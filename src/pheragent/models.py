@@ -153,6 +153,15 @@ class BuildRequest:
 
 
 @dataclass(slots=True)
+class SetupLocation:
+    path: str
+    language: str
+    package_files: list[str] = field(default_factory=list)
+    package_managers: list[str] = field(default_factory=list)
+    test_commands: list[str] = field(default_factory=list)
+
+
+@dataclass(slots=True)
 class RepoContext:
     repo_path: Path
     task_description: str | None = None
@@ -163,6 +172,7 @@ class RepoContext:
     build_commands: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
     runtime_notes: list[str] = field(default_factory=list)
+    setup_locations: list[SetupLocation] = field(default_factory=list)
 
 
 @dataclass(slots=True)

@@ -87,6 +87,52 @@ def test_rule_based_planner_installs_node_compatible_pnpm(tmp_path: Path) -> Non
     assert '.pheragent-tools/bin/npm install -g "$PNPM_PACKAGE"' in node_block.script
 
 
+def test_analyzer_detects_nested_multi_module_java_repo(tmp_path: Path) -> None:
+    reactor = tmp_path / "pre-registration"
+    reactor.mkdir()
+    (reactor / "pom.xml").write_text("<project/>", encoding="utf-8")
+    for service in ("service-a", "service-b"):
+        module_dir = reactor / service
+        module_dir.mkdir()
+        (module_dir / "pom.xml").write_text("<project/>", encoding="utf-8")
+    api_test = tmp_path / "api-test"
+    api_test.mkdir()
+    (api_test / "pom.xml").write_text("<project/>", encoding="utf-8")
+
+    context = RepoAnalyzer().analyze(tmp_path)
+
+    assert context.languages == ["java"]
+    assert "maven" in context.package_managers
+    java_location_paths = {
+        location.path for location in context.setup_locations if location.language == "java"
+    }
+    assert java_location_paths == {
+        "pre-registration",
+        "pre-registration/service-a",
+        "pre-registration/service-b",
+        "api-test",
+    }
+
+    blocks = RuleBasedBlockPlanner().plan(context)
+
+    assert any("api-test" in note for note in context.notes)
+    assert [block.id for block in blocks] == [
+        "00-preflight",
+        "20-java-runtime",
+        "30-java-deps",
+        "50-test-tooling",
+    ]
+    deps_block = next(block for block in blocks if block.id == "30-java-deps")
+    assert "cd pre-registration" in deps_block.script
+    assert deps_block.validation_command is not None
+    assert "cd pre-registration" in deps_block.validation_command
+    assert not deps_block.validation_command.rstrip().endswith("|| true")
+    test_block = next(block for block in blocks if block.id == "50-test-tooling")
+    assert "cd pre-registration" in test_block.script
+    assert test_block.validation_command is not None
+    assert not test_block.validation_command.rstrip().endswith("|| true")
+
+
 def test_rule_based_planner_splits_two_language_repo_but_caps_blocks(tmp_path: Path) -> None:
     (tmp_path / "pyproject.toml").write_text("[project]\nname = 'demo'\n", encoding="utf-8")
     (tmp_path / "package.json").write_text('{"scripts":{"test":"vitest"}}', encoding="utf-8")

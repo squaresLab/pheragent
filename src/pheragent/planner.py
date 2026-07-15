@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import shlex
 from collections.abc import Iterable
 from typing import Protocol
 
-from .models import CommandBlock, RepoContext
+from .models import CommandBlock, RepoContext, SetupLocation
 from .utils import shell_script, slugify
 
 
@@ -32,6 +33,9 @@ class RuleBasedBlockPlanner:
             )
         ]
 
+        if "java" in context.languages:
+            _note_secondary_java_locations(context)
+
         languages = [language for language in context.languages if _language_supported(language)]
         if not languages:
             blocks.append(
@@ -53,7 +57,7 @@ find . -maxdepth 2 -type f | sort | sed -n '1,120p'
 
         if len(languages) == 1:
             language = languages[0]
-            blocks.append(_runtime_block(language, 20))
+            blocks.append(_runtime_block(language, 20, context))
             blocks.append(_dependency_block(language, 30, context))
             blocks.append(_test_tooling_block(50, context))
             return blocks
@@ -61,14 +65,14 @@ find . -maxdepth 2 -type f | sort | sed -n '1,120p'
         if len(languages) == 2:
             blocks.append(_system_packages_block(10, context))
             for offset, language in enumerate(languages):
-                blocks.append(_runtime_block(language, 20 + offset))
+                blocks.append(_runtime_block(language, 20 + offset, context))
             for offset, language in enumerate(languages):
                 blocks.append(_dependency_block(language, 30 + offset, context))
             blocks.append(_test_tooling_block(50, context))
             return blocks
 
         blocks.append(_system_packages_block(10, context))
-        blocks.append(_combined_runtime_block(20, languages))
+        blocks.append(_combined_runtime_block(20, languages, context))
         blocks.append(_combined_dependency_block(30, languages, context))
         if _needs_native_build_config(context):
             blocks.append(_native_build_config_block(40))
@@ -84,14 +88,14 @@ def _language_supported(language: str) -> bool:
     return language in {"python", "node", "go", "rust", "java"}
 
 
-def _runtime_block(language: str, order: int) -> CommandBlock:
+def _runtime_block(language: str, order: int, context: RepoContext) -> CommandBlock:
     return CommandBlock(
         id=_ordered_id(order, f"{language}-runtime"),
         order=order,
         title=f"{language.title()} Runtime",
         goal=f"Verify the {language} runtime and core command-line tools.",
-        script=shell_script(_runtime_script(language)),
-        validation_command=_runtime_validation_command(language),
+        script=shell_script(_runtime_script(language, context)),
+        validation_command=_runtime_validation_command(language, context),
     )
 
 
@@ -102,19 +106,25 @@ def _dependency_block(language: str, order: int, context: RepoContext) -> Comman
         title=f"{language.title()} Dependencies",
         goal=f"Install {language} project dependencies from detected manifests.",
         script=shell_script(_dependency_script(language, context)),
-        validation_command=_dependency_validation_command(language),
+        validation_command=_dependency_validation_command(language, context),
     )
 
 
-def _combined_runtime_block(order: int, languages: list[str]) -> CommandBlock:
+def _combined_runtime_block(
+    order: int,
+    languages: list[str],
+    context: RepoContext,
+) -> CommandBlock:
     return CommandBlock(
         id=_ordered_id(order, "runtime-toolchain"),
         order=order,
         title="Runtime Toolchain",
         goal="Verify all detected language runtimes and core command-line tools.",
-        script=shell_script(_join_scripts(_runtime_script(language) for language in languages)),
+        script=shell_script(
+            _join_scripts(_runtime_script(language, context) for language in languages)
+        ),
         validation_command=_join_validation(
-            _runtime_validation_command(language) for language in languages
+            _runtime_validation_command(language, context) for language in languages
         ),
     )
 
@@ -174,7 +184,7 @@ def _test_tooling_block(order: int, context: RepoContext) -> CommandBlock:
     )
 
 
-def _runtime_script(language: str) -> str:
+def _runtime_script(language: str, context: RepoContext) -> str:
     if language == "python":
         return _python_runtime_script()
     if language == "node":
@@ -184,7 +194,7 @@ def _runtime_script(language: str) -> str:
     if language == "rust":
         return _rust_runtime_script()
     if language == "java":
-        return _java_runtime_script()
+        return _java_runtime_script(context)
     raise ValueError(f"unsupported language: {language}")
 
 
@@ -198,11 +208,12 @@ def _dependency_script(language: str, context: RepoContext) -> str:
     if language == "rust":
         return _rust_dependency_script()
     if language == "java":
-        return _java_script(context.package_managers)
+        return _java_script(context)
     raise ValueError(f"unsupported language: {language}")
 
 
-def _runtime_validation_command(language: str) -> str:
+def _runtime_validation_command(language: str, context: RepoContext) -> str:
+    del context
     if language == "python":
         return _python_runtime_validation_command()
     if language == "node":
@@ -216,7 +227,7 @@ def _runtime_validation_command(language: str) -> str:
     raise ValueError(f"unsupported language: {language}")
 
 
-def _dependency_validation_command(language: str) -> str:
+def _dependency_validation_command(language: str, context: RepoContext) -> str:
     if language == "python":
         return _python_dependency_validation_command()
     if language == "node":
@@ -226,7 +237,7 @@ def _dependency_validation_command(language: str) -> str:
     if language == "rust":
         return "cargo fetch --locked || cargo fetch"
     if language == "java":
-        return "mvn -q -DskipTests test || ./gradlew testClasses || gradle testClasses || true"
+        return _java_build_validation_command(context)
     raise ValueError(f"unsupported language: {language}")
 
 
@@ -248,6 +259,72 @@ def _join_validation(commands: Iterable[str]) -> str:
 def _needs_native_build_config(context: RepoContext) -> bool:
     native_languages = {"go", "rust", "java"}
     return any(language in native_languages for language in context.languages)
+
+
+def _java_locations(context: RepoContext) -> list[SetupLocation]:
+    return [location for location in context.setup_locations if location.language == "java"]
+
+
+def _select_reactor_root(java_locations: list[SetupLocation]) -> SetupLocation:
+    def descendant_count(candidate: SetupLocation) -> int:
+        if candidate.path == ".":
+            return len(java_locations) - 1
+        prefix = candidate.path + "/"
+        return sum(
+            1
+            for other in java_locations
+            if other is not candidate and other.path.startswith(prefix)
+        )
+
+    def sort_key(candidate: SetupLocation) -> tuple[int, int, str]:
+        segments = 0 if candidate.path == "." else candidate.path.count("/") + 1
+        return (-descendant_count(candidate), segments, candidate.path)
+
+    return sorted(java_locations, key=sort_key)[0]
+
+
+def _primary_java_location(context: RepoContext) -> SetupLocation | None:
+    java_locations = _java_locations(context)
+    if not java_locations:
+        return None
+    reactor_root = (
+        java_locations[0] if len(java_locations) == 1 else _select_reactor_root(java_locations)
+    )
+    return None if reactor_root.path == "." else reactor_root
+
+
+def _note_secondary_java_locations(context: RepoContext) -> None:
+    primary = _primary_java_location(context)
+    if primary is None:
+        return
+    prefix = primary.path + "/"
+    secondary = [
+        location.path
+        for location in _java_locations(context)
+        if location.path != primary.path and not location.path.startswith(prefix)
+    ]
+    if secondary:
+        context.notes.append(
+            "Additional Java module(s) outside the primary build reactor "
+            f"({primary.path}): {', '.join(secondary)}. Not included in the "
+            "generated dependency/test-tooling block; build separately if needed."
+        )
+
+
+def _cd_prefix(location: SetupLocation | None) -> str:
+    if location is None or location.path == ".":
+        return ""
+    return f"cd {shlex.quote(location.path)}\n"
+
+
+def _java_build_validation_command(context: RepoContext) -> str:
+    location = _primary_java_location(context)
+    target = shlex.quote(location.path if location is not None else ".")
+    return (
+        f"(cd {target} && mvn -q -DskipTests test) || "
+        f"(cd {target} && ./gradlew testClasses --no-daemon) || "
+        f"(cd {target} && gradle testClasses)"
+    )
 
 
 def _safe_python_validation_command(context: RepoContext, fallback: str) -> str:
@@ -470,10 +547,11 @@ rustc --version
 """
 
 
-def _java_runtime_script() -> str:
-    return """
+def _java_runtime_script(context: RepoContext) -> str:
+    cd_prefix = _cd_prefix(_primary_java_location(context))
+    return f"""
 echo "[pheragent] checking java runtime"
-java -version || true
+{cd_prefix}java -version || true
 mvn -version || true
 if [ -x ./gradlew ]; then
   ./gradlew --version || true
@@ -585,13 +663,15 @@ cargo fetch --locked || cargo fetch
 """
 
 
-def _java_script(package_managers: list[str]) -> str:
+def _java_script(context: RepoContext) -> str:
+    package_managers = context.package_managers
     has_maven = "maven" in package_managers
     has_gradle = "gradle" in package_managers
     gradle_enabled = "true" if has_gradle else "false"
+    cd_prefix = _cd_prefix(_primary_java_location(context))
     return f"""
 echo "[pheragent] warming java dependencies"
-if [ -f pom.xml ] && {"true" if has_maven else "false"}; then
+{cd_prefix}if [ -f pom.xml ] && {"true" if has_maven else "false"}; then
   mvn -q -DskipTests dependency:go-offline
 fi
 if {{ [ -f build.gradle ] || [ -f build.gradle.kts ]; }} && {gradle_enabled}; then
@@ -628,7 +708,7 @@ def _test_tooling_script(context: RepoContext) -> str:
     if "rust" in context.languages:
         scripts.append(_rust_test_tooling_script())
     if "java" in context.languages:
-        scripts.append(_java_test_tooling_script())
+        scripts.append(_java_test_tooling_script(context))
     return _join_scripts(scripts) or 'echo "[pheragent] no test tooling detected"'
 
 
@@ -645,10 +725,7 @@ def _test_tooling_validation_command(context: RepoContext) -> str:
     if "rust" in context.languages:
         commands.append("cargo test --no-run || cargo check")
     if "java" in context.languages:
-        commands.append(
-            "mvn -q -DskipTests test || ./gradlew testClasses || "
-            "gradle testClasses || true"
-        )
+        commands.append(_java_build_validation_command(context))
     return _join_validation(commands) or "test -d ."
 
 
@@ -687,10 +764,11 @@ cargo test --no-run || cargo check
 """
 
 
-def _java_test_tooling_script() -> str:
-    return """
+def _java_test_tooling_script(context: RepoContext) -> str:
+    cd_prefix = _cd_prefix(_primary_java_location(context))
+    return f"""
 echo "[pheragent] preparing java test tooling"
-if [ -f pom.xml ]; then
+{cd_prefix}if [ -f pom.xml ]; then
   mvn -q -DskipTests test || true
 fi
 if [ -f build.gradle ] || [ -f build.gradle.kts ]; then

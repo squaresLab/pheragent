@@ -117,6 +117,7 @@ class EnvironmentBuilder:
                 context=context,
             )
         )
+        self.store.save_context(context)
         result = BuildResult(
             ok=True,
             run_id=self.run_id,
@@ -225,6 +226,8 @@ class EnvironmentBuilder:
                 checkpoints.append(workspace_checkpoint)
                 current_image = workspace_checkpoint.image_ref
                 workspace_image = workspace_checkpoint.image_ref
+
+            self.store.save_context(context)
 
             if self.progress_control.forward_granularity == "whole-script":
                 whole_ok, current_image = self._run_whole_script_forward(
