@@ -1,0 +1,107 @@
+postgresql:
+  aliases: [postgres, postgresql, postgres-db]
+  block_type: shared_services
+  subtype: data_services
+  capabilities: [relational-database]
+
+minio:
+  aliases: [minio, object-store, object-storage]
+  block_type: shared_services
+  subtype: data_services
+  capabilities: [object-storage]
+
+redis:
+  aliases: [redis]
+  block_type: shared_services
+  subtype: data_services
+  capabilities: [distributed-cache]
+
+kafka:
+  aliases: [kafka]
+  block_type: shared_services
+  subtype: messaging_integration
+  capabilities: [event-streaming]
+
+activemq:
+  aliases: [activemq, active-mq]
+  block_type: shared_services
+  subtype: messaging_integration
+  capabilities: [message-queue]
+
+websub:
+  aliases: [websub]
+  block_type: shared_services
+  subtype: messaging_integration
+  capabilities: [event-notification]
+
+keycloak:
+  aliases: [keycloak, iam]
+  block_type: shared_services
+  subtype: identity_security
+  capabilities: [identity-provider]
+
+softhsm:
+  aliases: [softhsm, soft-hsm]
+  block_type: shared_services
+  subtype: identity_security
+  capabilities: [cryptographic-service]
+
+clamav:
+  aliases: [clamav, antivirus]
+  block_type: shared_services
+  subtype: external_integration
+  capabilities: [malware-scanning]
+
+smtp:
+  aliases: [smtp, mock-smtp]
+  block_type: shared_services
+  subtype: external_integration
+  capabilities: [email-delivery]
+
+rke2:
+  aliases: [rke2]
+  block_type: runtime_environment
+  subtype: container_platform
+  capabilities: [kubernetes-api, workload-scheduling]
+
+kubernetes:
+  aliases: [kubernetes, k8s]
+  block_type: runtime_environment
+  subtype: container_platform
+  capabilities: [kubernetes-api, workload-scheduling]
+
+ingress:
+  aliases: [ingress, ingress-nginx, nginx-ingress]
+  block_type: runtime_environment
+  subtype: platform_services
+  capabilities: [ingress]
+
+istio:
+  aliases: [istio, service-mesh]
+  block_type: runtime_environment
+  subtype: platform_services
+  capabilities: [service-networking]
+
+prometheus:
+  aliases: [prometheus]
+  block_type: operations
+  subtype: observability
+  capabilities: [metrics]
+
+grafana:
+  aliases: [grafana]
+  block_type: operations
+  subtype: observability
+  capabilities: [dashboards]
+
+loki:
+  aliases: [loki]
+  block_type: operations
+  subtype: observability
+  capabilities: [logging]
+
+alertmanager:
+  aliases: [alertmanager]
+  block_type: operations
+  subtype: health_monitoring
+  capabilities: [alerting]

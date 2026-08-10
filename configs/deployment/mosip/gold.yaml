@@ -1,0 +1,92 @@
+expected_components:
+  - PostgreSQL
+  - Keycloak
+  - SoftHSM
+  - MinIO
+  - ClamAV
+  - ActiveMQ
+  - Kafka
+  - Msg Gateway
+  - Docker Secrets
+  - Landing Page
+  - Captcha
+  - Conf Secrets
+  - Config Server
+  - Artifactory
+  - Keymanager
+  - Websub
+  - SMTP
+  - Kernel
+  - Masterdata Loader
+  - Biosdk
+  - Packetmanager
+  - Datashare
+  - Prereg
+  - Idrepo
+  - Pms
+  - Mock Abis
+  - Mock Mv
+  - Regproc
+  - Admin
+  - Ida
+  - Print
+  - Digitalcard
+  - Resident
+  - Partner Onboarder
+  - Mosip File Server
+  - Regclient
+  - Restart Cron
+
+expected_classifications:
+  PostgreSQL:
+    block_type: shared_services
+    subtype: data_services
+  MinIO:
+    block_type: shared_services
+    subtype: data_services
+  Kafka:
+    block_type: shared_services
+    subtype: messaging_integration
+  ActiveMQ:
+    block_type: shared_services
+    subtype: messaging_integration
+  Keycloak:
+    block_type: shared_services
+    subtype: identity_security
+  SoftHSM:
+    block_type: shared_services
+    subtype: identity_security
+
+expected_major_edges:
+  - source: base_infrastructure
+    target: runtime_environment
+  - source: runtime_environment
+    target: shared_services
+  - source: shared_services
+    target: application
+
+expected_entrypoints:
+  PostgreSQL: deployment/v3/external/postgres/install.sh
+  Keycloak: deployment/v3/external/iam/install.sh
+  SoftHSM: deployment/v3/external/hsm/softhsm/install.sh
+  MinIO: deployment/v3/external/object-store/minio/install.sh
+  ActiveMQ: deployment/v3/external/activemq/install.sh
+  Kafka: deployment/v3/external/kafka/install.sh
+
+expected_groups:
+  - [PostgreSQL, MinIO]
+  - [ActiveMQ, Kafka, Websub]
+  - [Keycloak, SoftHSM]
+  - [Kernel, Idrepo, Regproc, Admin, Ida, Resident, Prereg]
+
+forbidden_components:
+  - install.sh
+  - deployment.yaml
+  - Namespace
+  - ConfigMap
+  - Secret
+  - Command
+  - Step
+  - kubectl
+  - deployment
+  - configuration

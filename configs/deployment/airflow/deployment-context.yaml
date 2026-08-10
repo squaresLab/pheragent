@@ -1,0 +1,22 @@
+system: apache-airflow
+
+deployment:
+  profile: kubernetes
+
+provided_blocks:
+  - id: B0
+    type: runtime_environment
+    subtype: container_platform
+    implementation: kubernetes
+    state: provided
+    provides:
+      - kubernetes-api
+      - workload-scheduling
+      - service-networking
+      - persistent-storage
+
+# Keep the first run focused on Airflow's supported Kubernetes deployment path.
+hints:
+  documentation:
+    - chart/README.md
+    - docs/helm-chart/index.rst

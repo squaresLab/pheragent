@@ -1,0 +1,59 @@
+# Declarative source input for the MOSIP deployment artifact experiment.
+# Git revisions are resolved to immutable commit SHAs before inspection.
+system: mosip
+
+sources:
+  - id: mosip-infra
+    kind: git
+    location: https://github.com/mosip/mosip-infra.git
+    revision: v1.2.1.0
+    root_path: .
+    include_patterns:
+      - README*
+      - deployment/**
+      - .github/workflows/**
+    exclude_patterns:
+      - "**/.git/**"
+      - "**/node_modules/**"
+      - "**/vendor/**"
+      - "**/dist/**"
+      - "**/build/**"
+      - "**/target/**"
+      - "**/*.lock"
+      - "**/*.png"
+      - "**/*.jpg"
+      - "**/*.jpeg"
+      - "**/*.gif"
+      - "**/*.pdf"
+      - "**/*.zip"
+      - "**/*.tar"
+      - "**/*.gz"
+
+  - id: mosip-docs
+    kind: git
+    location: https://github.com/mosip/documentation.git
+    revision: 1.2.0
+    root_path: .
+    include_patterns:
+      - README*
+      - .gitbook.yaml
+      - docs/setup/**
+      - docs/roadmap-and-releases/releases/**
+    exclude_patterns:
+      - "**/.git/**"
+      - "**/node_modules/**"
+      - "**/vendor/**"
+      - "**/dist/**"
+      - "**/build/**"
+      - "**/target/**"
+      - "**/*.lock"
+      - "**/*.png"
+      - "**/*.jpg"
+      - "**/*.jpeg"
+      - "**/*.gif"
+      - "**/*.pdf"
+      - "**/*.doc"
+      - "**/*.docx"
+      - "**/*.zip"
+      - "**/*.tar"
+      - "**/*.gz"

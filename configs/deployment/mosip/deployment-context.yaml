@@ -1,0 +1,31 @@
+system: mosip
+
+deployment:
+  version: "1.2.1.0"
+  profile: cloud
+
+provided_blocks:
+  - id: B0
+    type: base_infrastructure
+    subtype: cloud_infrastructure
+    implementation: aws
+    state: provided
+    provides:
+      - compute-hosts
+      - private-network
+      - ssh-connectivity
+
+  - id: B1
+    type: runtime_environment
+    subtype: container_platform
+    implementation: kubernetes
+    state: provided
+    after: [B0]
+    provides:
+      - kubernetes-api
+      - workload-scheduling
+      - service-networking
+      - persistent-storage
+
+# Hints are optional. This initial context intentionally omits them so MOSIP also
+# exercises automatic deployment-entrypoint discovery.

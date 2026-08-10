@@ -1,0 +1,33 @@
+system: opentelemetry-demo
+
+deployment:
+  profile: docker-compose
+
+provided_blocks:
+  - id: B0
+    type: base_infrastructure
+    subtype: host_infrastructure
+    implementation: linux_host
+    state: provided
+    provides:
+      - compute-host
+      - host-network
+      - persistent-filesystem
+
+  - id: B1
+    type: runtime_environment
+    subtype: container_runtime
+    implementation: docker-compose
+    state: provided
+    after: [B0]
+    provides:
+      - container-runtime
+      - compose-orchestration
+      - service-networking
+
+# Constrain the first evaluation to the default Compose topology. Optional,
+# profiling, testing, and Kubernetes variants can be evaluated in later runs.
+hints:
+  documentation:
+    - compose.yaml
+    - README.md

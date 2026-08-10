@@ -4,6 +4,7 @@ import argparse
 import json
 from pathlib import Path
 
+from .deployment.cli import add_deployment_parser, run_deployment_command
 from .env import load_dotenv
 from .models import DEFAULT_ABLATION_MODE, BuildRequest, to_jsonable
 from .orchestrator import EnvironmentBuilder
@@ -43,6 +44,9 @@ def main(argv: list[str] | None = None) -> int:
         _print_batch_result(result, as_json=args.json)
         return 0 if result.ok else 1
 
+    if args.command == "deployment":
+        return run_deployment_command(args)
+
     parser.print_help()
     return 2
 
@@ -50,6 +54,8 @@ def main(argv: list[str] | None = None) -> int:
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="pheragent")
     subparsers = parser.add_subparsers(dest="command", required=True)
+
+    add_deployment_parser(subparsers)
 
     plan = subparsers.add_parser("plan", help="Analyze a repo and write setup block scripts.")
     _add_common_args(plan, include_dockerfile=False)

@@ -1,0 +1,25 @@
+system: automating-mosip-deployment
+
+deployment:
+  version: "1.2.1.1"
+  profile: on-premises
+
+# The on-premises path starts with provisioned VMs and private connectivity.
+# Ansible, RKE2, Terraform, and MOSIP application deployment are left for the
+# analyzer to discover from the repository.
+provided_blocks:
+  - id: B0
+    type: base_infrastructure
+    subtype: on_prem_infrastructure
+    implementation: existing_vms
+    state: provided
+    provides:
+      - compute-hosts
+      - private-network
+      - ssh-connectivity
+
+hints:
+  documentation:
+    - README.md
+    - deployment_plan_template.md
+    - ansible/infra_deployment/playbooks/deploy-all.yml

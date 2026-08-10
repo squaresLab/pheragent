@@ -1,0 +1,32 @@
+system: ahnlich
+
+deployment:
+  profile: docker-compose
+
+provided_blocks:
+  - id: B0
+    type: base_infrastructure
+    subtype: host_infrastructure
+    implementation: linux_host
+    state: provided
+    provides:
+      - compute-host
+      - host-network
+      - persistent-filesystem
+
+  - id: B1
+    type: runtime_environment
+    subtype: container_runtime
+    implementation: docker-compose
+    state: provided
+    after: [B0]
+    provides:
+      - container-runtime
+      - compose-orchestration
+      - service-networking
+
+# Start with the documented, provider-neutral Compose deployment. GPU
+# acceleration and optional tracing infrastructure can be evaluated separately.
+hints:
+  documentation:
+    - README.md

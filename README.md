@@ -30,6 +30,95 @@ uv run pytest -q
 uv run ruff check .
 ```
 
+## Deployment Repository Analyzer (Phase 1)
+
+The Phase 1 analyzer statically discovers deployable units and produces a compact
+functional-block DAG. It parses structural relationships in shell automation,
+Terraform, Ansible, Compose, Helm, Kustomize, Kubernetes, GitHub Actions, Flux, and
+Argo CD sources. Repository code and deployment commands are never executed.
+
+```bash
+uv run pheragent deployment analyze \
+  --repo https://github.com/mosip/mosip-infra.git \
+  --docs https://github.com/mosip/documentation.git \
+  --context configs/deployment/mosip/deployment-context.yaml \
+  --gold configs/deployment/mosip/gold.yaml \
+  --output .pheragent/deployment/mosip
+```
+
+Each invocation creates an immutable UTC directory under
+`.pheragent/deployment/mosip/runs/`. Source clones and content-addressed LLM synthesis
+responses are shared in `.source-cache/` and `.llm-cache/`, so prior runs are retained
+without paying repeated acquisition or synthesis costs. A normal run contains only:
+
+```text
+runs/<timestamp>/
+├── functional-blocks.yaml
+└── analysis-report.md
+```
+
+Use `--debug` to add the repository index, reference graph, candidate components,
+deployment signals, and compact LLM input beneath `debug/`. Use
+`--synthesizer deterministic` for a guaranteed offline run. In `auto` mode, one
+schema-constrained synthesis request is made only when `OPENAI_API_KEY` is available;
+the raw repository is never included. `--synthesizer llm` requires that request to
+succeed.
+
+Blocks and components use separate namespaces: blocks are `B0`, `B1`, and so on,
+while discovered components are deterministically sequenced as `C001_postgresql`,
+`C002_keycloak`, etc. The synthesis JSON Schema enumerates the exact allowed `C*`
+IDs, so provided `B*` IDs cannot be returned as components.
+
+Failed synthesis attempts are retained under `.llm-cache/failures/`, including the
+error, token usage when available, and rejected structured response. An identical
+model/input/prompt request is not charged again; the analyzer reuses the failure
+record and falls back deterministically. Use `--retry-failed-llm` only when an
+intentional retry is appropriate, such as after changing external account state.
+
+The MOSIP context deliberately supplies only the already-provisioned infrastructure
+and Kubernetes blocks. The analyzer discovers installer roots and service/application
+components without exact path hints. Its optional gold definition reports component,
+classification, dependency, entrypoint, grouping, grounding, artifact-size, and
+hallucination metrics.
+
+## Deployment Source Inspection MVP
+
+The experimental deployment inspector is read-only: it acquires pinned sources,
+inventories deployment-related files, and emits deterministic parser findings with
+line-level evidence. It then produces normalized deployment facts from deterministic
+findings and, when `OPENAI_API_KEY` is present, schema-constrained LLM enrichment over
+selected redacted evidence chunks. It does not execute commands found in the sources.
+
+```bash
+uv run pheragent deployment inspect \
+  --sources configs/deployment/mosip/sources.yaml \
+  --output .pheragent/deployment/mosip \
+  --strict
+```
+
+The inspector shows phase and per-source/chunk progress in the terminal and stores the
+same events in `inspection.log`. It writes `deployment-artifact.yaml`,
+`dependency-graph.json`, `inspection-report.md`, `facts.jsonl`,
+`unresolved-questions.yaml`, and the source/evidence sidecars. Generated outputs are
+staged and atomically replaced only after the complete inspection succeeds;
+`output-manifest.json` is published last with the SHA-256 of every staged artifact file. Use
+`--extractor deterministic` to guarantee an offline run or `--extractor llm` to
+require LLM extraction. A valid artifact exits zero; validation errors exit nonzero
+and are included in the report.
+
+LLM enrichment is cost-bounded by default. Evidence chunks are ranked by repository
+relevance and only the top 25 can be sent; retries count against the same hard limit.
+Override the budget explicitly, including using zero to disable API requests:
+
+```bash
+uv run pheragent deployment inspect \
+  --sources configs/deployment/mosip/sources.yaml \
+  --output .pheragent/deployment/mosip \
+  --strict \
+  --model gpt-5.6-luna \
+  --llm-max-requests 10
+```
+
 ## Configuration
 
 The CLI loads a local `.env` file from the current working directory before
