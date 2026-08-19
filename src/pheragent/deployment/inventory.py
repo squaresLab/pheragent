@@ -24,6 +24,10 @@ _IGNORED_DIRECTORIES = {
 _DOCUMENT_SUFFIXES = {".md", ".markdown", ".rst", ".adoc", ".asciidoc"}
 _CONFIG_SUFFIXES = {".env", ".ini", ".json", ".properties", ".toml", ".yaml", ".yml"}
 _YAML_SUFFIXES = {".yaml", ".yml"}
+_COMPOSE_FILE = re.compile(
+    r"^(?:docker-)?compose(?:[._-][a-z0-9][a-z0-9_.-]*)?\.ya?ml$",
+    re.IGNORECASE,
+)
 _RELEVANCE_TERMS = {
     "after",
     "ansible",
@@ -183,7 +187,7 @@ def classify_file(relative_path: str, sample: str) -> InventoryCategory:
 
     if normalized_path.startswith(".github/workflows/") and suffix in _YAML_SUFFIXES:
         return InventoryCategory.CI_WORKFLOW
-    if name in {"docker-compose.yaml", "docker-compose.yml", "compose.yaml", "compose.yml"}:
+    if _COMPOSE_FILE.fullmatch(name):
         return InventoryCategory.COMPOSE
     if name == "chart.yaml" or name.startswith("values") and suffix in _YAML_SUFFIXES:
         return InventoryCategory.HELM

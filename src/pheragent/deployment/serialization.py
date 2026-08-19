@@ -11,7 +11,7 @@ from typing import Any
 import yaml
 from pydantic import BaseModel
 
-from .models import DeploymentArtifact, SourcesConfig
+from .models import SourcesConfig
 
 
 def load_yaml(path: Path) -> Any:
@@ -24,10 +24,6 @@ def load_yaml(path: Path) -> Any:
 
 def load_sources_config(path: Path) -> SourcesConfig:
     return SourcesConfig.model_validate(load_yaml(path))
-
-
-def load_deployment_artifact(path: Path) -> DeploymentArtifact:
-    return DeploymentArtifact.model_validate(load_yaml(path))
 
 
 def write_yaml(path: Path, model: BaseModel | Any) -> None:

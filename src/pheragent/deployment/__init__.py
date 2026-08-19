@@ -1,5 +1,12 @@
-"""Read-only deployment artifact inspection contracts."""
+"""Repository analysis and approved deployment-workflow execution."""
 
-from .models import DeploymentArtifact, DeploymentBlock, SourcesConfig
+from .analyzer import AnalysisConfig, AnalysisResult, run_repository_analysis
+from .execution import PreparedExecution, prepare_execution
 
-__all__ = ["DeploymentArtifact", "DeploymentBlock", "SourcesConfig"]
+__all__ = [
+    "AnalysisConfig",
+    "AnalysisResult",
+    "PreparedExecution",
+    "prepare_execution",
+    "run_repository_analysis",
+]

@@ -2,8 +2,10 @@ system: mosip
 
 deployment:
   version: "1.2.1.0"
-  profile: cloud
+  profile: aws
 
+# Infrastructure is the execution boundary. AWS and the complete Kubernetes
+# runtime are already healthy; HerAgent starts with services deployed onto it.
 provided_blocks:
   - id: B0
     type: base_infrastructure
@@ -11,9 +13,11 @@ provided_blocks:
     implementation: aws
     state: provided
     provides:
-      - compute-hosts
-      - private-network
-      - ssh-connectivity
+      - aws-account
+      - aws-api-access
+      - vpc-and-subnets
+      - dns-zone
+      - ssh-key-pair
 
   - id: B1
     type: runtime_environment
@@ -25,7 +29,30 @@ provided_blocks:
       - kubernetes-api
       - workload-scheduling
       - service-networking
-      - persistent-storage
 
-# Hints are optional. This initial context intentionally omits them so MOSIP also
-# exercises automatic deployment-entrypoint discovery.
+  - id: B2
+    type: runtime_environment
+    subtype: platform_services
+    implementation: kubernetes-infrastructure
+    state: provided
+    after: [B1]
+    provides:
+      - ingress
+      - persistent-storage
+      - cluster-management
+
+objectives:
+  - Deploy the MOSIP V3 production services for version 1.2.1.0 onto the provided Kubernetes runtime.
+  - Discover every required shared service, MOSIP application, initialization action, validation, and operational component after B1.
+
+exclusions:
+  - Sandbox V2 and non-AWS deployment variants.
+  - AWS and Kubernetes infrastructure provisioning, ingress, storage, and cluster management.
+
+hints:
+  documentation:
+    - deployment/v3/README.md
+    - deployment/v3/external/README.md
+    - deployment/v3/mosip/README.md
+    - docs/setup/deploymentnew/v3-installation/mosip-external-dependencies.md
+    - docs/setup/deploymentnew/v3-installation/mosip-modules-deployment.md

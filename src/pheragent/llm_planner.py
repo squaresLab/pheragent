@@ -19,6 +19,16 @@ from .planner import (
 from .utils import shell_script, slugify
 
 
+class IncompleteLLMResponseError(RuntimeError):
+    """A streamed Responses API request stopped before producing a complete response."""
+
+    def __init__(self, reason: str, *, content: str, usage: dict[str, int]):
+        super().__init__(f"response incomplete: {reason}")
+        self.reason = reason
+        self.content = content
+        self.usage = usage
+
+
 @dataclass(slots=True)
 class OpenAIResponsesPlannerConfig:
     model: str = "gpt-5.5"
@@ -393,6 +403,19 @@ def _read_streamed_response_with_usage(
                 response_usage = _extract_token_usage(response)
                 if response_usage is not None:
                     usage = response_usage
+            elif event_type == "response.incomplete":
+                response = _event_value(event, "response")
+                response_usage = _extract_token_usage(response)
+                if response_usage is not None:
+                    usage = response_usage
+                details = _event_value(response, "incomplete_details")
+                reason = _event_value(details, "reason") or "unknown reason"
+                usage["requests"] = max(usage.get("requests", 0), 1)
+                raise IncompleteLLMResponseError(
+                    str(reason),
+                    content="".join(chunks),
+                    usage=usage,
+                )
             elif event_type in {"error", "response.failed"}:
                 raise RuntimeError(f"{error_context} stream failed: {_event_error_text(event)}")
     finally:

@@ -49,20 +49,19 @@ uv run pheragent deployment analyze \
 Each invocation creates an immutable UTC directory under
 `.pheragent/deployment/mosip/runs/`. Source clones and content-addressed LLM synthesis
 responses are shared in `.source-cache/` and `.llm-cache/`, so prior runs are retained
-without paying repeated acquisition or synthesis costs. A normal run contains only:
+without paying repeated acquisition or synthesis costs. A normal run contains:
 
 ```text
-runs/<timestamp>/
+runs/<timestamp>-<run-name>/
 ├── functional-blocks.yaml
+├── deployment-workflow.yaml
 └── analysis-report.md
 ```
 
 Use `--debug` to add the repository index, reference graph, candidate components,
-deployment signals, and compact LLM input beneath `debug/`. Use
-`--synthesizer deterministic` for a guaranteed offline run. In `auto` mode, one
-schema-constrained synthesis request is made only when `OPENAI_API_KEY` is available;
-the raw repository is never included. `--synthesizer llm` requires that request to
-succeed.
+deployment signals, and compact LLM input beneath `debug/`. Analysis uses at most two
+schema-constrained LLM requests by default: one bounded retrieval plan and one grounded
+synthesis. The raw repository is never included in either request.
 
 Blocks and components use separate namespaces: blocks are `B0`, `B1`, and so on,
 while discovered components are deterministically sequenced as `C001_postgresql`,
@@ -75,49 +74,40 @@ model/input/prompt request is not charged again; the analyzer reuses the failure
 record and falls back deterministically. Use `--retry-failed-llm` only when an
 intentional retry is appropriate, such as after changing external account state.
 
+### Dry-run and execution
+
+Review `deployment-workflow.yaml`, then preview the exact local commands and their order:
+
+```bash
+pheragent deployment run path/to/deployment-workflow.yaml \
+  --source-root mosip-infra=/path/to/mosip-infra
+```
+
+Dry-run is the default and never starts a repository command. If the workflow is ready,
+the output includes an approval token tied to the workflow, ordered commands, and source
+roots. Supply that token to execute the unchanged plan sequentially and stop at the first
+failure:
+
+```bash
+pheragent deployment run path/to/deployment-workflow.yaml \
+  --source-root mosip-infra=/path/to/mosip-infra \
+  --execute \
+  --approve 'sha256:...'
+```
+
+For fail-fast experiments, add `--allow-unready` to the dry-run and execution commands.
+HerAgent then selects only grounded, ready steps whose prerequisites are also selected;
+blocked steps and their dependents remain excluded. The approval token records this mode.
+
+Commands run on the machine hosting the CLI. Deployment scripts are responsible for
+reaching Kubernetes or worker nodes. This first execution slice does not yet perform
+automatic health validation, rollback, or repair.
+
 The MOSIP context deliberately supplies only the already-provisioned infrastructure
 and Kubernetes blocks. The analyzer discovers installer roots and service/application
 components without exact path hints. Its optional gold definition reports component,
 classification, dependency, entrypoint, grouping, grounding, artifact-size, and
 hallucination metrics.
-
-## Deployment Source Inspection MVP
-
-The experimental deployment inspector is read-only: it acquires pinned sources,
-inventories deployment-related files, and emits deterministic parser findings with
-line-level evidence. It then produces normalized deployment facts from deterministic
-findings and, when `OPENAI_API_KEY` is present, schema-constrained LLM enrichment over
-selected redacted evidence chunks. It does not execute commands found in the sources.
-
-```bash
-uv run pheragent deployment inspect \
-  --sources configs/deployment/mosip/sources.yaml \
-  --output .pheragent/deployment/mosip \
-  --strict
-```
-
-The inspector shows phase and per-source/chunk progress in the terminal and stores the
-same events in `inspection.log`. It writes `deployment-artifact.yaml`,
-`dependency-graph.json`, `inspection-report.md`, `facts.jsonl`,
-`unresolved-questions.yaml`, and the source/evidence sidecars. Generated outputs are
-staged and atomically replaced only after the complete inspection succeeds;
-`output-manifest.json` is published last with the SHA-256 of every staged artifact file. Use
-`--extractor deterministic` to guarantee an offline run or `--extractor llm` to
-require LLM extraction. A valid artifact exits zero; validation errors exit nonzero
-and are included in the report.
-
-LLM enrichment is cost-bounded by default. Evidence chunks are ranked by repository
-relevance and only the top 25 can be sent; retries count against the same hard limit.
-Override the budget explicitly, including using zero to disable API requests:
-
-```bash
-uv run pheragent deployment inspect \
-  --sources configs/deployment/mosip/sources.yaml \
-  --output .pheragent/deployment/mosip \
-  --strict \
-  --model gpt-5.6-luna \
-  --llm-max-requests 10
-```
 
 ## Configuration
 

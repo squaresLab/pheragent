@@ -65,6 +65,13 @@ def test_classification_detects_deployment_yaml_types() -> None:
     )
     assert classify_file("compose.yaml", "services:\n  api: {}\n") == InventoryCategory.COMPOSE
     assert (
+        classify_file("compose.full.yaml", "services:\n  worker: {}\n") == InventoryCategory.COMPOSE
+    )
+    assert (
+        classify_file("docker-compose.override.yml", "services:\n  worker: {}\n")
+        == InventoryCategory.COMPOSE
+    )
+    assert (
         classify_file("kustomization.yaml", "resources:\n  - app.yaml\n")
         == InventoryCategory.KUSTOMIZE
     )

@@ -3,458 +3,421 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from pydantic import BaseModel
+
 from pheragent.llm_planner import (
+    IncompleteLLMResponseError,
     _format_llm_error,
     _openai_client,
-    _parse_json_object,
     _read_streamed_response_with_usage,
     _resolve_openai_base_url,
 )
 
-from .analysis_models import (
-    AnalysisBlockType,
-    AnalysisQuestion,
-    CandidateComponent,
-    ComponentClassificationAssignment,
-    ComponentClassificationResponse,
-    DeploymentSignalBundle,
-)
 from .serialization import write_json
-
-_PROMPT_VERSION = "phase1-component-classification-v1"
-_SYSTEM_PROMPT = """Classify each discovered deployment component by functional purpose.
-Return exactly one assignment for every C-prefixed component ID supplied by the schema. Never
-return or classify B-prefixed provided block IDs. A locked classification is authoritative and
-must be returned unchanged. For an unlocked component, use the deterministic hint and the
-deployment relations to choose a concise snake_case type, subtype, and optional domain. Do not
-create deployment commands, paths, technologies, components, IDs, or grouping IDs. Execution
-order alone is not a hard dependency. Return structured JSON only."""
 
 
 @dataclass(slots=True)
 class AnalysisLLMConfig:
-    mode: str = "auto"
+    enabled: bool = True
     model: str = "gpt-4o-mini"
     api_key_env: str = "OPENAI_API_KEY"
     base_url_env: str = "OPENAI_BASE_URL"
     base_url: str | None = None
     timeout: float = 120.0
-    max_output_tokens: int = 3000
+    max_output_tokens: int = 5000
+    max_requests: int = 2
     cache_dir: Path | None = None
     retry_failed: bool = False
+    refresh_cache: bool = False
+    reasoning_effort: str | None = None
+
+
+@dataclass(slots=True)
+class LLMRequestBudget:
+    limit: int
+    attempted: int = 0
+
+    def consume(self) -> bool:
+        if self.attempted >= self.limit:
+            return False
+        self.attempted += 1
+        return True
 
 
 @dataclass(frozen=True, slots=True)
-class ComponentClassificationOutcome:
-    classification: ComponentClassificationResponse | None
-    used: str
+class ClassificationOutcome[T: BaseModel]:
+    value: T | None
+    stage: str
+    status: str
     usage: dict[str, int]
     input_tokens_estimate: int
     warning: str | None = None
     failure_history_path: Path | None = None
 
 
-def classify_components_with_llm(
-    signals: DeploymentSignalBundle,
-    *,
-    config: AnalysisLLMConfig,
-) -> ComponentClassificationOutcome:
-    mode = config.mode.strip().casefold()
-    if mode not in {"auto", "deterministic", "llm"}:
-        raise ValueError(f"unsupported analysis synthesizer: {config.mode}")
-    compact_input = build_compact_classification_input(signals)
-    serialized = json.dumps(compact_input, sort_keys=True, separators=(",", ":"))
-    estimate = max(1, len(serialized) // 4)
-    if mode == "deterministic":
-        return ComponentClassificationOutcome(None, "deterministic", {}, estimate)
-    if not signals.candidate_components:
-        return ComponentClassificationOutcome(
-            None,
-            "deterministic-no-components",
-            {},
-            estimate,
-            warning="LLM classification skipped because no component candidates were discovered",
-        )
-    api_key = os.getenv(config.api_key_env)
-    if not api_key:
-        if mode == "llm":
-            raise RuntimeError(f"missing API key in env var {config.api_key_env}")
-        return ComponentClassificationOutcome(None, "deterministic-no-key", {}, estimate)
+class CachedStructuredClassifier:
+    """Template for one validated, cached, structured classification request."""
 
-    cache_key = hashlib.sha256(
+    def __init__(self, config: AnalysisLLMConfig, budget: LLMRequestBudget):
+        self._config = config
+        self._budget = budget
+
+    def classify[T: BaseModel](
+        self,
+        *,
+        stage: str,
+        prompt_version: str,
+        instructions: str,
+        payload: dict[str, Any],
+        response_format: dict[str, Any],
+        response_model: type[T],
+        validate: Callable[[T], None],
+        output_token_limit: int | None = None,
+    ) -> ClassificationOutcome[T]:
+        serialized = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        estimate = max(1, len(serialized) // 4)
+        effective_output_tokens = min(
+            self._config.max_output_tokens,
+            output_token_limit or self._config.max_output_tokens,
+        )
+        if not self._config.enabled:
+            return ClassificationOutcome(
+                None,
+                stage,
+                "disabled",
+                {},
+                estimate,
+            )
+        api_key = os.getenv(self._config.api_key_env)
+        if not api_key:
+            return ClassificationOutcome(
+                None,
+                stage,
+                "not_requested_no_key",
+                {},
+                estimate,
+                warning=f"{stage} skipped because {self._config.api_key_env} is not set",
+            )
+
+        cache_key = _cache_key(
+            prompt_version=prompt_version,
+            model=self._config.model,
+            payload=payload,
+            response_format=response_format,
+            max_output_tokens=effective_output_tokens,
+            reasoning_effort=self._config.reasoning_effort,
+        )
+        cache_path = (
+            self._config.cache_dir / stage / f"{cache_key}.json" if self._config.cache_dir else None
+        )
+        failure_path = (
+            self._config.cache_dir / "failures" / stage / f"{cache_key}.json"
+            if self._config.cache_dir
+            else None
+        )
+
+        cache_warning: str | None = None
+        if not self._config.refresh_cache and cache_path and cache_path.is_file():
+            try:
+                cached = json.loads(cache_path.read_text(encoding="utf-8"))
+                value = response_model.model_validate(cached["result"])
+                validate(value)
+            except (KeyError, OSError, TypeError, ValueError) as exc:
+                cache_warning = f"ignored invalid {stage} success cache: {exc}"
+            else:
+                return ClassificationOutcome(
+                    value,
+                    stage,
+                    "cache",
+                    {},
+                    estimate,
+                )
+
+        if (
+            not self._config.refresh_cache
+            and failure_path
+            and failure_path.is_file()
+            and not self._config.retry_failed
+        ):
+            failure = _read_json_object(failure_path)
+            attempts = failure.get("attempts", [])
+            last_attempt = attempts[-1] if isinstance(attempts, list) and attempts else {}
+            error = str(last_attempt.get("error", "previous matching request failed"))
+            preserved_response = last_attempt.get("response")
+            if isinstance(preserved_response, str) and preserved_response.strip():
+                try:
+                    value = response_model.model_validate(
+                        _parse_structured_json_object(preserved_response)
+                    )
+                    validate(value)
+                except KeyError, TypeError, ValueError:
+                    pass
+                else:
+                    if cache_path:
+                        write_json(
+                            cache_path,
+                            {
+                                "status": "recovered_from_failure_history",
+                                "prompt_version": prompt_version,
+                                "model": self._config.model,
+                                "result": value.model_dump(mode="json"),
+                                "usage": {},
+                            },
+                        )
+                    return ClassificationOutcome(
+                        value,
+                        stage,
+                        "recovered_failure_cache",
+                        {},
+                        estimate,
+                        warning=(
+                            f"recovered {stage} from its preserved failed response after "
+                            "current contract validation succeeded"
+                        ),
+                        failure_history_path=failure_path,
+                    )
+            return ClassificationOutcome(
+                None,
+                stage,
+                "failure_cache",
+                {},
+                estimate,
+                warning=(
+                    f"skipped {stage} because the identical request previously failed: "
+                    f"{error}; use --retry-failed-llm to retry"
+                ),
+                failure_history_path=failure_path,
+            )
+
+        if not self._budget.consume():
+            return ClassificationOutcome(
+                None,
+                stage,
+                "request_budget_exhausted",
+                {},
+                estimate,
+                warning=(
+                    f"{stage} skipped because the run reached its "
+                    f"{self._budget.limit}-request LLM budget"
+                ),
+            )
+
+        content = ""
+        usage: dict[str, int] = {}
+        try:
+            base_url = _resolve_openai_base_url(
+                configured_base_url=self._config.base_url,
+                base_url_env=self._config.base_url_env,
+                api_mode="responses",
+            )
+            client = _openai_client(
+                base_url=base_url,
+                api_key=api_key,
+                timeout=self._config.timeout,
+            )
+            request: dict[str, Any] = {
+                "model": self._config.model,
+                "instructions": instructions,
+                "input": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "input_text",
+                                "text": json.dumps(payload, ensure_ascii=False),
+                            }
+                        ],
+                    }
+                ],
+                "text": {"format": response_format},
+                "max_output_tokens": effective_output_tokens,
+                "stream": True,
+            }
+            if self._config.reasoning_effort:
+                request["reasoning"] = {"effort": self._config.reasoning_effort}
+            stream = client.responses.create(**request)
+            content, usage = _read_streamed_response_with_usage(
+                stream,
+                error_context=stage.replace("_", " "),
+            )
+            value = response_model.model_validate(_parse_structured_json_object(content))
+            validate(value)
+        except Exception as exc:
+            failure_status = "failed"
+            if isinstance(exc, IncompleteLLMResponseError):
+                content = exc.content
+                usage = exc.usage
+                reason = "".join(
+                    character if character.isalnum() else "_" for character in exc.reason.casefold()
+                ).strip("_")
+                failure_status = f"incomplete_{reason or 'response'}"
+            elif isinstance(exc, ValueError):
+                failure_status = "invalid_response"
+            usage["requests"] = max(1, int(usage.get("requests", 0)))
+            formatted_error = _format_llm_error(stage.replace("_", " "), exc)
+            if failure_path:
+                _record_failure(
+                    failure_path,
+                    cache_key=cache_key,
+                    prompt_version=prompt_version,
+                    model=self._config.model,
+                    failure_kind=failure_status,
+                    error=formatted_error,
+                    usage=usage,
+                    response=content,
+                )
+            return ClassificationOutcome(
+                None,
+                stage,
+                failure_status,
+                usage,
+                estimate,
+                warning="; ".join(
+                    item
+                    for item in (
+                        cache_warning,
+                        f"{stage} unavailable: {formatted_error}",
+                    )
+                    if item
+                ),
+                failure_history_path=failure_path,
+            )
+
+        usage["requests"] = max(1, int(usage.get("requests", 0)))
+        if cache_path:
+            write_json(
+                cache_path,
+                {
+                    "status": "succeeded",
+                    "prompt_version": prompt_version,
+                    "model": self._config.model,
+                    "result": value.model_dump(mode="json"),
+                    "usage": usage,
+                },
+            )
+        return ClassificationOutcome(
+            value,
+            stage,
+            "llm",
+            usage,
+            estimate,
+            warning=cache_warning,
+        )
+
+
+def strict_response_format(
+    response_model: type[BaseModel],
+    *,
+    name: str,
+) -> dict[str, Any]:
+    """Build the strict Responses API format from the runtime validation contract."""
+    schema = response_model.model_json_schema()
+    _make_schema_strict(schema)
+    return {
+        "type": "json_schema",
+        "name": name,
+        "strict": True,
+        "schema": schema,
+    }
+
+
+def _make_schema_strict(node: Any) -> None:
+    if isinstance(node, list):
+        for item in node:
+            _make_schema_strict(item)
+        return
+    if not isinstance(node, dict):
+        return
+
+    node.pop("default", None)
+    node.pop("title", None)
+    properties = node.get("properties")
+    if isinstance(properties, dict):
+        node["additionalProperties"] = False
+        node["required"] = list(properties)
+    for value in node.values():
+        _make_schema_strict(value)
+
+
+def aggregate_usage(*outcomes: ClassificationOutcome[Any]) -> dict[str, int]:
+    usage: dict[str, int] = {}
+    for outcome in outcomes:
+        for key, value in outcome.usage.items():
+            usage[key] = usage.get(key, 0) + int(value)
+    return usage
+
+
+def _cache_key(
+    *,
+    prompt_version: str,
+    model: str,
+    payload: dict[str, Any],
+    response_format: dict[str, Any],
+    max_output_tokens: int,
+    reasoning_effort: str | None,
+) -> str:
+    return hashlib.sha256(
         json.dumps(
             {
-                "prompt_version": _PROMPT_VERSION,
-                "model": config.model,
-                "input": compact_input,
+                "prompt_version": prompt_version,
+                "model": model,
+                "input": payload,
+                "response_format": response_format,
+                "max_output_tokens": max_output_tokens,
+                "reasoning_effort": reasoning_effort,
             },
             sort_keys=True,
             separators=(",", ":"),
         ).encode()
     ).hexdigest()
-    cache_path = config.cache_dir / f"{cache_key}.json" if config.cache_dir else None
-    failure_path = (
-        config.cache_dir / "failures" / f"{cache_key}.json" if config.cache_dir else None
-    )
-    if cache_path and cache_path.is_file():
-        cached = json.loads(cache_path.read_text(encoding="utf-8"))
-        classification, issues = _normalize_response(cached["classification"], signals)
-        cached_issues = cached.get("repair_issues", [])
-        if isinstance(cached_issues, list):
-            issues = [*map(str, cached_issues), *issues]
-        issues = list(dict.fromkeys(issues))
-        return ComponentClassificationOutcome(
-            classification,
-            "llm-cache-with-fallback" if issues else "llm-cache",
-            {key: int(value) for key, value in cached.get("usage", {}).items()},
-            estimate,
-            warning=_fallback_warning(issues),
-        )
 
-    if failure_path and failure_path.is_file() and not config.retry_failed:
-        failure = json.loads(failure_path.read_text(encoding="utf-8"))
-        attempts = failure.get("attempts", [])
-        last_attempt = attempts[-1] if attempts else {}
-        error = str(last_attempt.get("error", "previous matching LLM request failed"))
-        if mode == "llm":
-            raise RuntimeError(
-                "deployment component classification skipped because an identical request "
-                "previously "
-                f"failed: {error}; use --retry-failed-llm to retry explicitly"
-            )
-        return ComponentClassificationOutcome(
-            None,
-            "llm-failure-cache",
-            {},
-            estimate,
-            warning=(
-                "Skipped an LLM request because the identical model/input/prompt contract "
-                f"previously failed; used deterministic classification: {error}"
-            ),
-            failure_history_path=failure_path,
-        )
 
-    base_url = _resolve_openai_base_url(
-        configured_base_url=config.base_url,
-        base_url_env=config.base_url_env,
-        api_mode="responses",
-    )
-    content = ""
-    usage: dict[str, int] = {}
-    attempted = False
+def _parse_structured_json_object(content: str) -> dict[str, Any]:
+    """Parse strict structured output without salvaging nested objects from truncation."""
     try:
-        client = _openai_client(base_url=base_url, api_key=api_key, timeout=config.timeout)
-        attempted = True
-        stream = client.responses.create(
-            model=config.model,
-            instructions=_SYSTEM_PROMPT,
-            input=[
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "input_text",
-                            "text": json.dumps(compact_input, ensure_ascii=False),
-                        }
-                    ],
-                }
-            ],
-            text={"format": _response_format(signals)},
-            max_output_tokens=config.max_output_tokens,
-            stream=True,
-        )
-        content, usage = _read_streamed_response_with_usage(
-            stream, error_context="deployment component classification"
-        )
-        classification, issues = _normalize_response(
-            _parse_json_object(content), signals
-        )
-    except Exception as exc:
-        if attempted:
-            usage["requests"] = max(1, int(usage.get("requests", 0)))
-        formatted_error = _format_llm_error("deployment component classification", exc)
-        if failure_path:
-            _record_failure(
-                failure_path,
-                cache_key=cache_key,
-                model=config.model,
-                error=formatted_error,
-                usage=usage,
-                response=content,
-            )
-        if mode == "llm":
-            raise RuntimeError(formatted_error) from exc
-        return ComponentClassificationOutcome(
-            None,
-            "llm-failed-deterministic",
-            usage,
-            estimate,
-            warning=(
-                "LLM component classification unavailable; used deterministic classification: "
-                f"{formatted_error}"
-            ),
-            failure_history_path=failure_path,
-        )
-    usage["requests"] = max(1, int(usage.get("requests", 0)))
-    if cache_path:
-        write_json(
-            cache_path,
-            {
-                "status": "succeeded",
-                "prompt_version": _PROMPT_VERSION,
-                "model": config.model,
-                "classification": classification.model_dump(mode="json"),
-                "repair_issues": issues,
-                "usage": usage,
-            },
-        )
-    return ComponentClassificationOutcome(
-        classification,
-        "llm-with-fallback" if issues else "llm",
-        usage,
-        estimate,
-        warning=_fallback_warning(issues),
-    )
+        value = json.loads(content)
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"structured response was not complete JSON: {exc.msg} at character {exc.pos}"
+        ) from None
+    if not isinstance(value, dict):
+        raise ValueError("structured response JSON must be an object")
+    return value
 
 
-def build_compact_classification_input(signals: DeploymentSignalBundle) -> dict[str, Any]:
-    """Return the compact, source-free payload supplied for classification."""
-    return {
-        "contract": {
-            "reserved_block_ids": [block.id for block in signals.context_blocks],
-            "required_component_ids": [
-                component.id for component in signals.candidate_components
-            ],
-            "rules": [
-                "Return one assignment for every required C-prefixed component ID.",
-                "Never return a B-prefixed provided block ID.",
-                "Keep locked classifications unchanged.",
-                "Do not invent IDs or grouping identifiers.",
-            ],
-        },
-        "provided_blocks": [
-            {
-                "id": block.id,
-                "type": block.type,
-                "subtype": block.subtype,
-                "implementation": block.implementation,
-                "provides": block.provides,
-            }
-            for block in signals.context_blocks
-        ],
-        "components": [
-            {
-                "id": component.id,
-                "name": component.name,
-                "implementation": component.implementation,
-                "entrypoint": (
-                    component.deployment.entrypoint if component.deployment else None
-                ),
-                "classification_hint": {
-                    "block_type": component.classification.block_type,
-                    "subtype": component.classification.subtype,
-                    "domain": component.classification.domain,
-                    "confidence": component.classification.confidence,
-                },
-                "classification_locked": _classification_locked(component),
-            }
-            for component in signals.candidate_components
-        ],
-        "stages": [
-            {
-                "id": stage.id,
-                "entrypoint": stage.entrypoint.path,
-                "component_ids": stage.component_ids,
-            }
-            for stage in signals.deployment_stages
-        ],
-        "relations": [
-            {
-                "source": relation.source,
-                "target": relation.target,
-                "relation": relation.relation,
-                "strength": relation.strength,
-            }
-            for relation in signals.relations
-        ],
-    }
-
-
-def _response_format(signals: DeploymentSignalBundle) -> dict[str, Any]:
-    component_properties = {
-        component.id: _assignment_schema(component)
-        for component in signals.candidate_components
-    }
-    component_ids = list(component_properties)
-    return {
-        "type": "json_schema",
-        "name": "component_classification",
-        "strict": True,
-        "schema": {
-            "type": "object",
-            "properties": {
-                "assignments": {
-                    "type": "object",
-                    "properties": component_properties,
-                    "required": component_ids,
-                    "additionalProperties": False,
-                },
-                "unresolved": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "question": {"type": "string", "minLength": 1},
-                            "reason": {"type": "string", "minLength": 1},
-                        },
-                        "required": ["question", "reason"],
-                        "additionalProperties": False,
-                    },
-                },
-            },
-            "required": ["assignments", "unresolved"],
-            "additionalProperties": False,
-        },
-    }
-
-
-def _assignment_schema(component: CandidateComponent) -> dict[str, Any]:
-    classification = component.classification
-    locked = _classification_locked(component)
-    block_types = (
-        [classification.block_type.value]
-        if locked
-        else [item.value for item in AnalysisBlockType]
-    )
-    subtype: dict[str, Any] = {"type": "string"}
-    domain: dict[str, Any]
-    if locked:
-        subtype["enum"] = [classification.subtype]
-        domain = (
-            {"type": "null", "enum": [None]}
-            if classification.domain is None
-            else {"type": "string", "enum": [classification.domain]}
-        )
-    else:
-        subtype["pattern"] = r"^[a-z0-9]+(?:_[a-z0-9]+)*$"
-        domain = {
-            "type": ["string", "null"],
-            "pattern": r"^[a-z0-9]+(?:_[a-z0-9]+)*$",
-        }
-    return {
-        "type": "object",
-        "properties": {
-            "block_type": {"type": "string", "enum": block_types},
-            "subtype": subtype,
-            "domain": domain,
-        },
-        "required": ["block_type", "subtype", "domain"],
-        "additionalProperties": False,
-    }
-
-
-def _classification_locked(component: CandidateComponent) -> bool:
-    return component.classification.confidence >= 1.0
-
-
-def _normalize_response(
-    payload: dict[str, Any],
-    signals: DeploymentSignalBundle,
-) -> tuple[ComponentClassificationResponse, list[str]]:
-    raw_assignments = payload.get("assignments")
-    if not isinstance(raw_assignments, dict):
-        raw_assignments = {}
-    issues: list[str] = []
-    expected = {component.id for component in signals.candidate_components}
-    unknown = sorted(set(raw_assignments) - expected)
-    if unknown:
-        issues.append(f"ignored unknown component IDs: {', '.join(unknown)}")
-
-    assignments: dict[str, ComponentClassificationAssignment] = {}
-    deterministic_fallbacks: list[str] = []
-    preserved_locks: list[str] = []
-    for component in signals.candidate_components:
-        fallback = ComponentClassificationAssignment(
-            block_type=component.classification.block_type,
-            subtype=component.classification.subtype,
-            domain=component.classification.domain,
-        )
-        raw_assignment = raw_assignments.get(component.id)
-        try:
-            assignment = ComponentClassificationAssignment.model_validate(raw_assignment)
-        except (TypeError, ValueError):
-            assignments[component.id] = fallback
-            deterministic_fallbacks.append(component.id)
-            continue
-        if _classification_locked(component) and assignment != fallback:
-            assignments[component.id] = fallback
-            preserved_locks.append(component.id)
-            continue
-        assignments[component.id] = assignment
-    if deterministic_fallbacks:
-        issues.append(
-            "used deterministic classification for "
-            + _summarize_ids(deterministic_fallbacks)
-        )
-    if preserved_locks:
-        issues.append("preserved locked classification for " + _summarize_ids(preserved_locks))
-
-    unresolved: list[AnalysisQuestion] = []
-    raw_unresolved = payload.get("unresolved", [])
-    if not isinstance(raw_unresolved, list):
-        raw_unresolved = []
-        issues.append("ignored invalid unresolved questions")
-    for item in raw_unresolved:
-        try:
-            unresolved.append(AnalysisQuestion.model_validate(item))
-        except (TypeError, ValueError):
-            issues.append("ignored an invalid unresolved question")
-    return ComponentClassificationResponse(
-        assignments=assignments,
-        unresolved=unresolved,
-    ), issues
-
-
-def _fallback_warning(issues: list[str]) -> str | None:
-    if not issues:
-        return None
-    return "LLM classification was repaired with deterministic fallbacks: " + "; ".join(issues)
-
-
-def _summarize_ids(component_ids: list[str], *, limit: int = 5) -> str:
-    visible = ", ".join(component_ids[:limit])
-    remaining = len(component_ids) - limit
-    return f"{visible} (+{remaining} more)" if remaining > 0 else visible
+def _read_json_object(path: Path) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except OSError, ValueError:
+        return {}
+    return value if isinstance(value, dict) else {}
 
 
 def _record_failure(
     path: Path,
     *,
     cache_key: str,
+    prompt_version: str,
     model: str,
+    failure_kind: str,
     error: str,
     usage: dict[str, int],
     response: str,
 ) -> None:
-    existing: dict[str, Any] = {}
-    if path.is_file():
-        try:
-            loaded = json.loads(path.read_text(encoding="utf-8"))
-            if isinstance(loaded, dict):
-                existing = loaded
-        except (OSError, ValueError):
-            existing = {}
+    existing = _read_json_object(path) if path.is_file() else {}
     attempts = existing.get("attempts", [])
     if not isinstance(attempts, list):
         attempts = []
     attempts.append(
         {
             "attempted_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+            "kind": failure_kind,
             "error": error,
             "usage": _normalize_usage(usage),
             "response": response or None,
@@ -465,7 +428,7 @@ def _record_failure(
         {
             "status": "failed",
             "cache_key": cache_key,
-            "prompt_version": _PROMPT_VERSION,
+            "prompt_version": prompt_version,
             "model": model,
             "attempts": attempts,
         },
@@ -475,8 +438,4 @@ def _record_failure(
 def _normalize_usage(value: Any) -> dict[str, int]:
     if not isinstance(value, dict):
         return {}
-    return {
-        str(key): int(item)
-        for key, item in value.items()
-        if isinstance(item, int | float)
-    }
+    return {str(key): int(item) for key, item in value.items() if isinstance(item, int | float)}

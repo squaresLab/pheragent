@@ -1,82 +1,75 @@
 from __future__ import annotations
 
-from .models import DependencyGraph, DependencyGraphEdge, DeploymentBlock
+from collections.abc import Iterable, Mapping, Set
 
 
-def build_dependency_graph(blocks: tuple[DeploymentBlock, ...]) -> DependencyGraph:
-    block_ids = {block.id for block in blocks}
-    providers: dict[str, list[str]] = {}
-    for block in blocks:
-        for capability in block.provides:
-            providers.setdefault(capability.capability, []).append(block.id)
-
-    edges: dict[tuple[str, str, str], DependencyGraphEdge] = {}
-    unmatched: set[str] = set()
-    for block in blocks:
-        for requirement in block.requires:
-            provider = requirement.provider_block
-            if provider is None:
-                candidates = sorted(set(providers.get(requirement.capability, [])) - {block.id})
-                if len(candidates) == 1:
-                    provider = candidates[0]
-            if provider is None:
-                if requirement.mandatory:
-                    unmatched.add(f"{block.id}:{requirement.capability}")
-                continue
-            if provider not in block_ids:
-                unmatched.add(f"{block.id}:{requirement.capability}")
-                continue
-            edge = DependencyGraphEdge(
-                provider_block=provider,
-                consumer_block=block.id,
-                capability=requirement.capability,
-                mandatory=requirement.mandatory,
-            )
-            edges[(provider, block.id, requirement.capability)] = edge
-
-    ordered_edges = sorted(
-        edges.values(),
-        key=lambda edge: (edge.provider_block, edge.consumer_block, edge.capability),
-    )
-    cycle = find_hard_cycle(tuple(sorted(block_ids)), tuple(ordered_edges))
-    return DependencyGraph(
-        nodes=sorted(block_ids),
-        edges=ordered_edges,
-        unmatched_capabilities=sorted(unmatched),
-        cycle=cycle or [],
-    )
-
-
-def find_hard_cycle(
-    nodes: tuple[str, ...], edges: tuple[DependencyGraphEdge, ...]
-) -> list[str] | None:
-    dependencies = {node: set() for node in nodes}
-    for edge in edges:
-        if edge.mandatory:
-            dependencies[edge.consumer_block].add(edge.provider_block)
+def add_dependency_if_acyclic(
+    dependencies: dict[str, set[str]],
+    *,
+    dependent: str,
+    prerequisite: str,
+) -> bool:
+    """Add one prerequisite unless it is invalid or would introduce a cycle."""
+    if dependent == prerequisite or dependent not in dependencies:
+        return False
+    pending = [prerequisite]
     visited: set[str] = set()
-    active: list[str] = []
-    active_set: set[str] = set()
+    while pending:
+        current = pending.pop()
+        if current == dependent:
+            return False
+        if current in visited:
+            continue
+        visited.add(current)
+        pending.extend(dependencies.get(current, ()))
+    dependencies[dependent].add(prerequisite)
+    return True
 
-    def visit(node: str) -> list[str] | None:
-        if node in active_set:
-            start = active.index(node)
-            return [*active[start:], node]
-        if node in visited:
-            return None
-        active.append(node)
-        active_set.add(node)
-        for dependency in sorted(dependencies[node]):
-            cycle = visit(dependency)
-            if cycle:
-                return cycle
-        active.pop()
-        active_set.remove(node)
-        visited.add(node)
-        return None
 
-    for node in nodes:
-        cycle = visit(node)
-        if cycle:
-            return cycle
-    return None
+def topological_order(
+    node_ids: Iterable[str],
+    dependencies: Mapping[str, Set[str]],
+    *,
+    cycle_label: str,
+) -> tuple[str, ...]:
+    """Return a stable dependency order or reject a cyclic graph."""
+    positions = {node_id: index for index, node_id in enumerate(node_ids)}
+    emitted: set[str] = set()
+    ordered: list[str] = []
+    while len(ordered) < len(positions):
+        ready = sorted(
+            (
+                node_id
+                for node_id in positions
+                if node_id not in emitted and dependencies.get(node_id, set()) <= emitted
+            ),
+            key=positions.__getitem__,
+        )
+        if not ready:
+            raise ValueError(f"{cycle_label} contains a cycle")
+        ordered.extend(ready)
+        emitted.update(ready)
+    return tuple(ordered)
+
+
+def topological_levels(
+    node_ids: Iterable[str],
+    dependencies: Mapping[str, Set[str]],
+    *,
+    cycle_label: str,
+) -> list[list[str]]:
+    """Return stable parallel levels while preserving dependency constraints."""
+    remaining = tuple(node_ids)
+    emitted: set[str] = set()
+    levels: list[list[str]] = []
+    while len(emitted) < len(remaining):
+        ready = sorted(
+            node_id
+            for node_id in remaining
+            if node_id not in emitted and dependencies.get(node_id, set()) <= emitted
+        )
+        if not ready:
+            raise ValueError(f"{cycle_label} contains a cycle")
+        levels.append(ready)
+        emitted.update(ready)
+    return levels

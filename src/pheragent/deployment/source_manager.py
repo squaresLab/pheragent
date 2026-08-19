@@ -34,11 +34,32 @@ _DEFAULT_IGNORED_DIRECTORIES = {
 
 @dataclass(frozen=True, slots=True)
 class AcquiredSource:
+    """A pinned source snapshot with containment-safe artifact access."""
+
     id: str
     kind: SourceKind
     path: Path
     spec: SourceSpec
     manifest: SourceManifestEntry
+
+    def resolve_path(self, relative_path: str) -> Path:
+        if self.path.is_file():
+            if relative_path != self.path.name:
+                raise ValueError(f"source {self.id} has no artifact: {relative_path}")
+            return self.path.resolve()
+        root = self.path.resolve()
+        candidate = root.joinpath(*PurePosixPath(relative_path).parts).resolve()
+        try:
+            candidate.relative_to(root)
+        except ValueError as exc:
+            raise ValueError(f"artifact path escapes source {self.id}: {relative_path}") from exc
+        return candidate
+
+    def contains_file(self, relative_path: str) -> bool:
+        try:
+            return self.resolve_path(relative_path).is_file()
+        except OSError, ValueError:
+            return False
 
 
 @dataclass(frozen=True, slots=True)

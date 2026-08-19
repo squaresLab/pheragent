@@ -8,9 +8,11 @@ import pytest
 
 from pheragent.analyzer import RepoAnalyzer
 from pheragent.llm_planner import (
+    IncompleteLLMResponseError,
     OpenAIResponsesBlockPlanner,
     OpenAIResponsesPlannerConfig,
     _openai_client,
+    _read_streamed_response_with_usage,
     make_planner,
 )
 from pheragent.planner import RuleBasedBlockPlanner
@@ -95,6 +97,38 @@ def _planner_response_events() -> list[FakeEvent]:
             },
         ),
     ]
+
+
+def test_stream_reader_reports_incomplete_response_with_usage() -> None:
+    stream = FakeStream(
+        [
+            FakeEvent("response.output_text.delta", delta='{"items":['),
+            FakeEvent(
+                "response.incomplete",
+                response={
+                    "incomplete_details": {"reason": "max_output_tokens"},
+                    "usage": {
+                        "input_tokens": 120,
+                        "output_tokens": 50,
+                        "total_tokens": 170,
+                    },
+                },
+            ),
+        ]
+    )
+
+    with pytest.raises(IncompleteLLMResponseError, match="max_output_tokens") as error:
+        _read_streamed_response_with_usage(stream, error_context="test synthesis")
+
+    assert error.value.content == '{"items":['
+    assert error.value.usage == {
+        "requests": 1,
+        "input_tokens": 120,
+        "output_tokens": 50,
+        "reasoning_tokens": 0,
+        "total_tokens": 170,
+    }
+    assert stream.closed is True
 
 
 def test_make_planner_auto_uses_rules_without_api_key(monkeypatch) -> None:
