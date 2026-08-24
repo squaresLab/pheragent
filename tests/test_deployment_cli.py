@@ -35,6 +35,23 @@ def test_deployment_analyze_can_force_fresh_llm_requests(tmp_path: Path) -> None
     assert _analysis_config(args, tmp_path).treatment == AnalysisTreatment.HYBRID
 
 
+def test_deployment_run_accepts_one_block_scope(tmp_path: Path) -> None:
+    parser = _build_parser()
+    args = parser.parse_args(
+        [
+            "deployment",
+            "run",
+            str(tmp_path / "deployment-workflow.yaml"),
+            "--block",
+            "B6",
+            "--allow-unready",
+        ]
+    )
+
+    assert args.block == "B6"
+    assert args.allow_unready is True
+
+
 @pytest.mark.parametrize("research_option", ["--treatment", "--gold"])
 def test_deployment_analyze_hides_research_options(
     tmp_path: Path,

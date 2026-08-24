@@ -110,6 +110,10 @@ For fail-fast experiments, add `--allow-unready` to the dry-run and execution co
 HerAgent then selects only grounded, ready steps whose prerequisites are also selected;
 blocked steps and their dependents remain excluded. The approval token records this mode.
 
+Limit a trial to one discovered block whose block prerequisites are already provided with
+`--block B6`. HerAgent resolves membership from the adjacent `functional-blocks.yaml`; the
+selected block is included in the dry-run and approval token.
+
 Commands run on the machine hosting the CLI. Deployment scripts are responsible for
 reaching Kubernetes or worker nodes. This first execution slice does not yet perform
 automatic health validation, rollback, or repair.

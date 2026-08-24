@@ -7,7 +7,12 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
-from .analysis_models import DeploymentWorkflow, DeploymentWorkflowStep, WorkflowStepStatus
+from .analysis_models import (
+    DeploymentWorkflow,
+    DeploymentWorkflowStep,
+    FunctionalBlock,
+    WorkflowStepStatus,
+)
 from .errors import (
     DeploymentInputError,
     WorkflowExecutionError,
@@ -37,6 +42,7 @@ class PreparedExecution:
     source_roots: Mapping[str, Path]
     operations: tuple[ExecutionOperation, ...]
     excluded_steps: tuple[DeploymentWorkflowStep, ...]
+    selected_block: FunctionalBlock | None
     allow_unready: bool
     approval_token: str
 
@@ -61,23 +67,32 @@ class PreparedExecution:
             f"Workflow: {self.workflow_path}",
             f"Workflow ready: {str(self.workflow.ready_for_execution).lower()}",
             f"Trial override: {str(self.allow_unready).lower()}",
+            f"Selected block: {_block_label(self.selected_block)}",
             f"Selected plan executable: {str(self.executable).lower()}",
             f"Ordered operations: {len(self.operations)}",
             "",
         ]
+        operation_ids = {operation.step.id for operation in self.operations}
         for index, operation in enumerate(self.operations, start=1):
             step = operation.step
             targets = ", ".join(f"{target.name} ({target.id})" for target in step.targets)
+            selected_dependencies = [item for item in step.after if item in operation_ids]
+            omitted_dependencies = [item for item in step.after if item not in operation_ids]
             lines.extend(
                 [
                     f"{index}. {step.id} [{step.status.value}] {targets}",
-                    f"   after: {', '.join(step.after) if step.after else '-'}",
+                    "   after in selected scope: "
+                    + (", ".join(selected_dependencies) if selected_dependencies else "-"),
                     f"   executor: {step.executor.value}",
                     f"   source: {_source_label(step)}",
                     f"   working directory: {operation.working_directory}",
                     f"   command: {step.command or '<missing>'}",
                 ]
             )
+            if omitted_dependencies:
+                lines.append(
+                    "   cross-block workflow order omitted: " + ", ".join(omitted_dependencies)
+                )
             if step.required_inputs:
                 lines.append(f"   required inputs: {', '.join(step.required_inputs)}")
             if step.blockers:
@@ -147,16 +162,19 @@ def prepare_execution(
     source_roots: Mapping[str, Path],
     *,
     allow_unready: bool = False,
+    block_id: str | None = None,
 ) -> PreparedExecution:
-    """Resolve one workflow into a safe local plan without executing repository commands."""
+    """Resolve a full workflow or one functional block without executing commands."""
     resolved_workflow = workflow_path.expanduser().resolve(strict=True)
     workflow = DeploymentWorkflow.model_validate(load_yaml(resolved_workflow))
     roots = _resolve_source_roots(source_roots)
     ordered_steps = ordered_workflow_steps(workflow.steps)
     _reject_duplicate_operations(ordered_steps)
+    selected_block = _load_selected_block(resolved_workflow, block_id)
     selected_steps, excluded_steps = _select_execution_steps(
         ordered_steps,
         allow_unready=allow_unready,
+        selected_block=selected_block,
     )
     operations = tuple(
         ExecutionOperation(
@@ -170,6 +188,7 @@ def prepare_execution(
         roots,
         operations,
         allow_unready=allow_unready,
+        selected_block=selected_block,
     )
     return PreparedExecution(
         workflow_path=resolved_workflow,
@@ -177,9 +196,45 @@ def prepare_execution(
         source_roots=roots,
         operations=operations,
         excluded_steps=tuple(excluded_steps),
+        selected_block=selected_block,
         allow_unready=allow_unready,
         approval_token=token,
     )
+
+
+def _load_selected_block(workflow_path: Path, block_id: str | None) -> FunctionalBlock | None:
+    if block_id is None:
+        return None
+    artifact_path = workflow_path.with_name("functional-blocks.yaml")
+    if not artifact_path.is_file():
+        raise DeploymentInputError(
+            f"--block requires the adjacent functional block artifact: {artifact_path}"
+        )
+    payload = load_yaml(artifact_path)
+    raw_blocks = payload.get("blocks") if isinstance(payload, dict) else None
+    if not isinstance(raw_blocks, list):
+        raise DeploymentInputError(f"functional block artifact has no blocks: {artifact_path}")
+    blocks = [FunctionalBlock.model_validate(item) for item in raw_blocks]
+    block_by_id = {block.id: block for block in blocks}
+    try:
+        selected = block_by_id[block_id]
+    except KeyError as exc:
+        available = ", ".join(block.id for block in blocks if block.state != "provided") or "none"
+        raise DeploymentInputError(
+            f"unknown or unavailable block {block_id}; discovered blocks: {available}"
+        ) from exc
+    if selected.state == "provided":
+        raise DeploymentInputError(f"block {block_id} is already provided and has nothing to run")
+    unavailable = [
+        dependency
+        for dependency in selected.after
+        if dependency not in block_by_id or block_by_id[dependency].state != "provided"
+    ]
+    if unavailable:
+        raise WorkflowNotExecutableError(
+            f"block {block_id} depends on non-provided blocks: {', '.join(unavailable)}"
+        )
+    return selected
 
 
 def _resolve_source_roots(source_roots: Mapping[str, Path]) -> dict[str, Path]:
@@ -221,17 +276,20 @@ def _select_execution_steps(
     steps: list[DeploymentWorkflowStep],
     *,
     allow_unready: bool,
+    selected_block: FunctionalBlock | None,
 ) -> tuple[list[DeploymentWorkflowStep], list[DeploymentWorkflowStep]]:
+    scoped_steps = _steps_for_block(steps, selected_block)
     if not allow_unready:
-        return steps, []
+        return scoped_steps, []
+    scoped_ids = {step.id for step in scoped_steps}
     selected: list[DeploymentWorkflowStep] = []
     selected_ids: set[str] = set()
     excluded: list[DeploymentWorkflowStep] = []
-    for step in steps:
+    for step in scoped_steps:
         runnable = (
             step.status == WorkflowStepStatus.READY
             and step.command is not None
-            and set(step.after) <= selected_ids
+            and (set(step.after) & scoped_ids) <= selected_ids
         )
         if runnable:
             selected.append(step)
@@ -239,6 +297,32 @@ def _select_execution_steps(
         else:
             excluded.append(step)
     return selected, excluded
+
+
+def _steps_for_block(
+    steps: list[DeploymentWorkflowStep],
+    selected_block: FunctionalBlock | None,
+) -> list[DeploymentWorkflowStep]:
+    if selected_block is None:
+        return steps
+    component_ids = {component.id for component in selected_block.components}
+    selected: list[DeploymentWorkflowStep] = []
+    for step in steps:
+        target_ids = {target.id for target in step.targets}
+        if not target_ids & component_ids:
+            continue
+        outside_block = sorted(target_ids - component_ids)
+        if outside_block:
+            raise WorkflowNotExecutableError(
+                f"workflow step {step.id} spans block {selected_block.id} and other components: "
+                + ", ".join(outside_block)
+            )
+        selected.append(step)
+    if not selected:
+        raise WorkflowNotExecutableError(
+            f"block {selected_block.id} has no grounded workflow operations"
+        )
+    return selected
 
 
 def _reject_duplicate_operations(steps: list[DeploymentWorkflowStep]) -> None:
@@ -268,15 +352,21 @@ def _approval_token(
     operations: tuple[ExecutionOperation, ...],
     *,
     allow_unready: bool,
+    selected_block: FunctionalBlock | None,
 ) -> str:
     payload = {
         "workflow": workflow.model_dump(mode="json", exclude_none=True),
         "source_roots": {source_id: str(path) for source_id, path in sorted(source_roots.items())},
         "execution_order": [operation.step.id for operation in operations],
         "allow_unready": allow_unready,
+        "selected_block": selected_block.id if selected_block else None,
     }
     serialized = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return "sha256:" + hashlib.sha256(serialized.encode()).hexdigest()
+
+
+def _block_label(block: FunctionalBlock | None) -> str:
+    return f"{block.id} ({block.name})" if block else "all"
 
 
 def _source_label(step: DeploymentWorkflowStep) -> str:

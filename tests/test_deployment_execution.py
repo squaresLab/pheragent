@@ -78,6 +78,61 @@ def _write_workflow(tmp_path: Path) -> tuple[Path, Path]:
     return workflow, source
 
 
+def _write_functional_blocks(tmp_path: Path) -> None:
+    payload = {
+        "blocks": [
+            {
+                "id": "B0",
+                "name": "Runtime",
+                "type": "runtime_environment",
+                "subtype": "container_platform",
+                "state": "provided",
+                "components": [],
+            },
+            {
+                "id": "B1",
+                "name": "Data Services",
+                "type": "shared_services",
+                "subtype": "data_services",
+                "after": ["B0"],
+                "components": [
+                    {
+                        "id": "C001_database",
+                        "name": "Database",
+                        "deployable": True,
+                        "external": False,
+                    }
+                ],
+            },
+            {
+                "id": "B2",
+                "name": "Application",
+                "type": "application",
+                "subtype": "core_application",
+                "after": ["B1"],
+                "components": [
+                    {
+                        "id": "C002_application",
+                        "name": "Application",
+                        "deployable": True,
+                        "external": False,
+                    },
+                    {
+                        "id": "C003_validation",
+                        "name": "Validation",
+                        "deployable": True,
+                        "external": False,
+                    },
+                ],
+            },
+        ]
+    }
+    (tmp_path / "functional-blocks.yaml").write_text(
+        yaml.safe_dump(payload, sort_keys=False),
+        encoding="utf-8",
+    )
+
+
 def test_dry_run_orders_commands_without_executing(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -165,6 +220,50 @@ def test_trial_mode_executes_only_ready_dependency_closed_steps(tmp_path: Path) 
     assert [step.id for step in prepared.excluded_steps] == ["S002", "S003"]
     assert completed == ("S001",)
     assert calls == ["printf database"]
+
+
+def test_trial_mode_can_select_one_block_after_provided_blocks(tmp_path: Path) -> None:
+    workflow, source = _write_workflow(tmp_path)
+    _write_functional_blocks(tmp_path)
+
+    prepared = prepare_execution(
+        workflow,
+        {"fixture": source},
+        allow_unready=True,
+        block_id="B1",
+    )
+
+    assert prepared.selected_block is not None
+    assert prepared.selected_block.id == "B1"
+    assert [operation.step.id for operation in prepared.operations] == ["S001"]
+    assert prepared.excluded_steps == ()
+    assert "Selected block: B1 (Data Services)" in prepared.render()
+
+    blocks_path = tmp_path / "functional-blocks.yaml"
+    blocks_payload = yaml.safe_load(blocks_path.read_text(encoding="utf-8"))
+    blocks_payload["blocks"][2]["after"] = ["B0"]
+    blocks_path.write_text(yaml.safe_dump(blocks_payload, sort_keys=False), encoding="utf-8")
+    application_block = prepare_execution(
+        workflow,
+        {"fixture": source},
+        allow_unready=True,
+        block_id="B2",
+    )
+    assert "cross-block workflow order omitted: S001" in application_block.render()
+    assert "after in selected scope: S002" in application_block.render()
+
+
+def test_block_selection_rejects_non_provided_prerequisites(tmp_path: Path) -> None:
+    workflow, source = _write_workflow(tmp_path)
+    _write_functional_blocks(tmp_path)
+
+    with pytest.raises(WorkflowNotExecutableError, match="non-provided blocks: B1"):
+        prepare_execution(
+            workflow,
+            {"fixture": source},
+            allow_unready=True,
+            block_id="B2",
+        )
 
 
 def test_legacy_duplicate_stack_commands_are_rejected(tmp_path: Path) -> None:

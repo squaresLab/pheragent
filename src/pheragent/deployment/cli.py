@@ -122,6 +122,15 @@ def _add_run_parser(commands: Any) -> None:
         ),
     )
     run.add_argument(
+        "--block",
+        default=None,
+        metavar="BLOCK_ID",
+        help=(
+            "Run only one discovered functional block whose prerequisites are provided; "
+            "reads functional-blocks.yaml beside the workflow."
+        ),
+    )
+    run.add_argument(
         "--approve",
         default=None,
         metavar="TOKEN",
@@ -278,6 +287,7 @@ def _run_workflow(args: argparse.Namespace) -> int:
         args.workflow,
         source_roots,
         allow_unready=args.allow_unready,
+        block_id=args.block,
     )
     print(prepared.render(), end="")
     if not args.execute:
