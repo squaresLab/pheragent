@@ -9,6 +9,7 @@ from typing import Any
 import yaml
 from pydantic import ValidationError
 
+from .analysis_llm import DEFAULT_ANALYSIS_MODEL
 from .analyzer import AnalysisConfig, AnalysisResult, run_repository_analysis
 from .artifacts import analysis_metrics, publish_analysis_artifacts
 from .enums import AnalysisTreatment
@@ -220,7 +221,10 @@ def _analysis_config(args: argparse.Namespace, output_root: Path) -> AnalysisCon
         source_timeout=args.source_timeout,
         gold_path=None,
         model=(
-            args.model or os.getenv("PHERAGENT_MODEL") or os.getenv("OPENAI_MODEL") or "gpt-4o-mini"
+            args.model
+            or os.getenv("PHERAGENT_MODEL")
+            or os.getenv("OPENAI_MODEL")
+            or DEFAULT_ANALYSIS_MODEL
         ),
         api_key_env=args.openai_api_key_env,
         base_url_env=args.openai_base_url_env,

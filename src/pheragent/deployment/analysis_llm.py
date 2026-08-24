@@ -21,11 +21,13 @@ from pheragent.llm_planner import (
 
 from .serialization import write_json
 
+DEFAULT_ANALYSIS_MODEL = "gpt-5.6-terra"
+
 
 @dataclass(slots=True)
 class AnalysisLLMConfig:
     enabled: bool = True
-    model: str = "gpt-4o-mini"
+    model: str = DEFAULT_ANALYSIS_MODEL
     api_key_env: str = "OPENAI_API_KEY"
     base_url_env: str = "OPENAI_BASE_URL"
     base_url: str | None = None

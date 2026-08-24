@@ -10,6 +10,7 @@ import yaml
 from pheragent.utils import slugify
 
 from .analysis_llm import (
+    DEFAULT_ANALYSIS_MODEL,
     AnalysisLLMConfig,
     CachedStructuredClassifier,
     LLMRequestBudget,
@@ -69,7 +70,7 @@ class AnalysisConfig:
     strict: bool = False
     source_timeout: float = 900.0
     gold_path: Path | None = None
-    model: str = "gpt-4o-mini"
+    model: str = DEFAULT_ANALYSIS_MODEL
     api_key_env: str = "OPENAI_API_KEY"
     base_url_env: str = "OPENAI_BASE_URL"
     base_url: str | None = None

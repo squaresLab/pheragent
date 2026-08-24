@@ -52,7 +52,8 @@ uv run pheragent deployment analyze \
 
 The product uses the versioned `deployment-analysis-v1` policy. Experimental methods and
 human-reviewed invariants belong to the separate `pheragent research` entry point, so operators do
-not select research treatments when producing a deployment plan.
+not select research treatments when producing a deployment plan. Its default analysis model is
+`gpt-5.6-terra`; `--model` and `PHERAGENT_MODEL` remain explicit overrides.
 
 Each invocation creates an immutable UTC directory under
 `.pheragent/deployment/mosip/runs/`. Source clones and content-addressed LLM synthesis

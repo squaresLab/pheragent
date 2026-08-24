@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from pheragent.cli import _build_parser
+from pheragent.deployment.analysis_llm import DEFAULT_ANALYSIS_MODEL
 from pheragent.deployment.cli import _analysis_config
 from pheragent.deployment.enums import AnalysisTreatment
 
@@ -14,7 +15,12 @@ def _isolate_project_dotenv(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> 
     monkeypatch.chdir(tmp_path)
 
 
-def test_deployment_analyze_can_force_fresh_llm_requests(tmp_path: Path) -> None:
+def test_deployment_analyze_can_force_fresh_llm_requests(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("PHERAGENT_MODEL", raising=False)
+    monkeypatch.delenv("OPENAI_MODEL", raising=False)
     parser = _build_parser()
     args = parser.parse_args(
         [
@@ -32,7 +38,9 @@ def test_deployment_analyze_can_force_fresh_llm_requests(tmp_path: Path) -> None
 
     assert args.refresh_llm is True
     assert args.llm_reasoning_effort == "low"
-    assert _analysis_config(args, tmp_path).treatment == AnalysisTreatment.HYBRID
+    config = _analysis_config(args, tmp_path)
+    assert config.treatment == AnalysisTreatment.HYBRID
+    assert config.model == DEFAULT_ANALYSIS_MODEL
 
 
 def test_deployment_run_accepts_one_block_scope(tmp_path: Path) -> None:
