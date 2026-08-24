@@ -48,6 +48,7 @@ from .investigation_models import (
     SourcePurpose,
 )
 from .models import RepositoryInventory
+from .retrieval import is_installer_path
 from .source_manager import AcquiredSource
 
 _VERSION = re.compile(r"(?<!\d)(\d+\.\d+\.\d+(?:\.\d+)?)(?!\d)")
@@ -1732,7 +1733,7 @@ def _best_installation_route(
         if observation.source_id != component.source_ref.repo_id:
             continue
         path = PurePosixPath(observation.path)
-        if path.name.casefold() not in {"install.sh", "deploy.sh", "setup.sh"}:
+        if not is_installer_path(observation.path):
             continue
         lines = _read_source_text_lines(sources[observation.source_id], observation.path)
         matching_line = next(

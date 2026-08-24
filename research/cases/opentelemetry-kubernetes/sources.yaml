@@ -1,0 +1,22 @@
+system: opentelemetry-demo
+sources:
+  - id: opentelemetry-demo
+    kind: git
+    location: https://github.com/open-telemetry/opentelemetry-demo.git
+    purpose: documentation
+    revision: 2e05c45b85b985a691cc75082c234e8d6ac0b2e9
+    root_path: .
+    include_patterns:
+      - README.md
+      - compose*.yaml
+  - id: opentelemetry-helm-charts
+    kind: git
+    location: https://github.com/open-telemetry/opentelemetry-helm-charts.git
+    purpose: repository
+    revision: e16802f9a5bc300bea37f80097f02b69c28874c4
+    root_path: charts/opentelemetry-demo
+    include_patterns:
+      - Chart.yaml
+      - README.md
+      - values.yaml
+      - templates/**

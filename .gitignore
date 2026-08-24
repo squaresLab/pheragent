@@ -46,6 +46,9 @@ projects-repo2run/
 tests/projects/ExecutionAgent_success_output_multi-oracles/
 tests/projects/success_output_multi-oracles/
 
+# Local research working notes
+research_plan.md
+
 # Repo-local caches created inside target projects
 .cache/
 **/.cache/

@@ -58,6 +58,8 @@ def _jsonable(value: Any) -> Any:
         return value.model_dump(mode="json", exclude_none=True)
     if isinstance(value, Enum):
         return value.value
+    if isinstance(value, Path):
+        return str(value)
     if isinstance(value, dict):
         return {key: _jsonable(item) for key, item in value.items()}
     if isinstance(value, (list, tuple)):

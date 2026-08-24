@@ -69,7 +69,7 @@ class EvidenceBudget:
 
 def collect_investigation_evidence(
     *,
-    plan: InvestigationPlan,
+    queries: tuple[InvestigationQuery, ...],
     sources: dict[str, AcquiredSource],
     source_purposes: dict[str, SourcePurpose],
     searchable_paths: dict[str, list[str]],
@@ -167,7 +167,7 @@ def collect_investigation_evidence(
     # Mandatory probes run alongside a bounded subset of model-selected terms.
     # This prevents known-name bias without allowing searches to crowd out roots.
     component_by_id = {component.id: component for component in components}
-    for query in _bounded_investigation_queries(plan):
+    for query in queries:
         target = component_by_id.get(query.component_id or "")
         collector.search(
             query=query,
@@ -236,6 +236,8 @@ class _EvidenceCollector:
         kind = (
             EvidenceKind.DOCUMENTATION_REQUIREMENT
             if query.purpose == InvestigationPurpose.EXTERNAL_REQUIREMENTS
+            else EvidenceKind.INSTALLATION_ROUTE
+            if query.purpose == InvestigationPurpose.DEPLOYMENT_ENTRYPOINTS
             else EvidenceKind.CONFIGURATION_REFERENCE
             if query.purpose == InvestigationPurpose.MISSING_COMPONENTS
             else EvidenceKind.SEARCH_RESULT
@@ -460,21 +462,20 @@ class _EvidenceCollector:
         self._characters += len(sanitized)
 
 
-def _bounded_investigation_queries(plan: InvestigationPlan) -> list[InvestigationQuery]:
-    """Guarantee independent probes while bounding model-directed search cost."""
+def schedule_investigation_queries(
+    plan: InvestigationPlan,
+    *,
+    guided_queries: tuple[InvestigationQuery, ...] = (),
+) -> tuple[InvestigationQuery, ...]:
+    """Run independent probes first, then spend the remaining fixed budget on guidance."""
+    maximum_queries = 8
     mandatory = default_investigation_plan().queries
-    selected = plan.queries[:4]
-    interleaved: list[InvestigationQuery] = []
-    for index in range(max(len(mandatory), len(selected))):
-        if index < len(mandatory):
-            interleaved.append(mandatory[index])
-        if index < len(selected):
-            interleaved.append(selected[index])
+    candidates = [*mandatory, *guided_queries[:2], *plan.queries]
     result: list[InvestigationQuery] = []
     seen: set[tuple[InvestigationPurpose, tuple[str, ...], SourceScope, str | None, str | None]] = (
         set()
     )
-    for query in interleaved:
+    for query in candidates:
         signature = (
             query.purpose,
             tuple(term.casefold() for term in query.terms),
@@ -485,7 +486,9 @@ def _bounded_investigation_queries(plan: InvestigationPlan) -> list[Investigatio
         if signature not in seen:
             result.append(query)
             seen.add(signature)
-    return result
+        if len(result) == maximum_queries:
+            break
+    return tuple(result)
 
 
 def _build_retriever(

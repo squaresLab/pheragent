@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
-from typing import Self
+from typing import Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -20,6 +20,7 @@ class SourceSpec(ContractModel):
     id: str = Field(pattern=IDENTIFIER_PATTERN)
     kind: SourceKind
     location: str = Field(min_length=1)
+    purpose: Literal["repository", "documentation"] = "repository"
     revision: str | None = None
     root_path: str = "."
     include_patterns: list[str] = Field(default_factory=list)
@@ -40,6 +41,7 @@ class SourceManifestEntry(ContractModel):
     id: str = Field(pattern=IDENTIFIER_PATTERN)
     kind: SourceKind
     location: str = Field(min_length=1)
+    purpose: Literal["repository", "documentation"] = "repository"
     requested_revision: str | None = None
     resolved_revision: str | None = Field(default=None, pattern=r"^[a-f0-9]{40,64}$")
     root_path: str = "."

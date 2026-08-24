@@ -30,8 +30,12 @@ from .discovery import (
     bind_retrieved_installation_routes,
     discover_repository,
 )
-from .enums import SourceKind
-from .evidence import EvidenceBudget, collect_investigation_evidence
+from .enums import AnalysisTreatment, SourceKind
+from .evidence import (
+    EvidenceBudget,
+    collect_investigation_evidence,
+    schedule_investigation_queries,
+)
 from .functional_blocks import build_functional_blocks
 from .inventory import RepositoryInventoryBuilder
 from .investigation import (
@@ -42,7 +46,12 @@ from .investigation import (
     reconcile_investigation_synthesis,
     synthesize_investigation_with_llm,
 )
-from .investigation_models import SourcePurpose, default_investigation_plan
+from .investigation_models import InvestigationQuery, SourcePurpose, default_investigation_plan
+from .knowledge_graph import (
+    DeploymentKnowledgeGraph,
+    graph_gap_queries,
+    project_deployment_knowledge,
+)
 from .models import RepositoryInventory, SourcesConfig, SourceSpec
 from .source_manager import AcquisitionResult, SourceManager
 from .workflow import build_deployment_workflow
@@ -74,6 +83,8 @@ class AnalysisConfig:
     llm_enabled: bool = True
     investigation_max_observations: int = 32
     investigation_max_evidence_chars: int = 18_000
+    treatment: AnalysisTreatment = AnalysisTreatment.HYBRID
+    sources: SourcesConfig | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -93,6 +104,10 @@ class AnalysisResult:
     llm_usage: dict[str, int]
     llm_stage_statuses: dict[str, str]
     llm_failure_history_paths: tuple[Path, ...]
+    knowledge_graph: DeploymentKnowledgeGraph | None
+    graph_queries: tuple[str, ...]
+    retrieval_queries: tuple[InvestigationQuery, ...]
+    evidence_characters: int
 
 
 def run_repository_analysis(
@@ -119,8 +134,12 @@ class RepositoryAnalysisPipeline:
         config = self.config
         notify = self.notify
         context = _load_context(config.context_path)
-        sources_config = _sources_config(config.repositories, config.documentation, context.system)
-        source_purposes = _source_purposes(sources_config, len(config.repositories))
+        sources_config = config.sources or _sources_config(
+            config.repositories,
+            config.documentation,
+            context.system,
+        )
+        source_purposes = _source_purposes(sources_config)
         notify(f"acquiring {len(sources_config.sources)} source(s)")
         acquisition = SourceManager(
             cache_dir=config.cache_dir,
@@ -149,8 +168,25 @@ class RepositoryAnalysisPipeline:
         outlines = discovery.outlines
         notify(f"extracting deterministic evidence from {len(files)} file(s)")
 
+        knowledge_graph = None
+        guided_queries = ()
+        if config.treatment == AnalysisTreatment.HYBRID_GRAPH:
+            knowledge_graph = project_deployment_knowledge(
+                signals,
+                list(nodes),
+                list(reference_relations),
+            )
+            guided_queries = graph_gap_queries(knowledge_graph)
+            notify(
+                f"projected {len(knowledge_graph.nodes)} graph node(s), "
+                f"{len(knowledge_graph.edges)} edge(s), and {len(knowledge_graph.gaps)} gap(s)"
+            )
+
         llm_config = AnalysisLLMConfig(
-            enabled=config.llm_enabled,
+            enabled=(
+                config.llm_enabled
+                and config.treatment != AnalysisTreatment.DETERMINISTIC
+            ),
             model=config.model,
             api_key_env=config.api_key_env,
             base_url_env=config.base_url_env,
@@ -176,9 +212,13 @@ class RepositoryAnalysisPipeline:
         if plan_outcome.warning:
             warnings.append(plan_outcome.warning)
 
-        notify(f"running {len(plan.queries)} model-selected and mandatory read-only probes")
+        retrieval_queries = schedule_investigation_queries(
+            plan,
+            guided_queries=guided_queries,
+        )
+        notify(f"running {len(retrieval_queries)} bounded read-only retrieval queries")
         observations, mandatory_probes = collect_investigation_evidence(
-            plan=plan,
+            queries=retrieval_queries,
             sources=source_by_id,
             source_purposes=source_purposes,
             searchable_paths=discovery.searchable_paths,
@@ -247,7 +287,9 @@ class RepositoryAnalysisPipeline:
             synthesis=synthesis,
             llm_completed=synthesis_outcome.value is not None,
             mandatory_probes=mandatory_probes,
-            documentation_expected=bool(config.documentation),
+            documentation_expected=(
+                SourcePurpose.DOCUMENTATION in source_purposes.values()
+            ),
         )
 
         gold = _load_gold(config.gold_path)
@@ -283,6 +325,12 @@ class RepositoryAnalysisPipeline:
             llm_usage=usage,
             llm_stage_statuses=statuses,
             llm_failure_history_paths=failure_paths,
+            knowledge_graph=knowledge_graph,
+            graph_queries=tuple(query.reason_code for query in guided_queries),
+            retrieval_queries=retrieval_queries,
+            evidence_characters=sum(
+                len(observation.excerpt or "") for observation in observations
+            ),
         )
 
 
@@ -329,6 +377,7 @@ def _sources_config(
                     id=source_id,
                     kind=source_kind,
                     location=resolved_location,
+                    purpose=("repository" if kind == "repo" else "documentation"),
                 )
             )
     if not specs:
@@ -343,16 +392,8 @@ def _source_kind(location: str) -> SourceKind:
     return SourceKind.LOCAL_FILE if path.is_file() else SourceKind.LOCAL_DIRECTORY
 
 
-def _source_purposes(
-    config: SourcesConfig,
-    repository_count: int,
-) -> dict[str, SourcePurpose]:
-    return {
-        source.id: (
-            SourcePurpose.REPOSITORY if index < repository_count else SourcePurpose.DOCUMENTATION
-        )
-        for index, source in enumerate(config.sources)
-    }
+def _source_purposes(config: SourcesConfig) -> dict[str, SourcePurpose]:
+    return {source.id: SourcePurpose(source.purpose) for source in config.sources}
 
 
 def _source_id(location: str, *, fallback: str) -> str:

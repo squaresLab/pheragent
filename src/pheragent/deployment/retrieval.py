@@ -17,12 +17,18 @@ _PATH_TOKEN = re.compile(r"(?:\./|\.\./)?[A-Za-z0-9_.${}/-]+")
 _REFERENCE_SUFFIXES = (".sh", ".yaml", ".yml")
 _MAX_REFERENCES_PER_DOCUMENT = 128
 _INSTALLER_NAMES = frozenset({"install.sh", "deploy.sh", "setup.sh"})
+_INSTALLER_NAME = re.compile(r"^(?:install|deploy|setup)(?:[-_.][a-z0-9_.-]+)?\.(?:sh|bash)$")
 
 
 def normalize_terms(value: str) -> tuple[str, ...]:
     """Normalize prose and identifiers without relying on a project vocabulary."""
     separated = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", value)
     return tuple(token.casefold() for token in _TOKEN.findall(separated))
+
+
+def is_installer_path(path: str) -> bool:
+    """Recognize conventional installer scripts without requiring one exact filename."""
+    return bool(_INSTALLER_NAME.fullmatch(PurePosixPath(path).name.casefold()))
 
 
 @dataclass(frozen=True, slots=True)

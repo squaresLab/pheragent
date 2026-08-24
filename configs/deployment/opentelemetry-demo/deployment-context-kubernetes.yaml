@@ -1,0 +1,33 @@
+system: opentelemetry-demo
+
+deployment:
+  profile: kubernetes
+
+provided_blocks:
+  - id: B0
+    type: base_infrastructure
+    subtype: host_infrastructure
+    implementation: existing_compute
+    state: provided
+    provides:
+      - compute-hosts
+      - host-network
+
+  - id: B1
+    type: runtime_environment
+    subtype: container_platform
+    implementation: kubernetes
+    state: provided
+    after: [B0]
+    provides:
+      - kubernetes-api
+      - workload-scheduling
+      - service-networking
+      - persistent-storage
+
+hints:
+  documentation:
+    - README.md
+    - Chart.yaml
+    - values.yaml
+    - templates

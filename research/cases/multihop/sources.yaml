@@ -1,0 +1,7 @@
+system: multihop-fixture
+sources:
+  - id: multihop-repository
+    kind: local_directory
+    location: repository
+    purpose: repository
+    root_path: .

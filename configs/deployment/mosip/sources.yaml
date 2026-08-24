@@ -6,6 +6,7 @@ sources:
   - id: mosip-infra
     kind: git
     location: https://github.com/mosip/mosip-infra.git
+    purpose: repository
     revision: v1.2.1.0
     root_path: .
     include_patterns:
@@ -32,6 +33,7 @@ sources:
   - id: mosip-docs
     kind: git
     location: https://github.com/mosip/documentation.git
+    purpose: documentation
     revision: 1.2.0
     root_path: .
     include_patterns:

@@ -9,6 +9,7 @@ from .env import load_dotenv
 from .models import DEFAULT_ABLATION_MODE, BuildRequest, to_jsonable
 from .orchestrator import EnvironmentBuilder
 from .project_batch import ProjectBatchBuilder
+from .research.cli import add_research_parser, run_research_command
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -47,6 +48,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "deployment":
         return run_deployment_command(args)
 
+    if args.command == "research":
+        return run_research_command(args)
+
     parser.print_help()
     return 2
 
@@ -56,6 +60,7 @@ def _build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     add_deployment_parser(subparsers)
+    add_research_parser(subparsers)
 
     plan = subparsers.add_parser("plan", help="Analyze a repo and write setup block scripts.")
     _add_common_args(plan, include_dockerfile=False)

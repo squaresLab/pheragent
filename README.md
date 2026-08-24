@@ -1,20 +1,25 @@
 # pheragent
 
-`pheragent` is a command-driven, checkpointed Docker environment builder agent.
-It analyzes a target repository, plans setup blocks, executes them inside an
-isolated container, repairs failed blocks when possible, and writes the final
-setup scripts plus a manifest for later inspection.
+`pheragent` contains two command-driven workflows built on repository analysis:
 
-The default planner mode is `auto`: it uses the LLM planner when the configured
-OpenAI-compatible API key is present, otherwise it falls back to deterministic
-rules.
+- **HerAgent-Deploy** analyzes deployment repositories and documentation, produces a
+  human-reviewable workflow, and executes only the exact approved operations.
+- The original **environment builder** plans setup blocks, executes them in an isolated
+  Docker container, and repairs failed blocks when possible.
+
+The environment builder's default planner mode is `auto`: it uses the LLM planner when the
+configured OpenAI-compatible API key is present, otherwise it falls back to deterministic rules.
+HerAgent-Deploy uses its versioned product analysis policy and reports degraded fallback when model
+reasoning is unavailable.
 
 ## Requirements
 
 - `uv`
-- Docker CLI with a running Docker daemon
 - Python `>=3.14`, as declared in `pyproject.toml`
 - Optional: an OpenAI-compatible endpoint for LLM planning and repair
+
+HerAgent-Deploy additionally requires the tools used by the generated workflow, such as
+`kubectl` and Helm. The environment builder requires the Docker CLI and a running Docker daemon.
 
 Install dependencies and check the CLI:
 
@@ -42,9 +47,12 @@ uv run pheragent deployment analyze \
   --repo https://github.com/mosip/mosip-infra.git \
   --docs https://github.com/mosip/documentation.git \
   --context configs/deployment/mosip/deployment-context.yaml \
-  --gold configs/deployment/mosip/gold.yaml \
   --output .pheragent/deployment/mosip
 ```
+
+The product uses the versioned `deployment-analysis-v1` policy. Experimental methods and
+human-reviewed invariants belong to the separate `pheragent research` entry point, so operators do
+not select research treatments when producing a deployment plan.
 
 Each invocation creates an immutable UTC directory under
 `.pheragent/deployment/mosip/runs/`. Source clones and content-addressed LLM synthesis
@@ -53,6 +61,9 @@ without paying repeated acquisition or synthesis costs. A normal run contains:
 
 ```text
 runs/<timestamp>-<run-name>/
+├── run-manifest.json
+├── events.jsonl
+├── metrics.json
 ├── functional-blocks.yaml
 ├── deployment-workflow.yaml
 └── analysis-report.md
@@ -105,9 +116,31 @@ automatic health validation, rollback, or repair.
 
 The MOSIP context deliberately supplies only the already-provisioned infrastructure
 and Kubernetes blocks. The analyzer discovers installer roots and service/application
-components without exact path hints. Its optional gold definition reports component,
-classification, dependency, entrypoint, grouping, grounding, artifact-size, and
-hallucination metrics.
+components without exact path hints. A human must reconcile the generated workflow with the live
+environment before approving execution.
+
+## Deployment Research
+
+Research uses the same analyzer core through a separate CLI. A study selects pinned cases,
+experimental treatments, repetitions, budgets, and optional human-reviewed invariants:
+
+```bash
+uv run pheragent research run \
+  --study research/studies/graph-retrieval-pilot.yaml
+```
+
+This defaults to cost preflight and reports the planned run and LLM-request ceilings. Add
+`--execute` to run the declared study. Research alone exposes the analysis treatments:
+
+- `a0`: deterministic baseline
+- `a1`: bounded hybrid analysis
+- `a2`: graph-guided bounded hybrid analysis
+
+Rebuild derived result tables without modifying sealed runs with:
+
+```bash
+uv run pheragent research summarize .pheragent/research/graph-retrieval-pilot
+```
 
 ## Configuration
 
@@ -389,7 +422,17 @@ uv run python scripts/run_setupbench.py \
 
 ## Branch Guide
 
-Use `main` for the integrated implementation and the documented CLI above:
+Use `feat/mosip-deployment-mvp` for the current HerAgent-Deploy product and research implementation:
+
+```bash
+git fetch origin
+git switch feat/mosip-deployment-mvp
+uv sync
+uv run pheragent deployment --help
+uv run pheragent research --help
+```
+
+Use `main` for the integrated environment-builder implementation:
 
 ```bash
 git switch main

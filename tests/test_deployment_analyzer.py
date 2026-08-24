@@ -455,7 +455,7 @@ def test_analyze_cli_writes_execution_readiness_outputs_in_timestamped_run(
     monkeypatch,
     capsys,
 ) -> None:
-    repository, context, gold = _write_fixture(tmp_path)
+    repository, context, _gold = _write_fixture(tmp_path)
     output = tmp_path / "output"
     monkeypatch.chdir(tmp_path)
 
@@ -467,8 +467,6 @@ def test_analyze_cli_writes_execution_readiness_outputs_in_timestamped_run(
             str(repository),
             "--context",
             str(context),
-            "--gold",
-            str(gold),
             "--output",
             str(output),
             "--openai-api-key-env",
@@ -483,13 +481,20 @@ def test_analyze_cli_writes_execution_readiness_outputs_in_timestamped_run(
     assert sorted(path.name for path in run_directories[0].iterdir()) == [
         "analysis-report.md",
         "deployment-workflow.yaml",
+        "events.jsonl",
         "functional-blocks.yaml",
+        "metrics.json",
+        "run-manifest.json",
     ]
     assert (output / ".source-cache").is_dir()
     workflow = yaml.safe_load(
         (run_directories[0] / "deployment-workflow.yaml").read_text(encoding="utf-8")
     )
+    manifest = json.loads(
+        (run_directories[0] / "run-manifest.json").read_text(encoding="utf-8")
+    )
     assert workflow["ready_for_execution"] is False
+    assert manifest["analysis_method"] == "deployment-analysis-v1"
     assert f"run: {run_directories[0]}" in capsys.readouterr().out
 
 

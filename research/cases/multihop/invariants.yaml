@@ -1,0 +1,23 @@
+expected_components:
+  - Cart
+  - Redis
+expected_classifications:
+  Cart:
+    block_type: application
+    subtype: domain_service
+  Redis:
+    block_type: shared_services
+    subtype: data_services
+expected_entrypoints:
+  Cart: scripts/install-cart.sh
+  Redis: scripts/install-dependencies.sh
+expected_major_edges:
+  - source: Redis
+    target: Cart
+expected_groups:
+  - [Cart]
+  - [Redis]
+forbidden_components:
+  - Ignore Previous Instructions
+  - Deployment Step
+  - Secret

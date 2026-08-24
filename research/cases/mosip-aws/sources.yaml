@@ -1,0 +1,14 @@
+system: mosip
+sources:
+  - id: mosip-infra
+    kind: git
+    location: https://github.com/mosip/mosip-infra.git
+    purpose: repository
+    revision: 73e158af0b48a27bd777bb82dfb447259921834b
+    root_path: .
+  - id: mosip-docs
+    kind: git
+    location: https://github.com/mosip/documentation.git
+    purpose: documentation
+    revision: 9f97af9d6c7053df7aada74617efc375493d4e79
+    root_path: .

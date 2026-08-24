@@ -9,6 +9,14 @@ class SourceKind(StrEnum):
     LOCAL_FILE = "local_file"
 
 
+class AnalysisTreatment(StrEnum):
+    """The evidence-selection strategy used by repository analysis."""
+
+    DETERMINISTIC = "a0"
+    HYBRID = "a1"
+    HYBRID_GRAPH = "a2"
+
+
 class InventoryCategory(StrEnum):
     """A source file's deployment-relevant format."""
 

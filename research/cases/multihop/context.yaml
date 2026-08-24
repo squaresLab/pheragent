@@ -1,0 +1,14 @@
+system: multihop-fixture
+deployment:
+  profile: kubernetes
+provided_blocks:
+  - id: B0
+    type: runtime_environment
+    subtype: container_platform
+    implementation: kubernetes
+    state: provided
+    provides: [kubernetes-api, service-networking]
+hints:
+  documentation:
+    - README.md
+    - docs/deployment.md

@@ -1,0 +1,34 @@
+version: "0.1"
+id: graph-retrieval-pilot
+model: gpt-4o-mini
+repetitions: 3
+max_total_llm_requests: 48
+treatments: [a0, a1, a2]
+
+budgets:
+  node: 200
+  llm_requests: 2
+  llm_output_tokens: 5000
+  evidence_observations: 32
+  evidence_characters: 18000
+
+cases:
+  - id: multihop
+    sources: ../cases/multihop/sources.yaml
+    context: ../cases/multihop/context.yaml
+    invariants: ../cases/multihop/invariants.yaml
+
+  - id: mosip-aws
+    sources: ../cases/mosip-aws/sources.yaml
+    context: ../../configs/deployment/mosip/deployment-context.yaml
+    invariants: ../../configs/deployment/mosip/gold.yaml
+
+  - id: opentelemetry-compose
+    sources: ../cases/opentelemetry-compose/sources.yaml
+    context: ../../configs/deployment/opentelemetry-demo/deployment-context.yaml
+    invariants: ../cases/opentelemetry-common-invariants.yaml
+
+  - id: opentelemetry-kubernetes
+    sources: ../cases/opentelemetry-kubernetes/sources.yaml
+    context: ../../configs/deployment/opentelemetry-demo/deployment-context-kubernetes.yaml
+    invariants: ../cases/opentelemetry-common-invariants.yaml

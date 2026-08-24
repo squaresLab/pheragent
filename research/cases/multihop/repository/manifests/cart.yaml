@@ -1,0 +1,13 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cart
+spec:
+  template:
+    spec:
+      containers:
+        - name: cart
+          image: example.invalid/cart:1.0.0
+          env:
+            - name: REDIS_HOST
+              value: redis

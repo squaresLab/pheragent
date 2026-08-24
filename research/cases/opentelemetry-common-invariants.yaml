@@ -1,0 +1,39 @@
+expected_components:
+  - Ad
+  - Cart
+  - Checkout
+  - Currency
+  - Email
+  - Frontend
+  - Frontend Proxy
+  - Image Provider
+  - Load Generator
+  - Payment
+  - Product Catalog
+  - Quote
+  - Recommendation
+  - Shipping
+  - Flagd
+  - Flagd UI
+  - Telemetry Docs
+  - Astronomy DB
+  - Valkey Cart
+  - Otel Collector
+  - Accounting
+  - Fraud Detection
+  - Kafka
+  - Jaeger
+  - Grafana
+  - Prometheus
+  - Opensearch
+  - Opamp Server
+expected_groups:
+  - [Ad, Cart, Checkout, Currency, Email, Frontend, Payment, Product Catalog, Quote, Recommendation, Shipping]
+  - [Astronomy DB, Valkey Cart]
+  - [Jaeger, Grafana, Prometheus, Opensearch, Otel Collector]
+forbidden_components:
+  - compose.yaml
+  - Dockerfile
+  - ConfigMap
+  - Secret
+  - Deployment

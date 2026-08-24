@@ -10,11 +10,15 @@ import yaml
 from pydantic import ValidationError
 
 from .analyzer import AnalysisConfig, AnalysisResult, run_repository_analysis
+from .artifacts import analysis_metrics, publish_analysis_artifacts
+from .enums import AnalysisTreatment
 from .errors import DeploymentError, DeploymentInputError
 from .execution import prepare_execution
-from .output import AtomicOutputTransaction, create_timestamped_run_directory
-from .report import render_analysis_report
-from .serialization import write_json, write_text, write_yaml
+from .output import create_timestamped_run_directory
+from .run_records import RunRecorder
+
+_PRODUCT_ANALYSIS_POLICY = "deployment-analysis-v1"
+_PRODUCT_ANALYSIS_METHOD = AnalysisTreatment.HYBRID
 
 
 def add_deployment_parser(subparsers: Any) -> None:
@@ -41,7 +45,6 @@ def _add_analyze_parser(commands: Any) -> None:
         default=None,
         help="Label for the timestamped run folder; defaults to the context system name.",
     )
-    analyze.add_argument("--gold", type=Path, default=None)
     analyze.add_argument("--node-budget", type=_positive_int, default=200)
     analyze.add_argument("--source-timeout", type=float, default=900.0)
     analyze.add_argument("--strict", action="store_true")
@@ -150,8 +153,27 @@ def _run_analyze(args: argparse.Namespace) -> int:
     output_root = args.output.expanduser().resolve()
     run_name = args.run_name or _context_system_name(args.context)
     run_dir = create_timestamped_run_directory(output_root, name=run_name)
+    recorder = RunRecorder.start(
+        run_dir,
+        run_kind="product",
+        analysis_method=_PRODUCT_ANALYSIS_POLICY,
+        inputs={
+            "repositories": args.repo,
+            "documentation": args.docs,
+            "context": args.context,
+            "model": args.model,
+            "budgets": {
+                "node": args.node_budget,
+                "llm_requests": args.llm_max_requests,
+                "llm_output_tokens": args.llm_max_tokens,
+                "evidence_observations": args.investigation_max_observations,
+                "evidence_characters": args.investigation_max_evidence_chars,
+            },
+        },
+    )
 
     def progress(message: str) -> None:
+        recorder.record_event("analysis", message)
         print(f"analyze: {message}", file=sys.stderr, flush=True)
 
     try:
@@ -159,12 +181,22 @@ def _run_analyze(args: argparse.Namespace) -> int:
             _analysis_config(args, output_root),
             progress=progress,
         )
-        published = _publish_analysis_outputs(run_dir, result, debug=args.debug)
-    except Exception:
+        published = publish_analysis_artifacts(run_dir, result, debug=args.debug)
+        recorder.complete(
+            metrics=analysis_metrics(result),
+            sources=result.acquisition.manifest.model_dump(mode="json"),
+            llm={
+                "usage": result.llm_usage,
+                "stages": result.llm_stage_statuses,
+            },
+        )
+    except Exception as exc:
+        recorder.fail(exc)
         progress(f"failed; run directory retained at {run_dir}")
         raise
 
-    _print_analysis_summary(run_dir, result, len(published))
+    published_count = len(tuple(path for path in run_dir.rglob("*") if path.is_file()))
+    _print_analysis_summary(run_dir, result, max(len(published), published_count))
     return 0
 
 
@@ -177,7 +209,7 @@ def _analysis_config(args: argparse.Namespace, output_root: Path) -> AnalysisCon
         node_budget=args.node_budget,
         strict=args.strict,
         source_timeout=args.source_timeout,
-        gold_path=args.gold,
+        gold_path=None,
         model=(
             args.model or os.getenv("PHERAGENT_MODEL") or os.getenv("OPENAI_MODEL") or "gpt-4o-mini"
         ),
@@ -193,45 +225,8 @@ def _analysis_config(args: argparse.Namespace, output_root: Path) -> AnalysisCon
         refresh_llm=args.refresh_llm,
         investigation_max_observations=args.investigation_max_observations,
         investigation_max_evidence_chars=args.investigation_max_evidence_chars,
+        treatment=_PRODUCT_ANALYSIS_METHOD,
     )
-
-
-def _publish_analysis_outputs(
-    run_dir: Path,
-    result: AnalysisResult,
-    *,
-    debug: bool,
-) -> tuple[Path, ...]:
-    with AtomicOutputTransaction(run_dir, write_manifest=False) as transaction:
-        staging = transaction.staging_dir
-        write_yaml(staging / "functional-blocks.yaml", result.document)
-        write_text(staging / "analysis-report.md", render_analysis_report(result))
-        write_yaml(staging / "deployment-workflow.yaml", result.workflow)
-        if debug:
-            _write_debug_outputs(staging / "debug", result)
-        return transaction.commit()
-
-
-def _write_debug_outputs(debug: Path, result: AnalysisResult) -> None:
-    write_json(debug / "repository-index.json", list(result.repository_files))
-    write_json(
-        debug / "reference-graph.json",
-        {
-            "nodes": [item.model_dump(mode="json") for item in result.reference_nodes],
-            "relations": [item.model_dump(mode="json") for item in result.reference_relations],
-        },
-    )
-    write_json(debug / "component-candidates.json", result.signals.candidate_components)
-    write_json(debug / "deployment-signals.json", result.signals)
-    write_yaml(debug / "investigation-plan-input.yaml", result.investigation.plan_input)
-    write_yaml(debug / "investigation-plan.yaml", result.investigation.plan)
-    write_json(debug / "investigation-evidence.json", list(result.investigation.observations))
-    write_yaml(
-        debug / "investigation-synthesis-input.yaml",
-        result.investigation.synthesis_input,
-    )
-    if result.investigation.synthesis is not None:
-        write_yaml(debug / "investigation-synthesis.yaml", result.investigation.synthesis)
 
 
 def _print_analysis_summary(
