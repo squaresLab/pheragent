@@ -6,6 +6,7 @@ from pathlib import Path
 
 from .deployment.cli import add_deployment_parser, run_deployment_command
 from .env import load_dotenv
+from .evaluation.cli import add_evaluation_parser, run_evaluation_command
 from .models import DEFAULT_ABLATION_MODE, BuildRequest, to_jsonable
 from .orchestrator import EnvironmentBuilder
 from .project_batch import ProjectBatchBuilder
@@ -51,6 +52,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "research":
         return run_research_command(args)
 
+    if args.command == "evaluation":
+        return run_evaluation_command(args)
+
     parser.print_help()
     return 2
 
@@ -60,6 +64,7 @@ def _build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     add_deployment_parser(subparsers)
+    add_evaluation_parser(subparsers)
     add_research_parser(subparsers)
 
     plan = subparsers.add_parser("plan", help="Analyze a repo and write setup block scripts.")
