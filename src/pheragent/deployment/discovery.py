@@ -4,7 +4,7 @@ import hashlib
 import re
 from collections import defaultdict, deque
 from collections.abc import Iterable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import PurePosixPath
 from urllib.parse import urlsplit
 
@@ -20,7 +20,6 @@ from .analysis_models import (
     AnalysisRelationType,
     AnalysisSourceRef,
     ArtifactRole,
-    ArtifactRoleCandidate,
     ArtifactScope,
     CandidateComponent,
     ComponentClassification,
@@ -48,7 +47,7 @@ from .investigation_models import (
     SourcePurpose,
 )
 from .models import RepositoryInventory
-from .retrieval import is_installer_path
+from .retrieval import DeploymentRetrievalEngine, RetrievalDocument, is_installer_path
 from .source_manager import AcquiredSource
 
 _VERSION = re.compile(r"(?<!\d)(\d+\.\d+\.\d+(?:\.\d+)?)(?!\d)")
@@ -89,6 +88,15 @@ _FORBIDDEN_COMPONENT = re.compile(
 )
 _WORKLOAD_KINDS = {"Deployment", "StatefulSet", "DaemonSet", "Job", "CronJob"}
 _MAX_ARTIFACT_ROLE_CARDS = 100
+_ROOT_ROLES = {
+    ArtifactRole.DEPLOYMENT_GUIDE,
+    ArtifactRole.DEPLOYMENT_INDEX,
+    ArtifactRole.ORCHESTRATOR,
+    ArtifactRole.DESIRED_STATE,
+    ArtifactRole.INITIALIZATION,
+    ArtifactRole.OPERATIONS,
+    ArtifactRole.VALIDATION,
+}
 _REQUIRED_ENV_INPUT = re.compile(r"\$\{(?P<name>[A-Z][A-Z0-9_]*)\s*(?::?\?)")
 _POSITIONAL_INPUT = re.compile(r"\$\{(?P<number>[1-9])\s*(?::?\?)")
 _COMPOSE_FILE_ARGUMENT = re.compile(
@@ -141,6 +149,7 @@ class RepositoryDiscovery:
     signals: DeploymentSignalBundle
     outlines: tuple[ArtifactOutline, ...]
     searchable_paths: dict[str, tuple[str, ...]]
+    retrieval_documents: tuple[RetrievalDocument, ...]
     warnings: tuple[str, ...]
 
 
@@ -154,14 +163,14 @@ def discover_repository(
 ) -> RepositoryDiscovery:
     """Discover deployment roots, components, and relations using bounded local evidence."""
     files = _repository_files(inventory, context)
-    parsed = _parse_artifacts(files, sources, context)
+    parsed, source_texts = _parse_artifacts(files, sources, context)
     nodes, relations = _reference_graph(parsed)
     files = _files_with_roles(files, parsed)
     roots = _discover_roots(files, parsed, relations, context)
     selected = _traverse_roots(roots, relations, node_budget)
     selected.update(_supplemental_materialization_artifacts(parsed))
     signals, warnings = _discover_signals(context, roots, selected, parsed, sources)
-    candidates = _artifact_role_candidates(files, parsed, relations, context)
+    searchable_paths = _searchable_paths(files, context)
     return RepositoryDiscovery(
         files=tuple(files),
         reference_nodes=tuple(nodes),
@@ -169,8 +178,18 @@ def discover_repository(
         roots=tuple(roots),
         selected_paths=frozenset(selected),
         signals=signals,
-        outlines=tuple(_investigation_outlines(candidates, source_purposes)),
-        searchable_paths=_searchable_paths(files, context),
+        outlines=tuple(
+            _investigation_outlines(files, parsed, relations, context, source_purposes)
+        ),
+        searchable_paths=searchable_paths,
+        retrieval_documents=tuple(
+            _retrieval_documents(
+                searchable_paths,
+                source_texts,
+                parsed,
+                source_purposes,
+            )
+        ),
         warnings=tuple(warnings),
     )
 
@@ -279,89 +298,92 @@ def _searchable_paths(
         ):
             continue
         paths[file.repo_id].append(file.path)
-    file_by_key = {(file.repo_id, file.path): file for file in files}
-    return {
-        source_id: sorted(
-            items,
-            key=lambda path: _investigation_path_rank(
-                file_by_key[(source_id, path)],
-                context,
-            ),
-        )
-        for source_id, items in paths.items()
-    }
+    return {source_id: sorted(items) for source_id, items in paths.items()}
 
 
-def _investigation_path_rank(
-    file: RepositoryFile,
-    context: DeploymentContext,
-) -> tuple[int, int, str]:
-    """Put profile/version deployment guides and executable roots first."""
-    path = file.path.casefold()
-    score = 0
-    if file.version_context and file.version_context == context.deployment.version:
-        score += 30
-    if file.profile_context and file.profile_context == context.deployment.profile:
-        score += 25
-    if context.deployment.version and context.deployment.version.casefold() in path:
-        score += 20
-    if context.deployment.profile and context.deployment.profile.casefold() in path:
-        score += 15
-    if any(part in path for part in ("deploy", "install", "setup", "infra")):
-        score += 12
-    if file.deployment_roles:
-        score += 8
-    if PurePosixPath(file.path).name.casefold() in {"readme.md", "install.sh", "deploy.sh"}:
-        score += 5
-    return (-score, len(PurePosixPath(file.path).parts), file.path)
+def _retrieval_documents(
+    searchable_paths: dict[str, list[str]],
+    source_texts: dict[str, str],
+    parsed: dict[str, _ParsedArtifact],
+    source_purposes: dict[str, SourcePurpose],
+) -> list[RetrievalDocument]:
+    documents = []
+    for source_id, paths in sorted(searchable_paths.items()):
+        for path in paths:
+            key = _node_key(source_id, path)
+            text = source_texts.get(key)
+            if text is None:
+                continue
+            artifact = parsed.get(key)
+            passages = DeploymentRetrievalEngine.passages(
+                source_id=source_id,
+                source_kind=source_purposes[source_id].value,
+                path=path,
+                text=text,
+                roles=(
+                    tuple(role.value for role in sorted(artifact.roles)) if artifact else ()
+                ),
+            )
+            documents.extend(
+                replace(
+                    passage,
+                    facts=_retrieval_facts(artifact, passage.start_line, passage.end_line),
+                )
+                for passage in passages
+            )
+    return documents
+
+
+def _retrieval_facts(
+    artifact: _ParsedArtifact | None,
+    start_line: int,
+    end_line: int,
+) -> tuple[str, ...]:
+    if artifact is None:
+        return ()
+    components = (
+        f"component {name} executor {executor.value}"
+        for name, executor, line in artifact.structured_components
+        if start_line <= line <= end_line
+    )
+    references = (
+        f"{relation.value} {target}"
+        for target, line, relation in artifact.references
+        if start_line <= line <= end_line
+    )
+    invocations = (
+        f"invokes {invocation.target} command {invocation.command}"
+        for invocation in artifact.invocation_sequence
+        if start_line <= invocation.line <= end_line
+    )
+    return tuple([*components, *references, *invocations])
 
 
 def _investigation_outlines(
-    candidates: list[ArtifactRoleCandidate],
-    purposes: dict[str, SourcePurpose],
-) -> list[ArtifactOutline]:
-    return [
-        ArtifactOutline(
-            id=candidate.id,
-            source_id=candidate.repo_id,
-            source_purpose=purposes[candidate.repo_id],
-            path=candidate.path,
-            file_type=candidate.file_type,
-            roles=[role.value for role in candidate.deterministic_roles],
-            references=candidate.references,
-            referenced_by=candidate.referenced_by,
-            materialized_names=candidate.materialized_names,
-            validation_count=candidate.validation_count,
-            context_hint=candidate.context_hint,
-        )
-        for candidate in candidates
-    ]
-
-
-def _artifact_role_candidates(
     files: list[RepositoryFile],
     parsed: dict[str, _ParsedArtifact],
     relations: list[AnalysisRelation],
     context: DeploymentContext,
-) -> list[ArtifactRoleCandidate]:
-    """Build compact, source-grounded cards for the artifact-role classifier."""
+    purposes: dict[str, SourcePurpose],
+) -> list[ArtifactOutline]:
     incoming: dict[str, int] = defaultdict(int)
     for relation in relations:
         incoming[relation.target] += 1
     file_by_key = {_node_key(item.repo_id, item.path): item for item in files}
     hints = {_normalize_path(PurePosixPath(path)) for path in context.hints.documentation}
-    candidates = []
+    outlines = []
     for key, artifact in parsed.items():
         file = file_by_key.get(key)
         if file is None:
             continue
-        candidates.append(
-            ArtifactRoleCandidate(
+        outlines.append(
+            ArtifactOutline(
                 id=_node_id(artifact.source_id, artifact.path),
-                repo_id=artifact.source_id,
+                source_id=artifact.source_id,
+                source_purpose=purposes[artifact.source_id],
                 path=artifact.path,
                 file_type=file.file_type,
-                deterministic_roles=sorted(artifact.roles),
+                roles=[role.value for role in sorted(artifact.roles)],
                 references=len(artifact.references),
                 referenced_by=incoming[key],
                 materialized_names=[
@@ -372,30 +394,25 @@ def _artifact_role_candidates(
             )
         )
     ranked = sorted(
-        candidates,
+        outlines,
         key=lambda item: (
-            -_artifact_role_card_score(item),
-            item.repo_id,
+            -_outline_score(item),
+            item.source_id,
             item.path,
         ),
     )
     return ranked[:_MAX_ARTIFACT_ROLE_CARDS]
 
 
-def _artifact_role_card_score(candidate: ArtifactRoleCandidate) -> int:
-    root_roles = {
-        ArtifactRole.DEPLOYMENT_GUIDE,
-        ArtifactRole.DEPLOYMENT_INDEX,
-        ArtifactRole.ORCHESTRATOR,
-        ArtifactRole.DESIRED_STATE,
-    }
+def _outline_score(outline: ArtifactOutline) -> int:
+    root_roles = {role.value for role in _ROOT_ROLES}
     return (
-        int(candidate.context_hint) * 1000
-        + len(root_roles & set(candidate.deterministic_roles)) * 200
-        + min(candidate.references, 20) * 10
-        + min(candidate.referenced_by, 20) * 5
-        + int(bool(candidate.materialized_names)) * 25
-        + min(candidate.validation_count, 10) * 3
+        int(outline.context_hint) * 1000
+        + len(root_roles & set(outline.roles)) * 200
+        + min(outline.references, 20) * 10
+        + min(outline.referenced_by, 20) * 5
+        + int(bool(outline.materialized_names)) * 25
+        + min(outline.validation_count, 10) * 3
     )
 
 
@@ -442,8 +459,9 @@ def _parse_artifacts(
     files: list[RepositoryFile],
     sources: dict[str, AcquiredSource],
     context: DeploymentContext,
-) -> dict[str, _ParsedArtifact]:
+) -> tuple[dict[str, _ParsedArtifact], dict[str, str]]:
     parsed: dict[str, _ParsedArtifact] = {}
+    source_texts: dict[str, str] = {}
     for file in files:
         if file.size > 2 * 1024 * 1024 or _wrong_context(file, context):
             continue
@@ -453,6 +471,7 @@ def _parse_artifacts(
             InventoryCategory.ANSIBLE.value,
             InventoryCategory.TERRAFORM.value,
             InventoryCategory.HELM.value,
+            InventoryCategory.HELMSMAN.value,
             InventoryCategory.KUSTOMIZE.value,
             InventoryCategory.KUBERNETES.value,
             InventoryCategory.COMPOSE.value,
@@ -465,10 +484,11 @@ def _parse_artifacts(
             text = path.read_text(encoding="utf-8", errors="replace")
         except OSError, ValueError:
             continue
+        source_texts[_node_key(file.repo_id, file.path)] = text
         artifact = _parse_file(file, text)
         if artifact.roles or artifact.references or artifact.structured_components:
             parsed[_node_key(file.repo_id, file.path)] = artifact
-    return parsed
+    return parsed, source_texts
 
 
 def _parse_file(file: RepositoryFile, text: str) -> _ParsedArtifact:
@@ -482,6 +502,7 @@ def _parse_file(file: RepositoryFile, text: str) -> _ParsedArtifact:
     elif file.file_type in {
         InventoryCategory.ANSIBLE.value,
         InventoryCategory.HELM.value,
+        InventoryCategory.HELMSMAN.value,
         InventoryCategory.KUSTOMIZE.value,
         InventoryCategory.KUBERNETES.value,
         InventoryCategory.COMPOSE.value,
@@ -1115,19 +1136,14 @@ def _discover_roots(
         incoming[relation.target] += 1
     hints = {_normalize_path(PurePosixPath(item)) for item in context.hints.documentation}
     role_candidates: dict[ArtifactRole, list[tuple[float, str, list[str]]]] = defaultdict(list)
-    allowed_roles = {
-        ArtifactRole.DEPLOYMENT_GUIDE,
-        ArtifactRole.DEPLOYMENT_INDEX,
-        ArtifactRole.ORCHESTRATOR,
-        ArtifactRole.DESIRED_STATE,
-        ArtifactRole.INITIALIZATION,
-        ArtifactRole.OPERATIONS,
-        ArtifactRole.VALIDATION,
-    }
     for key, artifact in parsed.items():
         if artifact.scope == ArtifactScope.EXCLUDE:
             continue
-        for role in artifact.roles & allowed_roles:
+        if PurePosixPath(artifact.path).name.casefold().startswith(
+            ("delete", "remove", "uninstall", "cleanup")
+        ):
+            continue
+        for role in artifact.roles & _ROOT_ROLES:
             score = artifact.structural_score + incoming[key] * 3
             reasons = [f"structural score {artifact.structural_score:.1f}"]
             if artifact.path in hints:
@@ -1136,32 +1152,11 @@ def _discover_roots(
             if _looks_deployment_path(artifact.path):
                 score += 10
                 reasons.append("deployment path")
-            if (
-                context.deployment.version
-                and _path_version(artifact.path) == context.deployment.version
-            ):
-                score += 20
-                reasons.append("version match")
-            effective_profile = _effective_profile(context)
-            artifact_profile = _path_profile(artifact.path)
-            if (
-                effective_profile
-                and artifact_profile is not None
-                and _profile_matches(artifact_profile, effective_profile)
-            ):
-                score += 100
-                reasons.append("profile match")
             if any(
                 term in artifact.path.casefold() for term in ("example", "sample", "deprecated")
             ):
                 score -= 20
                 reasons.append("example/deprecated penalty")
-            if any(
-                term in PurePosixPath(artifact.path).name.casefold()
-                for term in ("delete", "remove", "uninstall", "cleanup")
-            ):
-                score -= 500
-                reasons.append("destructive-entrypoint penalty")
             role_candidates[role].append((score, key, reasons))
     roots: list[DeploymentRoot] = []
     has_shell_orchestrator = any(
@@ -1755,6 +1750,8 @@ def _best_installation_route(
     if not ranked:
         return None
     _score, observation, line = max(ranked, key=lambda item: (item[0], item[1].path))
+    if _score == 0:
+        return None
     return AnalysisSourceRef(
         repo_id=observation.source_id,
         path=observation.path,

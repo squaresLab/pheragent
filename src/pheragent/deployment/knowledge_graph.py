@@ -13,7 +13,6 @@ from .analysis_models import (
     CandidateComponent,
     DeploymentSignalBundle,
     ReferenceNode,
-    ValidationSignal,
 )
 from .investigation_models import (
     InvestigationPurpose,
@@ -21,7 +20,6 @@ from .investigation_models import (
     SourceScope,
 )
 from .models import ContractModel
-from .retrieval import is_installer_path
 
 
 class KnowledgeNodeKind(StrEnum):
@@ -44,7 +42,6 @@ class KnowledgeEdgeKind(StrEnum):
 
 class KnowledgeGapKind(StrEnum):
     MISSING_OPERATION = "missing_operation"
-    UNOWNED_ARTIFACT = "unowned_artifact"
     MISSING_PROVIDER = "missing_provider"
     MISSING_VALIDATION = "missing_validation"
 
@@ -135,49 +132,44 @@ class _GraphBuilder:
         self.edges: dict[tuple[str, str, KnowledgeEdgeKind], KnowledgeEdge] = {}
         self.gaps: list[KnowledgeGap] = []
         self.artifact_ids: dict[tuple[str, str], str] = {}
-        self.reference_ids: dict[str, str] = {}
+        self.endpoint_ids: dict[str, str] = {}
         self.component_ids: dict[str, str] = {}
-        self.owned_artifacts: set[str] = set()
         for reference in sorted(references, key=lambda item: (item.repo_id, item.path)):
             source_ref = AnalysisSourceRef(repo_id=reference.repo_id, path=reference.path)
-            artifact_id = self._artifact_node(source_ref)
-            self.reference_ids[reference.id] = artifact_id
-            self.reference_ids[f"{reference.repo_id}:{reference.path}"] = artifact_id
+            artifact_id = self._artifact(source_ref)
+            self.endpoint_ids.update(
+                {reference.id: artifact_id, f"{reference.repo_id}:{reference.path}": artifact_id}
+            )
 
     def add_components(self, signals: DeploymentSignalBundle) -> None:
         for component in sorted(signals.candidate_components, key=lambda item: item.id):
-            self._add_component(component)
+            self._component(component)
 
     def add_relations(self, relations: list[AnalysisRelation]) -> None:
-        provided_capabilities = {
-            node.label.casefold()
-            for node in self.nodes.values()
-            if node.kind == KnowledgeNodeKind.CAPABILITY
-            and any(
-                edge.target == node.id and edge.kind == KnowledgeEdgeKind.PROVIDES
-                for edge in self.edges.values()
-            )
+        provided = {
+            edge.target for edge in self.edges.values() if edge.kind == KnowledgeEdgeKind.PROVIDES
         }
         for relation in sorted(
             relations,
             key=lambda item: (item.source, item.target, item.relation.value),
         ):
-            edge_kind = _edge_kind(relation.relation)
-            if edge_kind is None:
+            kind = _edge_kind(relation.relation)
+            if kind is None:
                 continue
-            source = self._relation_endpoint(relation.source, relation.evidence)
-            target = self._relation_endpoint(relation.target, relation.evidence)
-            self._add_edge(source, target, edge_kind, relation.evidence)
-            target_node = self.nodes[target]
-            if (
-                edge_kind == KnowledgeEdgeKind.REQUIRES
-                and target_node.kind == KnowledgeNodeKind.CAPABILITY
-                and target_node.label.casefold() not in provided_capabilities
-            ):
-                self._add_provider_gap(target_node, relation.evidence)
+            source = self._endpoint(relation.source, relation.evidence)
+            target = self._endpoint(relation.target, relation.evidence)
+            self._edge(source, target, kind, relation.evidence)
+            if kind == KnowledgeEdgeKind.REQUIRES and target not in provided:
+                node = self.nodes[target]
+                if node.kind == KnowledgeNodeKind.CAPABILITY:
+                    self._gap(
+                        KnowledgeGapKind.MISSING_PROVIDER,
+                        node.label,
+                        [node.label, "service", "dependency"],
+                        relation.evidence,
+                    )
 
     def build(self) -> DeploymentKnowledgeGraph:
-        self._add_unowned_artifact_gaps()
         return DeploymentKnowledgeGraph(
             nodes=sorted(self.nodes.values(), key=lambda item: item.id),
             edges=sorted(
@@ -186,183 +178,150 @@ class _GraphBuilder:
             ),
             gaps=sorted(
                 self.gaps,
-                key=lambda item: (_gap_priority(item.kind), item.subject.casefold(), item.id),
+                key=lambda item: (
+                    item.kind != KnowledgeGapKind.MISSING_OPERATION,
+                    item.subject.casefold(),
+                    item.id,
+                ),
             ),
         )
 
-    def _add_component(self, component: CandidateComponent) -> None:
-        component_node = _stable_id("component", component.id)
-        self.component_ids[component.id] = component_node
-        self._add_node(
-            component_node,
+    def _component(self, component: CandidateComponent) -> None:
+        component_id = _stable_id("component", component.id)
+        self.component_ids[component.id] = component_id
+        self._node(
+            component_id,
             KnowledgeNodeKind.COMPONENT,
             component.name,
             [component.source_ref],
         )
-        artifact_node = self._artifact_node(component.source_ref)
-        self.owned_artifacts.add(artifact_node)
-        self._add_edge(
-            component_node,
-            artifact_node,
+        artifact_id = self._artifact(component.source_ref)
+        self._edge(
+            component_id,
+            artifact_id,
             KnowledgeEdgeKind.SUPPORTED_BY,
             [component.source_ref],
         )
-        self._add_operation(component_node, component)
-        self._add_capabilities(component_node, component)
-        self._add_validations(component_node, component.validation_candidates)
-        if component.deployable and not component.validation_candidates:
-            self._add_component_gap(component, KnowledgeGapKind.MISSING_VALIDATION)
-
-    def _add_operation(self, component_node: str, component: CandidateComponent) -> None:
         deployment = component.deployment
         if deployment is None:
-            self._add_component_gap(component, KnowledgeGapKind.MISSING_OPERATION)
-            return
-        operation_ref = deployment.operation_source_ref or component.source_ref
-        operation_id = _stable_id(
-            "operation",
-            f"{operation_ref.repo_id}:{operation_ref.path}:{deployment.command or ''}",
-        )
-        self._add_node(
-            operation_id,
-            KnowledgeNodeKind.OPERATION,
-            deployment.command or deployment.entrypoint,
-            [operation_ref],
-        )
-        self._add_edge(operation_id, component_node, KnowledgeEdgeKind.INSTALLS, [operation_ref])
-        self.owned_artifacts.add(self._artifact_node(operation_ref))
-        if not deployment.command:
-            self._add_component_gap(component, KnowledgeGapKind.MISSING_OPERATION)
-
-    def _add_capabilities(self, component_node: str, component: CandidateComponent) -> None:
+            self._component_gap(component, KnowledgeGapKind.MISSING_OPERATION)
+        else:
+            reference = deployment.operation_source_ref or component.source_ref
+            operation_id = _stable_id(
+                "operation",
+                f"{reference.repo_id}:{reference.path}:{deployment.command or ''}",
+            )
+            self._node(
+                operation_id,
+                KnowledgeNodeKind.OPERATION,
+                deployment.command or deployment.entrypoint,
+                [reference],
+            )
+            self._edge(operation_id, component_id, KnowledgeEdgeKind.INSTALLS, [reference])
+            self._artifact(reference)
+            if not deployment.command:
+                self._component_gap(component, KnowledgeGapKind.MISSING_OPERATION)
         for capability in sorted(set(component.capabilities)):
-            capability_node = _stable_id("capability", capability)
-            self._add_node(
-                capability_node,
-                KnowledgeNodeKind.CAPABILITY,
-                capability,
-                [component.source_ref],
+            capability_id = _stable_id("capability", capability)
+            self._node(
+                capability_id, KnowledgeNodeKind.CAPABILITY, capability, [component.source_ref]
             )
-            self._add_edge(
-                component_node,
-                capability_node,
-                KnowledgeEdgeKind.PROVIDES,
-                [component.source_ref],
+            self._edge(
+                component_id, capability_id, KnowledgeEdgeKind.PROVIDES, [component.source_ref]
             )
-
-    def _add_validations(
-        self,
-        component_node: str,
-        validations: list[ValidationSignal],
-    ) -> None:
-        for validation in validations:
+        for validation in component.validation_candidates:
             validation_id = _stable_id(
                 "validation",
                 f"{validation.source_ref.repo_id}:{validation.source_ref.path}:{validation.check}",
             )
-            self._add_node(
+            self._node(
                 validation_id,
                 KnowledgeNodeKind.VALIDATION,
                 validation.check,
                 [validation.source_ref],
             )
-            self._add_edge(
+            self._edge(
                 validation_id,
-                component_node,
+                component_id,
                 KnowledgeEdgeKind.VALIDATES,
                 [validation.source_ref],
             )
+        if component.deployable and not component.validation_candidates:
+            self._component_gap(component, KnowledgeGapKind.MISSING_VALIDATION)
 
-    def _add_component_gap(
+    def _component_gap(
         self,
         component: CandidateComponent,
         kind: KnowledgeGapKind,
     ) -> None:
         parent = PurePosixPath(component.source_ref.path).parent.as_posix()
-        terms = list(
-            dict.fromkeys(
-                [
-                    component.name,
-                    *component.aliases,
-                    *component.materialized_names,
-                    "install deploy",
-                ]
-            )
-        )[:5]
-        self.gaps.append(
-            KnowledgeGap(
-                id=_stable_id("gap", f"{kind.value}:{component.id}"),
-                kind=kind,
-                subject=component.name,
-                component_id=component.id,
-                terms=terms,
-                source_scope=SourceScope.BOTH,
-                path_prefix=(
-                    None
-                    if kind == KnowledgeGapKind.MISSING_OPERATION or parent == "."
-                    else parent
-                ),
-                evidence=[component.source_ref],
-            )
+        self._gap(
+            kind,
+            component.name,
+            list(
+                dict.fromkeys(
+                    [
+                        component.name,
+                        *component.aliases,
+                        *component.materialized_names,
+                        "install deploy",
+                    ]
+                )
+            )[:5],
+            [component.source_ref],
+            component_id=component.id,
+            path_prefix=(
+                None
+                if kind == KnowledgeGapKind.MISSING_OPERATION or parent == "."
+                else parent
+            ),
         )
 
-    def _add_provider_gap(
+    def _gap(
         self,
-        capability: KnowledgeNode,
+        kind: KnowledgeGapKind,
+        subject: str,
+        terms: list[str],
         evidence: list[AnalysisSourceRef],
+        *,
+        component_id: str | None = None,
+        path_prefix: str | None = None,
     ) -> None:
-        gap_id = _stable_id("gap", f"provider:{capability.label}")
+        gap_id = _stable_id("gap", f"{kind.value}:{component_id or subject}")
         if any(gap.id == gap_id for gap in self.gaps):
             return
         self.gaps.append(
             KnowledgeGap(
                 id=gap_id,
-                kind=KnowledgeGapKind.MISSING_PROVIDER,
-                subject=capability.label,
-                terms=[capability.label, "service", "dependency"],
+                kind=kind,
+                subject=subject,
+                component_id=component_id,
+                terms=terms[:5],
                 source_scope=SourceScope.BOTH,
+                path_prefix=path_prefix,
                 evidence=evidence,
             )
         )
 
-    def _add_unowned_artifact_gaps(self) -> None:
-        for node in self.nodes.values():
-            if node.kind != KnowledgeNodeKind.ARTIFACT or node.id in self.owned_artifacts:
-                continue
-            path = PurePosixPath(node.label)
-            if not is_installer_path(node.label):
-                continue
-            self.gaps.append(
-                KnowledgeGap(
-                    id=_stable_id("gap", f"owner:{node.id}"),
-                    kind=KnowledgeGapKind.UNOWNED_ARTIFACT,
-                    subject=node.label,
-                    terms=[path.parent.name or path.stem, path.name],
-                    source_scope=SourceScope.REPOSITORY,
-                    path_prefix=None if path.parent.as_posix() == "." else path.parent.as_posix(),
-                    evidence=node.source_refs,
-                )
-            )
-
-    def _artifact_node(self, reference: AnalysisSourceRef) -> str:
+    def _artifact(self, reference: AnalysisSourceRef) -> str:
         key = (reference.repo_id, reference.path)
         node_id = self.artifact_ids.get(key)
         if node_id is None:
             node_id = _stable_id("artifact", f"{reference.repo_id}:{reference.path}")
             self.artifact_ids[key] = node_id
-            self._add_node(node_id, KnowledgeNodeKind.ARTIFACT, reference.path, [reference])
+            self._node(node_id, KnowledgeNodeKind.ARTIFACT, reference.path, [reference])
         return node_id
 
-    def _relation_endpoint(self, value: str, evidence: list[AnalysisSourceRef]) -> str:
+    def _endpoint(self, value: str, evidence: list[AnalysisSourceRef]) -> str:
         if value in self.component_ids:
             return self.component_ids[value]
-        if value in self.reference_ids:
-            return self.reference_ids[value]
+        if value in self.endpoint_ids:
+            return self.endpoint_ids[value]
         node_id = _stable_id("capability", value)
-        self._add_node(node_id, KnowledgeNodeKind.CAPABILITY, value, evidence)
+        self._node(node_id, KnowledgeNodeKind.CAPABILITY, value, evidence)
         return node_id
 
-    def _add_node(
+    def _node(
         self,
         node_id: str,
         kind: KnowledgeNodeKind,
@@ -378,7 +337,7 @@ class _GraphBuilder:
             source_refs=refs,
         )
 
-    def _add_edge(
+    def _edge(
         self,
         source: str,
         target: str,
@@ -413,18 +372,8 @@ def _edge_kind(relation: AnalysisRelationType) -> KnowledgeEdgeKind | None:
 def _query_purpose(kind: KnowledgeGapKind) -> InvestigationPurpose:
     return {
         KnowledgeGapKind.MISSING_OPERATION: InvestigationPurpose.DEPLOYMENT_ENTRYPOINTS,
-        KnowledgeGapKind.UNOWNED_ARTIFACT: InvestigationPurpose.MISSING_COMPONENTS,
         KnowledgeGapKind.MISSING_PROVIDER: InvestigationPurpose.MISSING_COMPONENTS,
         KnowledgeGapKind.MISSING_VALIDATION: InvestigationPurpose.VALIDATION,
-    }[kind]
-
-
-def _gap_priority(kind: KnowledgeGapKind) -> int:
-    return {
-        KnowledgeGapKind.MISSING_OPERATION: 0,
-        KnowledgeGapKind.UNOWNED_ARTIFACT: 1,
-        KnowledgeGapKind.MISSING_PROVIDER: 2,
-        KnowledgeGapKind.MISSING_VALIDATION: 3,
     }[kind]
 
 

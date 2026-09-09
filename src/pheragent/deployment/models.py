@@ -77,7 +77,6 @@ class InventoryEntry(ContractModel):
     selected: bool = False
     inspected: bool = False
     skip_reason: str | None = None
-    relevance_score: float = Field(default=0.0, ge=0.0)
     parser: str | None = None
     warnings: list[str] = Field(default_factory=list)
 

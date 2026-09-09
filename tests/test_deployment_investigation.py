@@ -385,7 +385,7 @@ def test_semantic_gap_prevents_the_model_from_stopping_early(
         ]
         return response
 
-    _mock_responses(monkeypatch, incomplete_synthesis)
+    requests = _mock_responses(monkeypatch, incomplete_synthesis)
     result = run_repository_analysis(
         AnalysisConfig(
             repositories=[str(repository)],
@@ -400,6 +400,108 @@ def test_semantic_gap_prevents_the_model_from_stopping_early(
     assert result.workflow.coverage.semantic_coverage_complete is False
     assert result.workflow.ready_for_execution is False
     assert any("Worker configuration" in item.reason for item in result.workflow.unresolved)
+    assert result.investigation.follow_up_status == "not_requested_budget_exhausted"
+    assert len(requests) == 2
+
+
+def test_follow_up_synthesis_accepts_fewer_unresolved_questions(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    repository = _write_orchestrated_repository(tmp_path)
+    notes = repository / "deployment/worker"
+    (notes / "tuning.md").write_text(
+        "# Worker tuning marker\nSet WORKER_CONCURRENCY before installing the worker.\n",
+        encoding="utf-8",
+    )
+
+    def synthesis(request):
+        response = _empty_synthesis(request)
+        if "unresolved_questions_to_recheck" not in request:
+            response["unresolved"] = [
+                {
+                    "question": "Where is the worker tuning marker documented?",
+                    "reason": "Worker concurrency configuration is not grounded.",
+                }
+            ]
+        return response
+
+    requests = _mock_responses(monkeypatch, synthesis)
+    result = run_repository_analysis(
+        AnalysisConfig(
+            repositories=[str(repository)],
+            documentation=[],
+            context_path=_write_context(tmp_path / "context.yaml"),
+            cache_dir=tmp_path / "cache",
+            api_key_env="TEST_OPENAI_KEY",
+            llm_cache_dir=tmp_path / "llm-cache",
+            llm_max_requests=3,
+        )
+    )
+
+    assert len(requests) == 3
+    assert result.investigation.follow_up_status == "accepted"
+    assert result.investigation.follow_up_accepted is True
+    assert result.investigation.synthesis is not None
+    assert result.investigation.synthesis.unresolved == []
+    assert result.llm_stage_statuses["investigation_follow_up_synthesis"] == "llm"
+    assert all("disposition" in component for component in requests[2]["components"])
+    evidence_locations = [
+        (observation.query_id, observation.path)
+        for observation in result.investigation.observations
+        if observation.query_id and observation.query_id.startswith("follow-up")
+    ]
+    assert any(
+        observation.query_id == "follow-up-01"
+        and observation.path == "deployment/worker/tuning.md"
+        for observation in result.investigation.observations
+    ), evidence_locations
+
+
+def test_failed_follow_up_preserves_initial_synthesis(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    repository = _write_orchestrated_repository(tmp_path)
+    notes = repository / "deployment/worker"
+    (notes / "tuning.md").write_text(
+        "# Worker tuning marker\nSet WORKER_CONCURRENCY before installing the worker.\n",
+        encoding="utf-8",
+    )
+    synthesis_calls = 0
+
+    def synthesis(request):
+        nonlocal synthesis_calls
+        synthesis_calls += 1
+        if synthesis_calls == 2:
+            return {"invalid": "follow-up response"}
+        response = _empty_synthesis(request)
+        response["unresolved"] = [
+            {
+                "question": "Where is the worker tuning marker documented?",
+                "reason": "Worker concurrency configuration is not grounded.",
+            }
+        ]
+        return response
+
+    _mock_responses(monkeypatch, synthesis)
+    result = run_repository_analysis(
+        AnalysisConfig(
+            repositories=[str(repository)],
+            documentation=[],
+            context_path=_write_context(tmp_path / "context.yaml"),
+            cache_dir=tmp_path / "cache",
+            api_key_env="TEST_OPENAI_KEY",
+            llm_cache_dir=tmp_path / "llm-cache",
+            llm_max_requests=3,
+        )
+    )
+
+    assert result.investigation.follow_up_status == "failed"
+    assert result.investigation.follow_up_accepted is False
+    assert result.investigation.synthesis is not None
+    assert len(result.investigation.synthesis.unresolved) == 1
+    assert result.llm_stage_statuses["investigation_follow_up_synthesis"] == "invalid_response"
 
 
 def test_grounded_operation_can_be_bound_to_its_owning_component(

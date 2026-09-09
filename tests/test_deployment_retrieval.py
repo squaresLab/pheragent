@@ -1,7 +1,3 @@
-from pathlib import Path
-
-import yaml
-
 from pheragent.deployment.analysis_models import (
     AnalysisBlockType,
     AnalysisExecutor,
@@ -15,9 +11,10 @@ from pheragent.deployment.analysis_models import (
     DeploymentSignalBundle,
     SignalStrength,
 )
-from pheragent.deployment.analyzer import AnalysisConfig, run_repository_analysis
+from pheragent.deployment.functional_blocks import build_functional_blocks
 from pheragent.deployment.retrieval import (
     DeploymentRetrievalEngine,
+    RetrievalDocument,
     RetrievalQuery,
 )
 from pheragent.deployment.workflow import build_deployment_workflow
@@ -25,31 +22,31 @@ from pheragent.deployment.workflow import build_deployment_workflow
 
 def _documents():
     return [
-        DeploymentRetrievalEngine.document(
+        RetrievalDocument(
             source_id="repo",
             source_kind="repository",
             path="deployment/oauth2-proxy/oauth2-proxy.yaml",
             text="kind: Deployment\nmetadata:\n  name: oauth2-proxy\n",
         ),
-        DeploymentRetrievalEngine.document(
+        RetrievalDocument(
             source_id="repo",
             source_kind="repository",
             path="deployment/oauth2-proxy/install.sh",
             text="#!/bin/bash\nkubectl apply -f ./oauth2-proxy.yaml\n",
         ),
-        DeploymentRetrievalEngine.document(
+        RetrievalDocument(
             source_id="repo",
             source_kind="repository",
             path="deployment/iam/istio-addons/Chart.yaml",
             text="name: istio-addons\n",
         ),
-        DeploymentRetrievalEngine.document(
+        RetrievalDocument(
             source_id="repo",
             source_kind="repository",
             path="deployment/iam/install.sh",
             text="#!/bin/bash\nhelm upgrade --install istio-addons ./istio-addons\n",
         ),
-        DeploymentRetrievalEngine.document(
+        RetrievalDocument(
             source_id="docs",
             source_kind="documentation",
             path="guide.md",
@@ -96,7 +93,7 @@ def test_retrieval_is_stable_when_irrelevant_files_are_added() -> None:
     noisy = DeploymentRetrievalEngine(
         [
             *_documents(),
-            DeploymentRetrievalEngine.document(
+            RetrievalDocument(
                 source_id="repo",
                 source_kind="repository",
                 path="notes/unrelated.md",
@@ -109,68 +106,60 @@ def test_retrieval_is_stable_when_irrelevant_files_are_added() -> None:
     assert noisy_result == baseline
 
 
-def test_reference_extraction_handles_large_non_path_tokens() -> None:
-    document = DeploymentRetrievalEngine.document(
-        source_id="repo",
-        source_kind="repository",
-        path="large.yaml",
-        text=f"{'a' * 500_000}\n./deployment/install.sh\n",
-    )
-
-    assert document.references == ("./deployment/install.sh",)
-
-
-def test_analysis_binds_manifest_to_its_grounded_installer(tmp_path: Path) -> None:
-    repository = tmp_path / "repo"
-    (repository / "deployment/all").mkdir(parents=True)
-    (repository / "deployment/admin").mkdir(parents=True)
-    (repository / "deployment/all/install-all.sh").write_text(
-        "#!/bin/bash\ncd ../admin\n./install.sh\n",
-        encoding="utf-8",
-    )
-    (repository / "deployment/admin/install.sh").write_text(
-        "#!/bin/bash\n: ${NAMESPACE:?required}\n: ${1:?required}\n"
-        "kubectl apply -f ./admin-proxy.yaml\n",
-        encoding="utf-8",
-    )
-    (repository / "deployment/admin/admin-proxy.yaml").write_text(
-        "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: admin-proxy\n",
-        encoding="utf-8",
-    )
-    context_path = tmp_path / "context.yaml"
-    context_path.write_text(
-        yaml.safe_dump(
-            {
-                "system": "nested-installer-fixture",
-                "deployment": {"profile": "kubernetes"},
-                "provided_blocks": [],
-            }
+def test_retrieval_indexes_markdown_sections_as_source_grounded_passages() -> None:
+    documents = DeploymentRetrievalEngine.passages(
+        source_id="docs",
+        source_kind="documentation",
+        path="deployment.md",
+        text=(
+            "# Overview\nGeneral architecture.\n\n"
+            "## Install Kafka\nRun the broker installer.\n"
+            "helm upgrade --install kafka ./charts/kafka\n"
         ),
-        encoding="utf-8",
     )
 
-    result = run_repository_analysis(
-        AnalysisConfig(
-            repositories=[str(repository)],
-            documentation=[],
-            context_path=context_path,
-            cache_dir=tmp_path / "cache",
-            llm_enabled=False,
-        )
+    assert len(documents) == 2
+    engine = DeploymentRetrievalEngine(documents)
+    hit = engine.search(RetrievalQuery(terms=("install kafka",)), limit=1)[0]
+
+    assert hit.document.start_line == 4
+    assert hit.document.end_line == 6
+    assert hit.line == 4
+    assert "helm upgrade --install kafka" in hit.document.text
+
+
+def test_retrieval_expands_over_parsed_file_relations() -> None:
+    documents = [
+        RetrievalDocument(
+            source_id="repo",
+            source_kind="repository",
+            path="docs/deployment.md",
+            text="Install the message broker.",
+        ),
+        RetrievalDocument(
+            source_id="repo",
+            source_kind="repository",
+            path="scripts/bootstrap.sh",
+            text="execute-the-unrelated-binary --flag",
+        ),
+    ]
+    engine = DeploymentRetrievalEngine(
+        documents,
+        relations=(("repo:docs/deployment.md", "repo:scripts/bootstrap.sh"),),
     )
 
-    proxy = next(
-        component
-        for component in result.signals.candidate_components
-        if component.name == "Admin Proxy"
+    hits = engine.search(
+        RetrievalQuery(
+            terms=("message broker",),
+            seed_paths=("docs/deployment.md",),
+        ),
+        limit=2,
     )
-    assert proxy.deployment is not None
-    assert proxy.deployment.entrypoint == "deployment/admin/install.sh"
-    proxy_steps = [step for step in result.workflow.steps if step.component_id == proxy.id]
-    assert len(proxy_steps) == 1
-    assert proxy_steps[0].command == "./install.sh"
-    assert proxy_steps[0].required_inputs == ["arg:1", "env:NAMESPACE"]
-    assert result.document.evaluation.orphan_component_count == 0
+
+    assert [hit.document.path for hit in hits] == [
+        "docs/deployment.md",
+        "scripts/bootstrap.sh",
+    ]
 
 
 def test_owned_component_relation_does_not_create_owner_self_dependency() -> None:
@@ -225,3 +214,61 @@ def test_owned_component_relation_does_not_create_owner_self_dependency() -> Non
     assert len(workflow.steps) == 1
     assert workflow.steps[0].component_id == owner.id
     assert workflow.steps[0].after == []
+
+
+def test_functional_block_dependencies_follow_component_relations() -> None:
+    database = CandidateComponent(
+        id="C001_database",
+        name="Database",
+        source_ref=AnalysisSourceRef(repo_id="repo", path="database/install.sh"),
+        deployment=ComponentDeployment(
+            executor=AnalysisExecutor.SHELL,
+            entrypoint="database/install.sh",
+        ),
+        classification=ComponentClassification(
+            block_type=AnalysisBlockType.SHARED_SERVICES,
+            subtype="data_services",
+            confidence=1.0,
+        ),
+    )
+    application = CandidateComponent(
+        id="C002_application",
+        name="Application",
+        source_ref=AnalysisSourceRef(repo_id="repo", path="application/install.sh"),
+        deployment=ComponentDeployment(
+            executor=AnalysisExecutor.SHELL,
+            entrypoint="application/install.sh",
+        ),
+        classification=ComponentClassification(
+            block_type=AnalysisBlockType.APPLICATION,
+            subtype="core_application",
+            confidence=1.0,
+        ),
+    )
+    signals = DeploymentSignalBundle(
+        candidate_components=[database, application],
+        relations=[
+            AnalysisRelation(
+                source=database.id,
+                target=application.id,
+                relation=AnalysisRelationType.REQUIRES,
+                strength=SignalStrength.EXPLICIT_DEPENDENCY,
+            )
+        ],
+    )
+
+    document = build_functional_blocks(
+        DeploymentContext(system="relation-fixture"),
+        signals,
+        {},
+        None,
+        llm_usage={},
+        llm_stage_statuses={},
+    )
+    block_by_component = {
+        component.id: block
+        for block in document.blocks
+        for component in block.components
+    }
+
+    assert block_by_component[database.id].after == [block_by_component[application.id].id]

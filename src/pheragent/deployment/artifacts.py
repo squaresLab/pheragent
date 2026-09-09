@@ -36,6 +36,17 @@ def analysis_metrics(result: AnalysisResult) -> dict[str, Any]:
             "evidence_observations": len(result.investigation.observations),
             "evidence_characters": result.evidence_characters,
             "retrieval_queries": len(result.retrieval_queries),
+            "follow_up_queries": len(result.investigation.follow_up_queries),
+            "follow_up_status": result.investigation.follow_up_status,
+            "follow_up_accepted": result.investigation.follow_up_accepted,
+            "unresolved_before_follow_up": (
+                result.investigation.unresolved_before_follow_up
+            ),
+            "unresolved_after_follow_up": (
+                len(result.investigation.synthesis.unresolved)
+                if result.investigation.synthesis is not None
+                else 0
+            ),
             "graph_queries": len(result.graph_queries),
             "graph_nodes": len(result.knowledge_graph.nodes) if result.knowledge_graph else 0,
             "graph_edges": len(result.knowledge_graph.edges) if result.knowledge_graph else 0,

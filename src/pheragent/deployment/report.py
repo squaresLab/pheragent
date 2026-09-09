@@ -133,6 +133,14 @@ def _append_evaluation_summary(lines: list[str], result: AnalysisResult) -> None
             f"- LLM requests this run: {evaluation.llm_requests}",
             "- LLM stages: "
             + "; ".join(f"{stage}={status}" for stage, status in result.llm_stage_statuses.items()),
+            f"- Follow-up synthesis: {result.investigation.follow_up_status}",
+            "- Unresolved questions before/after follow-up: "
+            f"{result.investigation.unresolved_before_follow_up}/"
+            + (
+                str(len(result.investigation.synthesis.unresolved))
+                if result.investigation.synthesis is not None
+                else "0"
+            ),
         ]
     )
     for path in result.llm_failure_history_paths:

@@ -466,19 +466,6 @@ class DeploymentSignalBundle(ContractModel):
     unresolved: list[AnalysisQuestion] = Field(default_factory=list)
 
 
-class ArtifactRoleCandidate(ContractModel):
-    id: str = Field(pattern=IDENTIFIER_PATTERN)
-    repo_id: str = Field(pattern=IDENTIFIER_PATTERN)
-    path: str = Field(min_length=1)
-    file_type: str = Field(min_length=1)
-    deterministic_roles: list[ArtifactRole] = Field(default_factory=list)
-    references: int = Field(default=0, ge=0)
-    referenced_by: int = Field(default=0, ge=0)
-    materialized_names: list[str] = Field(default_factory=list, max_length=20)
-    validation_count: int = Field(default=0, ge=0)
-    context_hint: bool = False
-
-
 class FunctionalDeployRef(ContractModel):
     executor: AnalysisExecutor
     ref: str = Field(min_length=1)

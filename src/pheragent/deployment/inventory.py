@@ -28,27 +28,6 @@ _COMPOSE_FILE = re.compile(
     r"^(?:docker-)?compose(?:[._-][a-z0-9][a-z0-9_.-]*)?\.ya?ml$",
     re.IGNORECASE,
 )
-_RELEVANCE_TERMS = {
-    "after",
-    "ansible",
-    "before",
-    "compose",
-    "deploy",
-    "health",
-    "helm",
-    "install",
-    "kubernetes",
-    "kustomize",
-    "migration",
-    "onboard",
-    "prerequisite",
-    "ready",
-    "requires",
-    "setup",
-    "terraform",
-    "validate",
-    "verify",
-}
 _CATEGORY_TECHNOLOGY = {
     InventoryCategory.ANSIBLE: "ansible",
     InventoryCategory.COMPOSE: "docker-compose",
@@ -129,7 +108,6 @@ class RepositoryInventoryBuilder:
             category=category,
             size_bytes=size_bytes,
             selected=True,
-            relevance_score=_relevance_score(relative_path, sample, category),
         )
 
     def _selection_reason(
@@ -251,14 +229,3 @@ def _read_sample(path: Path, limit: int = 128 * 1024) -> str:
             return handle.read(limit)
     except OSError:
         return ""
-
-
-def _relevance_score(
-    relative_path: str,
-    sample: str,
-    category: InventoryCategory,
-) -> float:
-    searchable = f"{relative_path}\n{sample[: 64 * 1024]}".lower()
-    term_score = sum(min(searchable.count(term), 5) for term in _RELEVANCE_TERMS)
-    category_score = 2 if category in _CATEGORY_TECHNOLOGY else 1
-    return float(category_score + term_score)

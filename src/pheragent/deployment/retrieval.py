@@ -13,11 +13,17 @@ _COMMAND = re.compile(
     r"docker\s+compose\b|terraform\s+(?:apply|plan)\b|ansible-playbook\b|"
     r"(?:\./|\.\./)[^\s;&|]+\.(?:sh|bash)\b).*$"
 )
-_PATH_TOKEN = re.compile(r"(?:\./|\.\./)?[A-Za-z0-9_.${}/-]+")
-_REFERENCE_SUFFIXES = (".sh", ".yaml", ".yml")
-_MAX_REFERENCES_PER_DOCUMENT = 128
 _INSTALLER_NAMES = frozenset({"install.sh", "deploy.sh", "setup.sh"})
 _INSTALLER_NAME = re.compile(r"^(?:install|deploy|setup)(?:[-_.][a-z0-9_.-]+)?\.(?:sh|bash)$")
+_MARKDOWN_SUFFIXES = {".md", ".markdown"}
+_YAML_SUFFIXES = {".yaml", ".yml"}
+_SHELL_SUFFIXES = {".sh", ".bash", ".zsh"}
+_MARKDOWN_HEADING = re.compile(r"^\s*#{1,6}\s+\S")
+_SHELL_FUNCTION = re.compile(
+    r"^\s*(?:function\s+)?[A-Za-z_][A-Za-z0-9_]*\s*(?:\(\s*\))?\s*\{\s*$"
+)
+_MAX_PASSAGE_LINES = 80
+_PASSAGE_OVERLAP_LINES = 8
 
 
 def normalize_terms(value: str) -> tuple[str, ...]:
@@ -38,10 +44,17 @@ class RetrievalDocument:
     path: str
     text: str
     roles: tuple[str, ...] = ()
-    references: tuple[str, ...] = ()
+    facts: tuple[str, ...] = ()
+    start_line: int = 1
+    end_line: int = 1
+    kind: str = "file"
 
     @property
     def key(self) -> str:
+        return f"{self.file_key}:{self.start_line}:{self.end_line}:{self.kind}"
+
+    @property
+    def file_key(self) -> str:
         return f"{self.source_id}:{self.path}"
 
 
@@ -75,17 +88,22 @@ class DeploymentRetrievalEngine:
         "filename": 5.0,
         "commands": 4.0,
         "roles": 3.0,
+        "facts": 3.0,
         "path": 2.5,
         "body": 1.0,
     }
 
-    def __init__(self, documents: list[RetrievalDocument]):
+    def __init__(
+        self,
+        documents: list[RetrievalDocument],
+        *,
+        relations: tuple[tuple[str, str], ...] = (),
+    ):
         self._documents = {document.key: document for document in documents}
         self._indexed = [self._index(document) for document in documents]
-        self._index_by_key = {item.document.key: item for item in self._indexed}
         self._document_frequency = self._document_frequencies(self._indexed)
         self._average_lengths = self._field_averages(self._indexed)
-        self._neighbors = self._build_neighbors(documents)
+        self._neighbors = self._build_neighbors(documents, relations)
 
     def search(self, query: RetrievalQuery, *, limit: int = 3) -> list[RetrievalHit]:
         if limit <= 0:
@@ -97,34 +115,12 @@ class DeploymentRetrievalEngine:
             reverse=True,
         )
         lexical = [(score, key) for score, key in lexical if score > 0]
-        feedback_tokens = self._feedback_tokens(lexical[:3], query_tokens)
-        if feedback_tokens:
-            lexical = sorted(
-                (
-                    (
-                        score
-                        + 0.25
-                        * self._lexical_score(
-                            self._index_by_key[key],
-                            feedback_tokens,
-                        ),
-                        key,
-                    )
-                    for score, key in lexical
-                ),
-                reverse=True,
-            )
-        exact = sorted(
-            ((self._exact_score(item.document, query), item.document.key) for item in eligible),
-            reverse=True,
-        )
-        exact = [(score, key) for score, key in exact if score > 0]
         structural = self._structural_ranking(query, lexical[: max(limit, 3)])
         fused: dict[str, float] = defaultdict(float)
         reasons: dict[str, set[str]] = defaultdict(set)
-        for label, ranking in (("lexical", lexical), ("exact", exact), ("structural", structural)):
+        for label, ranking in (("lexical", lexical), ("structural", structural)):
             for rank, (_score, key) in enumerate(ranking, start=1):
-                fused[key] += 1.0 / (40 + rank)
+                fused[key] += (0.5 if label == "structural" else 1.0) / (40 + rank)
                 reasons[key].add(label)
         ranked = self._select_diverse(
             sorted(fused, key=lambda key: (-fused[key], key)),
@@ -135,14 +131,14 @@ class DeploymentRetrievalEngine:
             RetrievalHit(
                 document=self._documents[key],
                 score=fused[key],
-                line=self._best_line(self._documents[key].text, query_tokens),
+                line=self._best_line(self._documents[key], query_tokens),
                 reasons=tuple(sorted(reasons[key])),
             )
             for key in ranked
         ]
 
     @classmethod
-    def document(
+    def passages(
         cls,
         *,
         source_id: str,
@@ -150,17 +146,28 @@ class DeploymentRetrievalEngine:
         path: str,
         text: str,
         roles: tuple[str, ...] = (),
-    ) -> RetrievalDocument:
-        """Create a document and extract only explicit local file references."""
-        references = _local_references(text)
-        return RetrievalDocument(
-            source_id=source_id,
-            source_kind=source_kind,
-            path=path,
-            text=text,
-            roles=roles,
-            references=references,
-        )
+        facts: tuple[str, ...] = (),
+    ) -> list[RetrievalDocument]:
+        """Split source text at format-aware boundaries while retaining provenance."""
+        lines = text.splitlines()
+        if not lines:
+            return []
+        kind = _passage_kind(path)
+        return [
+            RetrievalDocument(
+                source_id=source_id,
+                source_kind=source_kind,
+                path=path,
+                text="\n".join(lines[start:end]),
+                roles=roles,
+                facts=facts,
+                start_line=start + 1,
+                end_line=end,
+                kind=kind,
+            )
+            for start, end in _passage_ranges(path, lines)
+            if any(line.strip() for line in lines[start:end])
+        ]
 
     def _index(self, document: RetrievalDocument) -> _IndexedDocument:
         path = PurePosixPath(document.path)
@@ -169,6 +176,7 @@ class DeploymentRetrievalEngine:
             "filename": Counter(normalize_terms(path.name)),
             "path": Counter(normalize_terms(document.path)),
             "roles": Counter(normalize_terms(" ".join(document.roles))),
+            "facts": Counter(normalize_terms(" ".join(document.facts))),
             "commands": Counter(normalize_terms(commands)),
             "body": Counter(normalize_terms(document.text)),
         }
@@ -197,22 +205,12 @@ class DeploymentRetrievalEngine:
                 score += weight * inverse_frequency * frequency * 2.2 / denominator
         return score
 
-    @staticmethod
-    def _exact_score(document: RetrievalDocument, query: RetrievalQuery) -> float:
-        haystack = f"{document.path}\n{document.text}".casefold()
-        return float(sum(term.casefold() in haystack for term in query.terms if term.strip()))
-
     def _structural_ranking(
         self,
         query: RetrievalQuery,
         lexical: list[tuple[float, str]],
     ) -> list[tuple[float, str]]:
-        seeds = {key for _score, key in lexical} | {
-            f"{document.source_id}:{path}"
-            for document in self._documents.values()
-            for path in query.seed_paths
-            if f"{document.source_id}:{path}" in self._documents
-        }
+        seeds = {key for _score, key in lexical}
         scores: dict[str, float] = defaultdict(float)
         for seed in seeds:
             for neighbor in self._neighbors.get(seed, ()):
@@ -232,23 +230,6 @@ class DeploymentRetrievalEngine:
         if query.seed_paths:
             tokens.update({"install", "deploy", "apply", "helm", "kubectl"})
         return tokens
-
-    def _feedback_tokens(
-        self,
-        initial: list[tuple[float, str]],
-        query_tokens: set[str],
-    ) -> set[str]:
-        """Expand with repeated identifiers from top paths/commands, never arbitrary prose."""
-        counts: Counter[str] = Counter()
-        for _score, key in initial:
-            item = self._index_by_key[key]
-            counts.update(set(item.fields["filename"]) | set(item.fields["commands"]))
-        ignored = query_tokens | {"install", "deploy", "apply", "helm", "kubectl", "sh"}
-        return {
-            token
-            for token, count in counts.most_common(4)
-            if count >= 2 and token not in ignored and len(token) > 2
-        }
 
     def _select_diverse(
         self,
@@ -277,9 +258,9 @@ class DeploymentRetrievalEngine:
         return not query.path_prefix or document.path.startswith(query.path_prefix.strip("/"))
 
     @staticmethod
-    def _best_line(text: str, query_tokens: set[str]) -> int:
-        best = (0, 1)
-        for number, line in enumerate(text.splitlines(), start=1):
+    def _best_line(document: RetrievalDocument, query_tokens: set[str]) -> int:
+        best = (0, document.start_line)
+        for number, line in enumerate(document.text.splitlines(), start=document.start_line):
             score = len(set(normalize_terms(line)) & query_tokens)
             if score > best[0]:
                 best = (score, number)
@@ -305,12 +286,21 @@ class DeploymentRetrievalEngine:
         }
 
     @staticmethod
-    def _build_neighbors(documents: list[RetrievalDocument]) -> dict[str, set[str]]:
-        by_source_path = {(item.source_id, item.path): item.key for item in documents}
+    def _build_neighbors(
+        documents: list[RetrievalDocument],
+        relations: tuple[tuple[str, str], ...],
+    ) -> dict[str, set[str]]:
+        by_file: dict[str, list[str]] = defaultdict(list)
+        for document in documents:
+            by_file[document.file_key].append(document.key)
         neighbors: dict[str, set[str]] = defaultdict(set)
+        for passage_keys in by_file.values():
+            for left, right in zip(passage_keys, passage_keys[1:], strict=False):
+                neighbors[left].add(right)
+                neighbors[right].add(left)
         for document in documents:
             path = PurePosixPath(document.path)
-            structural_paths = set(document.references)
+            structural_paths = set()
             parent = path.parent
             for name in _INSTALLER_NAMES:
                 structural_paths.add(str(parent / name))
@@ -319,21 +309,62 @@ class DeploymentRetrievalEngine:
             for raw in structural_paths:
                 resolved = str(PurePosixPath(parent, raw)) if raw.startswith(".") else raw
                 normalized = posixpath.normpath(resolved)
-                target = by_source_path.get((document.source_id, normalized))
-                if target:
+                for target in by_file.get(f"{document.source_id}:{normalized}", ()):
                     neighbors[document.key].add(target)
                     neighbors[target].add(document.key)
+        for source, target in relations:
+            for source_key in by_file.get(source, ()):
+                for target_key in by_file.get(target, ()):
+                    neighbors[source_key].add(target_key)
+                    neighbors[target_key].add(source_key)
         return neighbors
 
 
-def _local_references(text: str) -> tuple[str, ...]:
-    """Extract path-like deployment references in linear time with a hard cap."""
-    references: dict[str, None] = {}
-    for match in _PATH_TOKEN.finditer(text):
-        token = match.group(0)
-        if not token.casefold().endswith(_REFERENCE_SUFFIXES):
-            continue
-        references.setdefault(token, None)
-        if len(references) >= _MAX_REFERENCES_PER_DOCUMENT:
-            break
-    return tuple(references)
+def _passage_ranges(path: str, lines: list[str]) -> list[tuple[int, int]]:
+    suffix = PurePosixPath(path).suffix.casefold()
+    starts = [0]
+    if suffix in _MARKDOWN_SUFFIXES:
+        starts.extend(
+            index
+            for index, line in enumerate(lines[1:], start=1)
+            if _MARKDOWN_HEADING.match(line)
+        )
+    elif suffix in _YAML_SUFFIXES:
+        starts.extend(
+            index for index, line in enumerate(lines[1:], start=1) if line.strip() == "---"
+        )
+    elif suffix in _SHELL_SUFFIXES:
+        starts.extend(
+            index
+            for index, line in enumerate(lines[1:], start=1)
+            if _SHELL_FUNCTION.match(line)
+        )
+    ranges = [
+        (start, end)
+        for start, end in zip(starts, [*starts[1:], len(lines)], strict=True)
+    ]
+    return [bounded for start, end in ranges for bounded in _bounded_ranges(start, end)]
+
+
+def _bounded_ranges(start: int, end: int) -> list[tuple[int, int]]:
+    if end - start <= _MAX_PASSAGE_LINES:
+        return [(start, end)]
+    step = _MAX_PASSAGE_LINES - _PASSAGE_OVERLAP_LINES
+    return [
+        (offset, min(offset + _MAX_PASSAGE_LINES, end))
+        for offset in range(start, end, step)
+        if offset < end
+    ]
+
+
+def _passage_kind(path: str) -> str:
+    suffix = PurePosixPath(path).suffix.casefold()
+    return (
+        "documentation_section"
+        if suffix in _MARKDOWN_SUFFIXES
+        else "yaml_document"
+        if suffix in _YAML_SUFFIXES
+        else "shell_section"
+        if suffix in _SHELL_SUFFIXES
+        else "text_section"
+    )

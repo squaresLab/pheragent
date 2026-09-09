@@ -45,6 +45,10 @@ class LLMRequestBudget:
     limit: int
     attempted: int = 0
 
+    @property
+    def remaining(self) -> int:
+        return max(0, self.limit - self.attempted)
+
     def consume(self) -> bool:
         if self.attempted >= self.limit:
             return False

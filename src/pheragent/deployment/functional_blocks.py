@@ -7,6 +7,7 @@ import yaml
 
 from .analysis_models import (
     AnalysisBlockType,
+    AnalysisRelationType,
     CandidateComponent,
     ComponentDisposition,
     DeploymentContext,
@@ -18,7 +19,7 @@ from .analysis_models import (
     GoldDefinition,
 )
 from .evaluation import evaluate_functional_blocks
-from .graph import topological_levels
+from .graph import add_dependency_if_acyclic, topological_levels
 from .source_manager import AcquiredSource
 
 
@@ -37,7 +38,7 @@ def build_functional_blocks(
     for name, block_type, subtype, components in _component_groups(signals):
         blocks.append(_functional_block(next_id, name, block_type, subtype, components))
         next_id += 1
-    _attach_dependencies(blocks)
+    _attach_dependencies(blocks, signals)
     levels = _block_levels(blocks)
     evaluation = evaluate_functional_blocks(blocks, signals, sources, gold).model_copy(
         update={
@@ -168,7 +169,37 @@ def _functional_component(component: CandidateComponent) -> FunctionalComponent:
     )
 
 
-def _attach_dependencies(blocks: list[FunctionalBlock]) -> None:
+def _attach_dependencies(
+    blocks: list[FunctionalBlock],
+    signals: DeploymentSignalBundle,
+) -> None:
+    dependencies = {block.id: set(block.after) for block in blocks}
+    component_blocks = {
+        component.id: block.id for block in blocks for component in block.components
+    }
+    capability_blocks: dict[str, set[str]] = defaultdict(set)
+    for block in blocks:
+        for capability in block.provides:
+            capability_blocks[capability].add(block.id)
+
+    for relation in sorted(
+        signals.relations,
+        key=lambda item: (item.relation.value, item.source, item.target),
+    ):
+        endpoints = _dependency_endpoints(relation.relation, relation.source, relation.target)
+        if endpoints is None:
+            continue
+        dependent, prerequisite = (
+            _endpoint_block(endpoint, component_blocks, capability_blocks)
+            for endpoint in endpoints
+        )
+        if dependent and prerequisite:
+            add_dependency_if_acyclic(
+                dependencies,
+                dependent=dependent,
+                prerequisite=prerequisite,
+            )
+
     by_type: dict[AnalysisBlockType, list[FunctionalBlock]] = defaultdict(list)
     for block in blocks:
         by_type[block.type].append(block)
@@ -176,15 +207,45 @@ def _attach_dependencies(blocks: list[FunctionalBlock]) -> None:
     runtime_ids = [item.id for item in by_type[AnalysisBlockType.RUNTIME_ENVIRONMENT]]
     shared_ids = [item.id for item in by_type[AnalysisBlockType.SHARED_SERVICES]]
     for block in blocks:
-        if block.after:
-            continue
         if block.type == AnalysisBlockType.RUNTIME_ENVIRONMENT:
-            block.after.extend(base_ids)
+            fallback = base_ids
         elif block.type in {AnalysisBlockType.SHARED_SERVICES, AnalysisBlockType.OPERATIONS}:
-            block.after.extend(runtime_ids or base_ids)
+            fallback = runtime_ids or base_ids
         elif block.type == AnalysisBlockType.APPLICATION:
-            block.after.extend(shared_ids or runtime_ids or base_ids)
-        block.after = sorted({item for item in block.after if item != block.id})
+            fallback = shared_ids or runtime_ids or base_ids
+        else:
+            fallback = []
+        for prerequisite in fallback:
+            add_dependency_if_acyclic(
+                dependencies,
+                dependent=block.id,
+                prerequisite=prerequisite,
+            )
+    for block in blocks:
+        block.after = sorted(dependencies[block.id])
+
+
+def _dependency_endpoints(
+    relation: AnalysisRelationType,
+    source: str,
+    target: str,
+) -> tuple[str, str] | None:
+    if relation == AnalysisRelationType.ORDERED_BEFORE:
+        return target, source
+    if relation in {AnalysisRelationType.REQUIRES, AnalysisRelationType.HEALTH_GATED_BY}:
+        return source, target
+    return None
+
+
+def _endpoint_block(
+    endpoint: str,
+    component_blocks: dict[str, str],
+    capability_blocks: dict[str, set[str]],
+) -> str | None:
+    if endpoint in component_blocks:
+        return component_blocks[endpoint]
+    providers = capability_blocks.get(endpoint, set())
+    return next(iter(providers)) if len(providers) == 1 else None
 
 
 def _block_levels(blocks: list[FunctionalBlock]) -> list[list[str]]:

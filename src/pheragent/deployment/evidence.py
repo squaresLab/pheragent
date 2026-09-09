@@ -6,8 +6,8 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
 from .analysis_models import (
+    AnalysisRelation,
     AnalysisSourceRef,
-    ArtifactRole,
     CandidateComponent,
     ComponentEvidenceStrength,
 )
@@ -23,7 +23,13 @@ from .investigation_models import (
     default_investigation_plan,
 )
 from .redaction import redact_secrets
-from .retrieval import DeploymentRetrievalEngine, RetrievalQuery
+from .retrieval import (
+    DeploymentRetrievalEngine,
+    RetrievalDocument,
+    RetrievalHit,
+    RetrievalQuery,
+    is_installer_path,
+)
 from .source_manager import AcquiredSource
 
 _PROMPT_INJECTION = re.compile(
@@ -73,16 +79,17 @@ def collect_investigation_evidence(
     sources: dict[str, AcquiredSource],
     source_purposes: dict[str, SourcePurpose],
     searchable_paths: dict[str, list[str]],
+    retrieval_documents: tuple[RetrievalDocument, ...],
+    reference_relations: tuple[AnalysisRelation, ...],
     roots: list[AnalysisSourceRef],
     components: list[CandidateComponent],
     budget: EvidenceBudget | None = None,
 ) -> tuple[tuple[EvidenceObservation, ...], tuple[str, ...]]:
     budget = budget or EvidenceBudget()
     collector = _EvidenceCollector(budget)
-    retriever = _build_retriever(
-        sources=sources,
-        purposes=source_purposes,
-        searchable_paths=searchable_paths,
+    retriever = DeploymentRetrievalEngine(
+        list(retrieval_documents),
+        relations=tuple((relation.source, relation.target) for relation in reference_relations),
     )
     references = [*roots, *(component.source_ref for component in components)]
     for root in roots:
@@ -101,8 +108,6 @@ def collect_investigation_evidence(
         searchable_paths=searchable_paths,
     )
 
-    # Reserve a small part of the ledger for concrete candidate entrypoints.
-    # Without this reservation, broad searches can consume the entire budget.
     component_references = sorted(
         components,
         key=lambda item: (
@@ -126,31 +131,6 @@ def collect_investigation_evidence(
             summary=f"Deployment evidence for {component.name}",
         )
 
-    # Retrieve execution routes for the least actionable candidates first. The
-    # query is component-scoped, but ranking and structural expansion are generic.
-    route_candidates = sorted(
-        (
-            component
-            for component in components
-            if component.deployable
-            and component.deployment is not None
-            and not component.deployment.command
-            and ArtifactRole.DEPLOYMENT_GUIDE not in component.artifact_roles
-        ),
-        key=lambda component: (
-            PurePosixPath(component.deployment.entrypoint).suffix.casefold() in {".sh", ".bash"},
-            not component.existence_locked,
-            component.id,
-        ),
-    )[:12]
-    for component in route_candidates:
-        collector.retrieve_component_route(
-            component=component,
-            retriever=retriever,
-            sources=sources,
-            purposes=source_purposes,
-        )
-
     referenced_entrypoints = {
         (component.source_ref.repo_id, component.deployment.entrypoint)
         for component in components
@@ -164,22 +144,7 @@ def collect_investigation_evidence(
         max_results=3,
     )
 
-    # Mandatory probes run alongside a bounded subset of model-selected terms.
-    # This prevents known-name bias without allowing searches to crowd out roots.
-    component_by_id = {component.id: component for component in components}
-    for query in queries:
-        target = component_by_id.get(query.component_id or "")
-        collector.search(
-            query=query,
-            retriever=retriever,
-            sources=sources,
-            purposes=source_purposes,
-            seed_paths=(
-                (target.deployment.entrypoint,)
-                if target is not None and target.deployment is not None
-                else ()
-            ),
-        )
+    _collect_queries(collector, retriever, queries, source_purposes, components)
     probes = (
         "primary_roots",
         "component_entrypoints",
@@ -190,6 +155,85 @@ def collect_investigation_evidence(
         "profile_conflicts",
     )
     return tuple(collector.observations), probes
+
+
+def collect_query_evidence(
+    *,
+    queries: tuple[InvestigationQuery, ...],
+    source_purposes: dict[str, SourcePurpose],
+    retrieval_documents: tuple[RetrievalDocument, ...],
+    reference_relations: tuple[AnalysisRelation, ...],
+    components: list[CandidateComponent],
+    budget: EvidenceBudget,
+) -> tuple[EvidenceObservation, ...]:
+    """Collect only evidence requested by a follow-up investigation."""
+    collector = _EvidenceCollector(budget)
+    retriever = DeploymentRetrievalEngine(
+        list(retrieval_documents),
+        relations=tuple((relation.source, relation.target) for relation in reference_relations),
+    )
+    _collect_queries(collector, retriever, queries, source_purposes, components)
+    return tuple(collector.observations)
+
+
+def merge_investigation_evidence(
+    existing: tuple[EvidenceObservation, ...],
+    focused: tuple[EvidenceObservation, ...],
+    *,
+    budget: EvidenceBudget,
+) -> tuple[EvidenceObservation, ...]:
+    """Add focused evidence without exceeding the synthesis evidence budget."""
+    essential = {
+        EvidenceKind.PRIMARY_ROOT,
+        EvidenceKind.COMPONENT_ENTRYPOINT,
+        EvidenceKind.INSTALLATION_ROUTE,
+        EvidenceKind.DYNAMIC_DEPLOYMENT,
+    }
+    candidates = [
+        *focused,
+        *(item for item in existing if item.kind in essential),
+        *(item for item in existing if item.kind not in essential),
+    ]
+    selected = []
+    seen = set()
+    characters = 0
+    for observation in candidates:
+        if observation.id in seen:
+            continue
+        excerpt_characters = len(observation.excerpt or "")
+        if (
+            len(selected) >= budget.max_observations
+            or characters + excerpt_characters > budget.max_characters
+        ):
+            continue
+        selected.append(observation)
+        seen.add(observation.id)
+        characters += excerpt_characters
+    return tuple(selected)
+
+
+def _collect_queries(
+    collector: _EvidenceCollector,
+    retriever: DeploymentRetrievalEngine,
+    queries: tuple[InvestigationQuery, ...],
+    source_purposes: dict[str, SourcePurpose],
+    components: list[CandidateComponent],
+) -> None:
+    component_by_id = {component.id: component for component in components}
+    for query in queries:
+        target = component_by_id.get(query.component_id or "")
+        collector.search(
+            query=query,
+            retriever=retriever,
+            purposes=source_purposes,
+            seed_paths=(
+                (target.deployment.entrypoint,)
+                if query.purpose == InvestigationPurpose.DEPLOYMENT_ENTRYPOINTS
+                and target is not None
+                and target.deployment is not None
+                else ()
+            ),
+        )
 
 
 class _EvidenceCollector:
@@ -229,7 +273,6 @@ class _EvidenceCollector:
         *,
         query: InvestigationQuery,
         retriever: DeploymentRetrievalEngine,
-        sources: dict[str, AcquiredSource],
         purposes: dict[str, SourcePurpose],
         seed_paths: tuple[str, ...] = (),
     ) -> None:
@@ -243,6 +286,12 @@ class _EvidenceCollector:
             else EvidenceKind.SEARCH_RESULT
         )
         source_kind = None if query.source_scope == SourceScope.BOTH else query.source_scope.value
+        is_route_query = query.purpose == InvestigationPurpose.DEPLOYMENT_ENTRYPOINTS
+        result_limit = (
+            max(3, self.budget.results_per_query)
+            if is_route_query
+            else self.budget.results_per_query
+        )
         hits = retriever.search(
             RetrievalQuery(
                 terms=tuple(query.terms),
@@ -250,66 +299,52 @@ class _EvidenceCollector:
                 path_prefix=query.path_prefix,
                 seed_paths=seed_paths,
             ),
-            limit=self.budget.results_per_query,
+            limit=result_limit,
         )
+        if is_route_query:
+            hits = [hit for hit in hits if is_installer_path(hit.document.path)][
+                : self.budget.results_per_query
+            ]
         for hit in hits:
-            self._add_excerpt(
+            self._add_hit(
+                hit,
                 source_id=hit.document.source_id,
                 purpose=purposes[hit.document.source_id],
-                path=hit.document.path,
-                lines=_read_source_lines(sources[hit.document.source_id], hit.document.path),
-                line=hit.line,
                 kind=kind,
                 strength=EvidenceStrength.SUPPORTING,
                 summary=f"Ranked retrieval for {', '.join(query.terms)}",
-                query_id=(f"component-{query.component_id}" if query.component_id else query.id),
+                query_id=(
+                    f"component-{query.component_id}"
+                    if query.purpose == InvestigationPurpose.DEPLOYMENT_ENTRYPOINTS
+                    and query.component_id
+                    else query.id
+                ),
             )
 
-    def retrieve_component_route(
+    def _add_hit(
         self,
+        hit: RetrievalHit,
         *,
-        component: CandidateComponent,
-        retriever: DeploymentRetrievalEngine,
-        sources: dict[str, AcquiredSource],
-        purposes: dict[str, SourcePurpose],
+        source_id: str,
+        purpose: SourcePurpose,
+        kind: EvidenceKind,
+        strength: EvidenceStrength,
+        summary: str,
+        query_id: str | None = None,
     ) -> None:
-        assert component.deployment is not None
-        terms = tuple(
-            dict.fromkeys(
-                (
-                    component.name,
-                    *component.aliases,
-                    *component.materialized_names,
-                    PurePosixPath(component.deployment.entrypoint).stem,
-                )
-            )
+        document = hit.document
+        self._add_excerpt(
+            source_id=source_id,
+            purpose=purpose,
+            path=document.path,
+            lines=document.text.splitlines(),
+            line=hit.line - document.start_line + 1,
+            line_offset=document.start_line - 1,
+            kind=kind,
+            strength=strength,
+            summary=summary,
+            query_id=query_id,
         )
-        hits = retriever.search(
-            RetrievalQuery(
-                terms=terms,
-                source_kind=SourcePurpose.REPOSITORY.value,
-                seed_paths=(component.deployment.entrypoint,),
-            ),
-            limit=2,
-        )
-        for hit in hits:
-            if PurePosixPath(hit.document.path).name.casefold() not in {
-                "install.sh",
-                "deploy.sh",
-                "setup.sh",
-            }:
-                continue
-            self._add_excerpt(
-                source_id=hit.document.source_id,
-                purpose=purposes[hit.document.source_id],
-                path=hit.document.path,
-                lines=_read_source_lines(sources[hit.document.source_id], hit.document.path),
-                line=hit.line,
-                kind=EvidenceKind.INSTALLATION_ROUTE,
-                strength=EvidenceStrength.STRONG,
-                summary=f"Candidate installation route for {component.name}",
-                query_id=f"component-{component.id}",
-            )
 
     def add_unreferenced_installers(
         self,
@@ -420,13 +455,16 @@ class _EvidenceCollector:
         dynamic: bool = False,
         requires_resolution: bool = False,
         blocks_execution: bool = False,
+        line_offset: int = 0,
     ) -> None:
         if self.full:
             return
         line = min(max(1, line), len(lines))
         start = max(1, line - self.budget.lines_before)
         end = min(len(lines), line + self.budget.lines_after)
-        key = (source_id, path, start, kind)
+        source_start = start + line_offset
+        source_end = end + line_offset
+        key = (source_id, path, source_start, kind)
         if key in self._keys:
             return
         raw = "\n".join(lines[start - 1 : end])
@@ -436,7 +474,7 @@ class _EvidenceCollector:
             return
         sanitized = sanitized[: min(remaining, self.budget.max_excerpt_characters)]
         digest = hashlib.sha256(raw.encode(errors="replace")).hexdigest()
-        identity = f"{source_id}:{path}:{start}:{end}:{kind}"
+        identity = f"{source_id}:{path}:{source_start}:{source_end}:{kind}"
         evidence_id = f"evidence-{hashlib.sha256(identity.encode()).hexdigest()[:20]}"
         self.observations.append(
             EvidenceObservation(
@@ -444,8 +482,8 @@ class _EvidenceCollector:
                 source_id=source_id,
                 source_purpose=purpose,
                 path=path,
-                start_line=start,
-                end_line=end,
+                start_line=source_start,
+                end_line=source_end,
                 kind=kind,
                 strength=strength,
                 summary=sanitize_metadata(summary),
@@ -489,29 +527,6 @@ def schedule_investigation_queries(
         if len(result) == maximum_queries:
             break
     return tuple(result)
-
-
-def _build_retriever(
-    *,
-    sources: dict[str, AcquiredSource],
-    purposes: dict[str, SourcePurpose],
-    searchable_paths: dict[str, list[str]],
-) -> DeploymentRetrievalEngine:
-    documents = []
-    for source_id, paths in sorted(searchable_paths.items()):
-        for path in paths:
-            lines = _read_source_lines(sources[source_id], path)
-            if not lines:
-                continue
-            documents.append(
-                DeploymentRetrievalEngine.document(
-                    source_id=source_id,
-                    source_kind=purposes[source_id].value,
-                    path=path,
-                    text="\n".join(lines),
-                )
-            )
-    return DeploymentRetrievalEngine(documents)
 
 
 def _read_source_lines(source: AcquiredSource, relative_path: str) -> list[str]:

@@ -65,7 +65,10 @@ def _add_analyze_parser(commands: Any) -> None:
         "--llm-max-requests",
         type=_positive_int,
         default=2,
-        help="Hard cap for investigation planning and grounded synthesis requests.",
+        help=(
+            "Hard cap for investigation planning and synthesis requests; "
+            "set at least 3 to enable one unresolved-question follow-up."
+        ),
     )
     analyze.add_argument(
         "--investigation-max-observations",
@@ -258,12 +261,20 @@ def _print_analysis_summary(
     )
     print(f"ready for execution: {str(result.workflow.ready_for_execution).lower()}")
     print(f"LLM requests this run: {evaluation.llm_requests}")
-    for outcome in (
+    outcomes = [
         result.investigation.plan_outcome,
         result.investigation.synthesis_outcome,
+    ]
+    if (
+        result.investigation.follow_up_outcome is not None
+        and result.investigation.follow_up_outcome
+        is not result.investigation.synthesis_outcome
     ):
+        outcomes.append(result.investigation.follow_up_outcome)
+    for outcome in outcomes:
         if outcome.value is None and outcome.warning:
             print(f"LLM {outcome.stage}: {outcome.warning}")
+    print(f"follow-up synthesis: {result.investigation.follow_up_status}")
     for failure_path in result.llm_failure_history_paths:
         print(f"LLM failure history: {failure_path}")
     print(

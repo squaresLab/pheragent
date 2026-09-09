@@ -35,12 +35,15 @@ from .enums import AnalysisTreatment, SourceKind
 from .evidence import (
     EvidenceBudget,
     collect_investigation_evidence,
+    collect_query_evidence,
+    merge_investigation_evidence,
     schedule_investigation_queries,
 )
 from .functional_blocks import build_functional_blocks
 from .inventory import RepositoryInventoryBuilder
 from .investigation import (
     InvestigationResult,
+    build_follow_up_queries,
     build_plan_input,
     build_synthesis_input,
     plan_investigation_with_llm,
@@ -58,6 +61,8 @@ from .source_manager import AcquisitionResult, SourceManager
 from .workflow import build_deployment_workflow
 
 ProgressCallback = Callable[[str], None]
+_MAX_FOLLOW_UP_OBSERVATIONS = 8
+_MAX_FOLLOW_UP_EVIDENCE_CHARACTERS = 4_000
 
 
 @dataclass(slots=True)
@@ -200,10 +205,8 @@ class RepositoryAnalysisPipeline:
             refresh_cache=config.refresh_llm,
             reasoning_effort=config.llm_reasoning_effort,
         )
-        classifier = CachedStructuredClassifier(
-            llm_config,
-            LLMRequestBudget(limit=config.llm_max_requests),
-        )
+        request_budget = LLMRequestBudget(limit=config.llm_max_requests)
+        classifier = CachedStructuredClassifier(llm_config, request_budget)
 
         notify(f"selected {len(roots)} deployment root(s) and {len(selected)} evidence node(s)")
         plan_input = build_plan_input(context, outlines, signals)
@@ -223,6 +226,8 @@ class RepositoryAnalysisPipeline:
             sources=source_by_id,
             source_purposes=source_purposes,
             searchable_paths=discovery.searchable_paths,
+            retrieval_documents=discovery.retrieval_documents,
+            reference_relations=discovery.reference_relations,
             roots=[root.source_ref for root in roots],
             components=signals.candidate_components,
             budget=EvidenceBudget(
@@ -263,13 +268,116 @@ class RepositoryAnalysisPipeline:
                 evidence_ids={observation.id for observation in observations},
             )
             warnings.extend(reconciliation_warnings)
-            signals = apply_investigation_synthesis(
-                signals,
-                synthesis,
-                observations,
-            )
         if synthesis_outcome.warning:
             warnings.append(synthesis_outcome.warning)
+
+        settled_signals = (
+            apply_investigation_synthesis(signals, synthesis, observations)
+            if synthesis is not None
+            else signals
+        )
+        outcomes = [plan_outcome, synthesis_outcome]
+        follow_up_queries = build_follow_up_queries(
+            synthesis.unresolved if synthesis else [],
+            settled_signals.candidate_components,
+        )
+        follow_up_outcome = None
+        follow_up_status = "not_requested_no_synthesis"
+        follow_up_accepted = False
+        unresolved_before_follow_up = len(synthesis.unresolved) if synthesis else 0
+        novel_evidence = ()
+        if follow_up_queries:
+            notify(f"probing {len(follow_up_queries)} uncovered deployment fact(s)")
+            focused_evidence = collect_query_evidence(
+                queries=follow_up_queries,
+                source_purposes=source_purposes,
+                retrieval_documents=discovery.retrieval_documents,
+                reference_relations=discovery.reference_relations,
+                components=settled_signals.candidate_components,
+                budget=EvidenceBudget(
+                    max_observations=min(
+                        _MAX_FOLLOW_UP_OBSERVATIONS,
+                        config.investigation_max_observations,
+                    ),
+                    max_characters=min(
+                        _MAX_FOLLOW_UP_EVIDENCE_CHARACTERS,
+                        config.investigation_max_evidence_chars,
+                    ),
+                    results_per_query=1,
+                ),
+            )
+            known_evidence = {observation.id for observation in observations}
+            novel_evidence = tuple(
+                observation
+                for observation in focused_evidence
+                if observation.id not in known_evidence
+            )
+            if novel_evidence:
+                observations = merge_investigation_evidence(
+                    observations,
+                    novel_evidence,
+                    budget=EvidenceBudget(
+                        max_observations=config.investigation_max_observations,
+                        max_characters=config.investigation_max_evidence_chars,
+                    ),
+                )
+        if synthesis is not None and not synthesis.unresolved:
+            follow_up_status = "not_requested_no_unresolved"
+        elif synthesis is not None and (
+            config.llm_max_requests < 3 or request_budget.remaining < 1
+        ):
+            follow_up_status = "not_requested_budget_exhausted"
+        elif synthesis is not None and not follow_up_queries:
+            follow_up_status = "not_requested_no_queries"
+        elif synthesis is not None and not novel_evidence:
+            follow_up_status = "not_requested_no_new_evidence"
+        elif synthesis is not None:
+            follow_up_input = build_synthesis_input(
+                context,
+                settled_signals,
+                observations,
+                mandatory_probes,
+                questions_to_recheck=synthesis.unresolved,
+            )
+            notify("re-synthesizing unresolved deployment questions")
+            follow_up_outcome = synthesize_investigation_with_llm(
+                follow_up_input,
+                components=settled_signals.candidate_components,
+                context=context,
+                evidence_ids={observation.id for observation in observations},
+                classifier=classifier,
+                stage="investigation_follow_up_synthesis",
+            )
+            outcomes.append(follow_up_outcome)
+            if follow_up_outcome.value is None:
+                follow_up_status = "failed"
+            else:
+                follow_up_synthesis, follow_up_warnings = reconcile_investigation_synthesis(
+                    follow_up_outcome.value,
+                    components=settled_signals.candidate_components,
+                    context=context,
+                    evidence_ids={observation.id for observation in observations},
+                )
+                warnings.extend(follow_up_warnings)
+                if len(follow_up_synthesis.unresolved) < len(synthesis.unresolved):
+                    synthesis = follow_up_synthesis
+                    synthesis_outcome = follow_up_outcome
+                    synthesis_input = follow_up_input
+                    settled_signals = apply_investigation_synthesis(
+                        settled_signals,
+                        synthesis,
+                        observations,
+                    )
+                    follow_up_status = "accepted"
+                    follow_up_accepted = True
+                else:
+                    follow_up_status = "rejected_no_improvement"
+            if follow_up_outcome.warning:
+                warnings.append(follow_up_outcome.warning)
+
+        signals = settled_signals
+
+        retrieval_queries = (*retrieval_queries, *follow_up_queries)
 
         investigation = InvestigationResult(
             plan_input=plan_input,
@@ -280,13 +388,18 @@ class RepositoryAnalysisPipeline:
             synthesis_input=synthesis_input,
             synthesis=synthesis,
             synthesis_outcome=synthesis_outcome,
+            follow_up_queries=follow_up_queries,
+            follow_up_outcome=follow_up_outcome,
+            follow_up_status=follow_up_status,
+            follow_up_accepted=follow_up_accepted,
+            unresolved_before_follow_up=unresolved_before_follow_up,
         )
         workflow = build_deployment_workflow(
             context=context,
             signals=signals,
             observations=observations,
             synthesis=synthesis,
-            llm_completed=synthesis_outcome.value is not None,
+            llm_completed=synthesis is not None,
             mandatory_probes=mandatory_probes,
             documentation_expected=(
                 SourcePurpose.DOCUMENTATION in source_purposes.values()
@@ -294,7 +407,6 @@ class RepositoryAnalysisPipeline:
         )
 
         gold = _load_gold(config.gold_path)
-        outcomes = (plan_outcome, synthesis_outcome)
         usage = aggregate_usage(*outcomes)
         statuses = {outcome.stage: outcome.status for outcome in outcomes}
         document = build_functional_blocks(
