@@ -17,6 +17,12 @@ from .errors import DeploymentError, DeploymentInputError
 from .execution import prepare_execution
 from .output import create_timestamped_run_directory
 from .run_records import RunRecorder
+from .runtime_context import (
+    RuntimeInspectionConfig,
+    inspect_runtime_context,
+    load_runtime_context,
+)
+from .serialization import write_json
 
 _PRODUCT_ANALYSIS_POLICY = "deployment-analysis-v1"
 _PRODUCT_ANALYSIS_METHOD = AnalysisTreatment.HYBRID
@@ -28,8 +34,21 @@ def add_deployment_parser(subparsers: Any) -> None:
         help="Inspect deployment sources and review deployment artifacts.",
     )
     commands = deployment.add_subparsers(dest="deployment_command", required=True)
+    _add_runtime_parser(commands)
     _add_analyze_parser(commands)
     _add_run_parser(commands)
+
+
+def _add_runtime_parser(commands: Any) -> None:
+    inspect = commands.add_parser(
+        "inspect-runtime",
+        help="Save read-only AWS and Kubernetes environment observations.",
+    )
+    inspect.add_argument("--output", required=True, type=Path)
+    inspect.add_argument("--aws-profile", default=None)
+    inspect.add_argument("--aws-region", default=None)
+    inspect.add_argument("--kube-context", default=None)
+    inspect.add_argument("--timeout", type=_positive_float, default=30.0)
 
 
 def _add_analyze_parser(commands: Any) -> None:
@@ -40,6 +59,12 @@ def _add_analyze_parser(commands: Any) -> None:
     analyze.add_argument("--repo", action="append", default=[])
     analyze.add_argument("--docs", action="append", default=[])
     analyze.add_argument("--context", required=True, type=Path)
+    analyze.add_argument(
+        "--runtime-context",
+        type=Path,
+        default=None,
+        help="Snapshot produced by deployment inspect-runtime.",
+    )
     analyze.add_argument("--output", required=True, type=Path)
     analyze.add_argument(
         "--run-name",
@@ -145,6 +170,8 @@ def _add_run_parser(commands: Any) -> None:
 
 def run_deployment_command(args: argparse.Namespace) -> int:
     try:
+        if args.deployment_command == "inspect-runtime":
+            return _run_runtime_inspection(args)
         if args.deployment_command == "analyze":
             return _run_analyze(args)
         if args.deployment_command == "run":
@@ -162,6 +189,25 @@ def run_deployment_command(args: argparse.Namespace) -> int:
         return 1
 
 
+def _run_runtime_inspection(args: argparse.Namespace) -> int:
+    snapshot = inspect_runtime_context(
+        RuntimeInspectionConfig(
+            aws_profile=args.aws_profile,
+            aws_region=args.aws_region,
+            kube_context=args.kube_context,
+            timeout=args.timeout,
+        )
+    )
+    output = args.output.expanduser().resolve()
+    write_json(output, snapshot)
+    succeeded = sum(probe.succeeded for probe in snapshot.probes)
+    print(f"runtime context: {output}")
+    print(f"read-only probes: {succeeded}/{len(snapshot.probes)} succeeded")
+    for warning in snapshot.warnings:
+        print(f"runtime warning: {warning}", file=sys.stderr)
+    return 0 if snapshot.aws.available or snapshot.kubernetes.available else 1
+
+
 def _run_analyze(args: argparse.Namespace) -> int:
     output_root = args.output.expanduser().resolve()
     run_name = args.run_name or _context_system_name(args.context)
@@ -174,6 +220,7 @@ def _run_analyze(args: argparse.Namespace) -> int:
             "repositories": args.repo,
             "documentation": args.docs,
             "context": args.context,
+            "runtime_context": args.runtime_context,
             "model": args.model,
             "budgets": {
                 "node": args.node_budget,
@@ -242,6 +289,9 @@ def _analysis_config(args: argparse.Namespace, output_root: Path) -> AnalysisCon
         investigation_max_observations=args.investigation_max_observations,
         investigation_max_evidence_chars=args.investigation_max_evidence_chars,
         treatment=_PRODUCT_ANALYSIS_METHOD,
+        runtime_context=(
+            load_runtime_context(args.runtime_context) if args.runtime_context else None
+        ),
     )
 
 
@@ -255,6 +305,8 @@ def _print_analysis_summary(
     print(f"functional blocks: {run_dir / 'functional-blocks.yaml'}")
     print(f"analysis report: {run_dir / 'analysis-report.md'}")
     print(f"deployment workflow: {run_dir / 'deployment-workflow.yaml'}")
+    if result.runtime_context is not None:
+        print(f"runtime context: {run_dir / 'runtime-context.json'}")
     print(
         "LLM stages: "
         + "; ".join(f"{stage}={status}" for stage, status in result.llm_stage_statuses.items())

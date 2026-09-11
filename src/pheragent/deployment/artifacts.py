@@ -21,6 +21,8 @@ def publish_analysis_artifacts(
         write_yaml(staging / "functional-blocks.yaml", result.document)
         write_text(staging / "analysis-report.md", render_analysis_report(result))
         write_yaml(staging / "deployment-workflow.yaml", result.workflow)
+        if result.runtime_context is not None:
+            write_json(staging / "runtime-context.json", result.runtime_context)
         if result.knowledge_graph is not None:
             write_json(staging / "knowledge-graph.json", result.knowledge_graph)
         if debug:
@@ -45,6 +47,14 @@ def analysis_metrics(result: AnalysisResult) -> dict[str, Any]:
             "unresolved_after_follow_up": (
                 len(result.investigation.synthesis.unresolved)
                 if result.investigation.synthesis is not None
+                else 0
+            ),
+            "runtime_probes": (
+                len(result.runtime_context.probes) if result.runtime_context else 0
+            ),
+            "runtime_probe_failures": (
+                sum(not probe.succeeded for probe in result.runtime_context.probes)
+                if result.runtime_context
                 else 0
             ),
             "graph_queries": len(result.graph_queries),

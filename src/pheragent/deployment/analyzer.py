@@ -57,6 +57,7 @@ from .knowledge_graph import (
     project_deployment_knowledge,
 )
 from .models import RepositoryInventory, SourcesConfig, SourceSpec
+from .runtime_context import RuntimeContextSnapshot, compact_runtime_context
 from .source_manager import AcquisitionResult, SourceManager
 from .workflow import build_deployment_workflow
 
@@ -91,6 +92,7 @@ class AnalysisConfig:
     investigation_max_evidence_chars: int = 18_000
     treatment: AnalysisTreatment = AnalysisTreatment.HYBRID
     sources: SourcesConfig | None = None
+    runtime_context: RuntimeContextSnapshot | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -114,6 +116,7 @@ class AnalysisResult:
     graph_queries: tuple[str, ...]
     retrieval_queries: tuple[InvestigationQuery, ...]
     evidence_characters: int
+    runtime_context: RuntimeContextSnapshot | None
 
 
 def run_repository_analysis(
@@ -209,7 +212,13 @@ class RepositoryAnalysisPipeline:
         classifier = CachedStructuredClassifier(llm_config, request_budget)
 
         notify(f"selected {len(roots)} deployment root(s) and {len(selected)} evidence node(s)")
-        plan_input = build_plan_input(context, outlines, signals)
+        runtime_context = compact_runtime_context(config.runtime_context)
+        plan_input = build_plan_input(
+            context,
+            outlines,
+            signals,
+            runtime_context=runtime_context,
+        )
         notify(f"planning bounded evidence investigation from {len(outlines)} source outline(s)")
         plan_outcome = plan_investigation_with_llm(plan_input, classifier=classifier)
         plan = plan_outcome.value or default_investigation_plan()
@@ -250,6 +259,7 @@ class RepositoryAnalysisPipeline:
             signals,
             observations,
             mandatory_probes,
+            runtime_context=runtime_context,
         )
         notify("synthesizing grounded deployment facts and component decisions")
         synthesis_outcome = synthesize_investigation_with_llm(
@@ -338,6 +348,7 @@ class RepositoryAnalysisPipeline:
                 observations,
                 mandatory_probes,
                 questions_to_recheck=synthesis.unresolved,
+                runtime_context=runtime_context,
             )
             notify("re-synthesizing unresolved deployment questions")
             follow_up_outcome = synthesize_investigation_with_llm(
@@ -444,6 +455,7 @@ class RepositoryAnalysisPipeline:
             evidence_characters=sum(
                 len(observation.excerpt or "") for observation in observations
             ),
+            runtime_context=config.runtime_context,
         )
 
 

@@ -60,6 +60,26 @@ def test_deployment_run_accepts_one_block_scope(tmp_path: Path) -> None:
     assert args.allow_unready is True
 
 
+def test_deployment_runtime_inspection_options(tmp_path: Path) -> None:
+    parser = _build_parser()
+    args = parser.parse_args(
+        [
+            "deployment",
+            "inspect-runtime",
+            "--output",
+            str(tmp_path / "runtime.json"),
+            "--aws-region",
+            "us-east-1",
+            "--kube-context",
+            "mosip",
+        ]
+    )
+
+    assert args.deployment_command == "inspect-runtime"
+    assert args.aws_region == "us-east-1"
+    assert args.kube_context == "mosip"
+
+
 @pytest.mark.parametrize("research_option", ["--treatment", "--gold"])
 def test_deployment_analyze_hides_research_options(
     tmp_path: Path,

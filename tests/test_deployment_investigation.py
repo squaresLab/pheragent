@@ -21,6 +21,7 @@ from pheragent.deployment.investigation_models import (
     InvestigationPlan,
     InvestigationSynthesis,
 )
+from pheragent.deployment.runtime_context import RuntimeContextSnapshot
 
 
 def _write_context(path: Path) -> Path:
@@ -297,6 +298,37 @@ def test_refresh_llm_bypasses_success_cache_without_changing_source_cache(
         "investigation_synthesis": "llm",
     }
     assert len(requests) == 4
+
+
+def test_runtime_context_is_available_to_both_investigation_calls(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    repository = _write_orchestrated_repository(tmp_path)
+    requests = _mock_responses(monkeypatch, _empty_synthesis)
+    runtime = RuntimeContextSnapshot(
+        captured_at="2026-09-09T10:00:00+00:00",
+        aws={"available": True, "region": "us-east-1"},
+        kubernetes={"available": True, "namespaces": ["istio-system"]},
+    )
+
+    result = run_repository_analysis(
+        AnalysisConfig(
+            repositories=[str(repository)],
+            documentation=[],
+            context_path=_write_context(tmp_path / "context.yaml"),
+            cache_dir=tmp_path / "cache",
+            api_key_env="TEST_OPENAI_KEY",
+            llm_cache_dir=tmp_path / "llm-cache",
+            runtime_context=runtime,
+        )
+    )
+
+    assert result.runtime_context == runtime
+    assert [request["runtime_context"]["kubernetes"]["namespaces"] for request in requests] == [
+        ["istio-system"],
+        ["istio-system"],
+    ]
 
 
 def test_fallback_order_does_not_override_opposite_source_order() -> None:
