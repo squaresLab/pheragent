@@ -19,6 +19,7 @@ from .phase_one import (
     PhaseOneEvaluationReport,
     evaluate_phase_one,
 )
+from .recovery import RecoveryEvaluationReport, evaluate_recovery
 
 
 def add_evaluation_parser(subparsers: Any) -> None:
@@ -86,10 +87,23 @@ def add_evaluation_parser(subparsers: Any) -> None:
         action="store_true",
         help="Make fresh judge requests instead of reading successful or failed caches.",
     )
+    phase_three = commands.add_parser(
+        "phase-three",
+        help="Evaluate failure capture and bounded deployment recovery.",
+    )
+    phase_three.add_argument("--run", required=True, type=Path)
+    phase_three.add_argument("--output", required=True, type=Path)
 
 
 def run_evaluation_command(args: argparse.Namespace) -> int:
     try:
+        if args.evaluation_command == "phase-three":
+            report = evaluate_recovery(args.run)
+            output = args.output.expanduser().resolve()
+            _reject_output_inside_runs(output, (args.run,))
+            write_json(output, report)
+            _print_recovery_report(report, output)
+            return 0
         if args.evaluation_command != "phase-one":
             raise ValueError(f"unsupported evaluation command: {args.evaluation_command}")
         evaluation_input = PhaseOneEvaluationInput(
@@ -107,6 +121,17 @@ def run_evaluation_command(args: argparse.Namespace) -> int:
     except (OSError, ValueError, ValidationError, yaml.YAMLError) as exc:
         print(f"evaluation error: {exc}", file=sys.stderr)
         return 1
+
+
+def _print_recovery_report(report: RecoveryEvaluationReport, output: Path) -> None:
+    print(f"evaluation report: {output}")
+    print(
+        f"{report.run_id}: capture={_score(report.failure_capture_rate)}; "
+        f"sandbox={_score(report.sandbox_validation_success_rate)}; "
+        f"live_repair={_score(report.live_repair_success_rate)}; "
+        f"mean_attempts={_score(report.mean_attempts_before_success)}; "
+        f"unresolved={report.unresolved_failures}; tokens={report.usage.total_tokens}"
+    )
 
 
 def _parse_source_roots(values: list[str]) -> dict[str, Path]:

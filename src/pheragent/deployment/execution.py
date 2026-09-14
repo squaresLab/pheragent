@@ -2,10 +2,17 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import signal
 import subprocess
+import sys
+import threading
+import time
+from collections import deque
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
+from typing import Any, Protocol
 
 from .analysis_models import (
     DeploymentWorkflow,
@@ -18,12 +25,51 @@ from .errors import (
     WorkflowExecutionError,
     WorkflowNotExecutableError,
 )
-from .serialization import load_yaml
+from .recovery import RecoveryFailure, RecoveryResolution, RecoveryStatus
+from .redaction import redact_secrets
+from .serialization import load_yaml, write_json, write_text
 from .workflow import operation_fingerprint, ordered_workflow_steps
 
-CommandRunner = Callable[[str, Path, float], int]
 ProgressCallback = Callable[[str], None]
 _FAILURE_POLICY = "continue-independent"
+_CAPTURE_LIMIT = 1_000_000
+_FAILURE_EXCERPT_LIMIT = 8_000
+
+
+@dataclass(frozen=True, slots=True)
+class CommandOutcome:
+    return_code: int | None
+    output: str
+    duration_seconds: float
+    timed_out: bool = False
+
+    @classmethod
+    def succeeded(cls, output: str = "", *, duration_seconds: float = 0.0) -> CommandOutcome:
+        return cls(0, output, duration_seconds)
+
+    @classmethod
+    def failed(
+        cls,
+        return_code: int,
+        output: str,
+        *,
+        duration_seconds: float = 0.0,
+    ) -> CommandOutcome:
+        return cls(return_code, output, duration_seconds)
+
+
+CommandRunner = Callable[[str, Path, float], CommandOutcome | int]
+
+
+class RecoveryQueue(Protocol):
+    @property
+    def has_pending(self) -> bool: ...
+
+    def submit(self, failure: RecoveryFailure) -> None: ...
+
+    def poll(self) -> RecoveryResolution | None: ...
+
+    def wait(self) -> RecoveryResolution: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,12 +89,26 @@ class ExecutionIssue:
 
 
 @dataclass(frozen=True, slots=True)
+class ExecutionAttempt:
+    step_id: str
+    attempt: int
+    status: str
+    exit_code: int | None
+    timed_out: bool
+    duration_seconds: float
+    output_path: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class ExecutionReport:
     """Final outcome after every runnable dependency branch has been attempted."""
 
     completed: tuple[str, ...]
     failed: tuple[ExecutionIssue, ...]
     skipped: tuple[ExecutionIssue, ...]
+    attempts: tuple[ExecutionAttempt, ...] = ()
+    recoveries: tuple[RecoveryResolution, ...] = ()
+    failures_seen: tuple[RecoveryFailure, ...] = ()
 
     @property
     def successful(self) -> bool:
@@ -152,51 +212,443 @@ class PreparedExecution:
         timeout: float,
         progress: ProgressCallback | None = None,
         command_runner: CommandRunner | None = None,
+        recovery_queue: RecoveryQueue | None = None,
+        max_repair_attempts: int = 2,
+        output_directory: Path | None = None,
     ) -> ExecutionReport:
-        """Execute every viable branch while respecting failed dependencies."""
+        """Run ready work while failed branches recover within a fixed budget."""
         if not self.executable:
             raise WorkflowNotExecutableError("deployment workflow is not ready for execution")
         if approval_token != self.approval_token:
             raise DeploymentInputError(
                 "approval token does not match this workflow, command order, and source mapping"
             )
-        notify = progress or (lambda _message: None)
-        runner = command_runner or _run_command
-        completed: list[str] = []
-        failed: list[ExecutionIssue] = []
-        skipped: list[ExecutionIssue] = []
-        unsuccessful: set[str] = set()
-        total = len(self.operations)
-        for index, operation in enumerate(self.operations, start=1):
-            step = operation.step
-            blocked_by = [dependency for dependency in step.after if dependency in unsuccessful]
-            if blocked_by:
-                reason = "unsuccessful prerequisite(s): " + ", ".join(blocked_by)
-                notify(f"[{index}/{total}] {step.id}: skipped; {reason}")
-                skipped.append(ExecutionIssue(step.id, reason))
-                unsuccessful.add(step.id)
-                continue
+        if max_repair_attempts < 1:
+            raise DeploymentInputError("max repair attempts must be greater than zero")
+        output = output_directory.expanduser().resolve() if output_directory else None
+        if output:
+            output.mkdir(parents=True, exist_ok=True)
+        report = _execute_operations(
+            self,
+            runner=command_runner or _run_command,
+            recovery_queue=recovery_queue,
+            max_repair_attempts=max_repair_attempts,
+            timeout=timeout,
+            output_directory=output,
+            notify=progress or (lambda _message: None),
+        )
+        if output:
+            _write_execution_artifacts(output, report)
+        return report
+
+
+def _execute_operations(
+    prepared: PreparedExecution,
+    *,
+    runner: CommandRunner,
+    recovery_queue: RecoveryQueue | None,
+    max_repair_attempts: int,
+    timeout: float,
+    output_directory: Path | None,
+    notify: ProgressCallback,
+) -> ExecutionReport:
+    operations = {operation.step.id: operation for operation in prepared.operations}
+    states = dict.fromkeys(operations, "pending")
+    working_directories = {
+        step_id: operation.working_directory for step_id, operation in operations.items()
+    }
+    source_roots = {
+        step_id: prepared.source_roots[
+            (operation.step.operation_source_ref or operation.step.source_ref).repo_id
+        ]
+        for step_id, operation in operations.items()
+    }
+    attempt_counts = dict.fromkeys(operations, 0)
+    repair_counts = dict.fromkeys(operations, 0)
+    latest_failures: dict[str, RecoveryFailure] = {}
+    completed: list[str] = []
+    failed: dict[str, ExecutionIssue] = {}
+    skipped: dict[str, ExecutionIssue] = {}
+    attempts: list[ExecutionAttempt] = []
+    recoveries: list[RecoveryResolution] = []
+    failures_seen: list[RecoveryFailure] = []
+
+    def checkpoint() -> None:
+        if output_directory:
+            _write_execution_artifacts(
+                output_directory,
+                ExecutionReport(
+                    tuple(completed),
+                    tuple(failed.values()),
+                    tuple(skipped.values()),
+                    tuple(attempts),
+                    tuple(recoveries),
+                    tuple(failures_seen),
+                ),
+            )
+
+    while True:
+        while recovery_queue and (resolution := recovery_queue.poll()) is not None:
+            _accept_resolution(
+                resolution,
+                states=states,
+                working_directories=working_directories,
+                source_roots=source_roots,
+                latest_failures=latest_failures,
+                repair_counts=repair_counts,
+                max_repair_attempts=max_repair_attempts,
+                recovery_queue=recovery_queue,
+                recoveries=recoveries,
+                failed=failed,
+                notify=notify,
+            )
+            checkpoint()
+
+        _skip_failed_descendants(operations, states, skipped, notify)
+        ready = _next_ready_operation(prepared.operations, states)
+        if ready is not None:
+            step = ready.step
             command = step.command
-            if command is None:  # Protected by executable; keeps the boundary explicit.
+            if command is None:
                 raise WorkflowNotExecutableError(f"workflow step {step.id} has no command")
-            notify(f"[{index}/{total}] {step.id}: {command}")
-            try:
-                return_code = runner(command, operation.working_directory, timeout)
-            except WorkflowExecutionError as exc:
-                reason = str(exc)
-                notify(f"[{index}/{total}] {step.id}: failed; {reason}")
-                failed.append(ExecutionIssue(step.id, reason))
-                unsuccessful.add(step.id)
+            attempt_counts[step.id] += 1
+            attempt = attempt_counts[step.id]
+            label = f"[{list(operations).index(step.id) + 1}/{len(operations)}] {step.id}"
+            suffix = f" (attempt {attempt})" if attempt > 1 else ""
+            notify(f"{label}{suffix}: {command}")
+            outcome = _run_attempt(runner, command, working_directories[step.id], timeout)
+            log_path = _write_attempt_log(output_directory, step.id, attempt, outcome.output)
+            attempts.append(_attempt_record(step.id, attempt, outcome, log_path))
+            if outcome.return_code == 0 and not outcome.timed_out:
+                states[step.id] = "completed"
+                completed.append(step.id)
+                failed.pop(step.id, None)
+                notify(f"{label}{suffix}: completed")
+                checkpoint()
                 continue
-            if return_code != 0:
-                reason = f"exit code {return_code}"
-                notify(f"[{index}/{total}] {step.id}: failed; {reason}")
-                failed.append(ExecutionIssue(step.id, reason))
-                unsuccessful.add(step.id)
+            failure = _build_failure(
+                prepared,
+                ready,
+                source_root=source_roots[step.id],
+                working_directory=working_directories[step.id],
+                attempt=attempt,
+                outcome=outcome,
+                history=tuple(
+                    resolution.reason
+                    for resolution in recoveries
+                    if resolution.step_id == step.id
+                ),
+            )
+            failures_seen.append(failure)
+            latest_failures[step.id] = failure
+            reason = _failure_reason(outcome)
+            notify(f"{label}{suffix}: failed; {reason}")
+            if recovery_queue and repair_counts[step.id] < max_repair_attempts:
+                repair_counts[step.id] += 1
+                states[step.id] = "recovering"
+                recovery_queue.submit(failure)
+                notify(
+                    f"{label}: queued for recovery "
+                    f"({repair_counts[step.id]}/{max_repair_attempts})"
+                )
+            else:
+                states[step.id] = "failed"
+                failed[step.id] = ExecutionIssue(step.id, reason)
+            checkpoint()
+            continue
+
+        if recovery_queue and recovery_queue.has_pending:
+            resolution = recovery_queue.wait()
+            _accept_resolution(
+                resolution,
+                states=states,
+                working_directories=working_directories,
+                source_roots=source_roots,
+                latest_failures=latest_failures,
+                repair_counts=repair_counts,
+                max_repair_attempts=max_repair_attempts,
+                recovery_queue=recovery_queue,
+                recoveries=recoveries,
+                failed=failed,
+                notify=notify,
+            )
+            checkpoint()
+            continue
+        if all(state in {"completed", "failed", "skipped"} for state in states.values()):
+            break
+        _skip_unreachable_operations(states, skipped, notify)
+        checkpoint()
+        break
+
+    return ExecutionReport(
+        tuple(completed),
+        tuple(failed.values()),
+        tuple(skipped.values()),
+        tuple(attempts),
+        tuple(recoveries),
+        tuple(failures_seen),
+    )
+
+
+def _accept_resolution(
+    resolution: RecoveryResolution,
+    *,
+    states: dict[str, str],
+    working_directories: dict[str, Path],
+    source_roots: dict[str, Path],
+    latest_failures: dict[str, RecoveryFailure],
+    repair_counts: dict[str, int],
+    max_repair_attempts: int,
+    recovery_queue: RecoveryQueue,
+    recoveries: list[RecoveryResolution],
+    failed: dict[str, ExecutionIssue],
+    notify: ProgressCallback,
+) -> None:
+    recoveries.append(resolution)
+    step_id = resolution.step_id
+    failure = latest_failures[step_id]
+    if resolution.status == RecoveryStatus.RESOLVED:
+        if resolution.workspace_root:
+            relative = failure.working_directory.relative_to(failure.source_root)
+            source_roots[step_id] = resolution.workspace_root
+            working_directories[step_id] = resolution.workspace_root / relative
+        states[step_id] = "pending"
+        notify(f"recovery: {step_id}: validated fix ready; retrying original command")
+        return
+    if (
+        resolution.status == RecoveryStatus.RETRYABLE
+        and repair_counts[step_id] < max_repair_attempts
+    ):
+        repair_counts[step_id] += 1
+        retried = replace(
+            failure,
+            id=f"{step_id}-recovery-{repair_counts[step_id]}",
+            history=(*failure.history, resolution.reason),
+        )
+        latest_failures[step_id] = retried
+        recovery_queue.submit(retried)
+        notify(
+            f"recovery: {step_id}: trying another repair "
+            f"({repair_counts[step_id]}/{max_repair_attempts})"
+        )
+        return
+    states[step_id] = "failed"
+    failed[step_id] = ExecutionIssue(step_id, resolution.reason)
+    notify(f"recovery: {step_id}: {resolution.status.value}; {resolution.reason}")
+
+
+def _skip_failed_descendants(
+    operations: dict[str, ExecutionOperation],
+    states: dict[str, str],
+    skipped: dict[str, ExecutionIssue],
+    notify: ProgressCallback,
+) -> None:
+    changed = True
+    while changed:
+        changed = False
+        for step_id, operation in operations.items():
+            if states[step_id] != "pending":
                 continue
-            completed.append(step.id)
-            notify(f"[{index}/{total}] {step.id}: completed")
-        return ExecutionReport(tuple(completed), tuple(failed), tuple(skipped))
+            blocked_by = [
+                dependency
+                for dependency in operation.step.after
+                if states.get(dependency) in {"failed", "skipped"}
+            ]
+            if not blocked_by:
+                continue
+            reason = "unsuccessful prerequisite(s): " + ", ".join(blocked_by)
+            states[step_id] = "skipped"
+            skipped[step_id] = ExecutionIssue(step_id, reason)
+            notify(f"{step_id}: skipped; {reason}")
+            changed = True
+
+
+def _next_ready_operation(
+    ordered: tuple[ExecutionOperation, ...],
+    states: dict[str, str],
+) -> ExecutionOperation | None:
+    for operation in ordered:
+        if states[operation.step.id] != "pending":
+            continue
+        dependencies = [item for item in operation.step.after if item in states]
+        if all(states[item] == "completed" for item in dependencies):
+            return operation
+    return None
+
+
+def _skip_unreachable_operations(
+    states: dict[str, str],
+    skipped: dict[str, ExecutionIssue],
+    notify: ProgressCallback,
+) -> None:
+    for step_id, state in states.items():
+        if state != "pending":
+            continue
+        reason = "deployment made no progress"
+        states[step_id] = "skipped"
+        skipped[step_id] = ExecutionIssue(step_id, reason)
+        notify(f"{step_id}: skipped; {reason}")
+
+
+def _run_attempt(
+    runner: CommandRunner,
+    command: str,
+    working_directory: Path,
+    timeout: float,
+) -> CommandOutcome:
+    started = time.monotonic()
+    try:
+        result = runner(command, working_directory, timeout)
+    except WorkflowExecutionError as exc:
+        return CommandOutcome(None, str(exc), time.monotonic() - started, "timed out" in str(exc))
+    if isinstance(result, CommandOutcome):
+        return result
+    return CommandOutcome(result, "", time.monotonic() - started)
+
+
+def _build_failure(
+    prepared: PreparedExecution,
+    operation: ExecutionOperation,
+    *,
+    source_root: Path,
+    working_directory: Path,
+    attempt: int,
+    outcome: CommandOutcome,
+    history: tuple[str, ...],
+) -> RecoveryFailure:
+    step = operation.step
+    source = step.operation_source_ref or step.source_ref
+    return RecoveryFailure(
+        id=f"{step.id}-attempt-{attempt}",
+        step_id=step.id,
+        block_id=prepared.selected_block.id if prepared.selected_block else None,
+        component_ids=tuple(target.id for target in step.targets),
+        executor=step.executor.value,
+        command=step.command or "",
+        repo_id=source.repo_id,
+        source_path=source.path,
+        source_root=source_root,
+        working_directory=working_directory,
+        attempt=attempt,
+        exit_code=outcome.return_code,
+        timed_out=outcome.timed_out,
+        duration_seconds=round(outcome.duration_seconds, 6),
+        output_excerpt=_compact_output(redact_secrets(outcome.output), _FAILURE_EXCERPT_LIMIT),
+        history=history,
+    )
+
+
+def _failure_reason(outcome: CommandOutcome) -> str:
+    if outcome.timed_out:
+        return "command timed out"
+    return f"exit code {outcome.return_code}"
+
+
+def _write_attempt_log(
+    output_directory: Path | None,
+    step_id: str,
+    attempt: int,
+    output: str,
+) -> str | None:
+    if output_directory is None:
+        return None
+    relative = Path("logs") / f"{step_id}-attempt-{attempt}.log"
+    write_text(output_directory / relative, redact_secrets(_compact_output(output, _CAPTURE_LIMIT)))
+    return relative.as_posix()
+
+
+def _attempt_record(
+    step_id: str,
+    attempt: int,
+    outcome: CommandOutcome,
+    output_path: str | None,
+) -> ExecutionAttempt:
+    return ExecutionAttempt(
+        step_id=step_id,
+        attempt=attempt,
+        status="completed" if outcome.return_code == 0 and not outcome.timed_out else "failed",
+        exit_code=outcome.return_code,
+        timed_out=outcome.timed_out,
+        duration_seconds=round(outcome.duration_seconds, 6),
+        output_path=output_path,
+    )
+
+
+def _write_execution_artifacts(output: Path, report: ExecutionReport) -> None:
+    write_json(
+        output / "execution.json",
+        {
+            "completed": report.completed,
+            "failed": [asdict(issue) for issue in report.failed],
+            "skipped": [asdict(issue) for issue in report.skipped],
+            "attempts": [asdict(attempt) for attempt in report.attempts],
+            "recoveries": [_resolution_payload(item) for item in report.recoveries],
+        },
+    )
+    write_json(
+        output / "failure-bundle.json",
+        {"failures": [_failure_payload(item) for item in report.failures_seen]},
+    )
+
+
+def _failure_payload(failure: RecoveryFailure) -> dict[str, Any]:
+    return {
+        "id": failure.id,
+        "step_id": failure.step_id,
+        "block_id": failure.block_id,
+        "component_ids": failure.component_ids,
+        "executor": failure.executor,
+        "command": redact_secrets(failure.command),
+        "repo_id": failure.repo_id,
+        "source_path": failure.source_path,
+        "working_directory": failure.working_directory.relative_to(failure.source_root).as_posix(),
+        "attempt": failure.attempt,
+        "exit_code": failure.exit_code,
+        "timed_out": failure.timed_out,
+        "duration_seconds": failure.duration_seconds,
+        "output_excerpt": failure.output_excerpt,
+        "history": failure.history,
+    }
+
+
+def _resolution_payload(resolution: RecoveryResolution) -> dict[str, Any]:
+    return {
+        "failure_id": resolution.failure_id,
+        "step_id": resolution.step_id,
+        "status": resolution.status.value,
+        "reason": resolution.reason,
+        "scope": resolution.scope.value,
+        "patch": resolution.patch,
+        "probes": [
+            {
+                "request": probe.request.model_dump(mode="json", exclude_none=True),
+                "succeeded": probe.succeeded,
+                "output": probe.output,
+                "error": probe.error,
+            }
+            for probe in resolution.probes
+        ],
+        "usage": resolution.usage,
+        "validation": (
+            {
+                "succeeded": resolution.validation.succeeded,
+                "checks": resolution.validation.checks,
+                "error": resolution.validation.error,
+            }
+            if resolution.validation
+            else None
+        ),
+        "model": resolution.model,
+        "llm_calls": resolution.llm_calls,
+    }
+
+
+def _compact_output(text: str, limit: int) -> str:
+    if len(text) <= limit:
+        return text
+    head = min(1_000, limit // 4)
+    marker = "\n...[truncated]...\n"
+    return text[:head] + marker + text[-(limit - head - len(marker)) :]
 
 
 def prepare_execution(
@@ -418,14 +870,77 @@ def _source_label(step: DeploymentWorkflowStep) -> str:
     return f"{source.repo_id}:{source.path}{line}"
 
 
-def _run_command(command: str, working_directory: Path, timeout: float) -> int:
+def _run_command(command: str, working_directory: Path, timeout: float) -> CommandOutcome:
+    started = time.monotonic()
+    process = subprocess.Popen(
+        ["bash", "-o", "pipefail", "-c", command],
+        cwd=working_directory,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        errors="replace",
+        bufsize=1,
+        start_new_session=True,
+    )
+    captured = _OutputTail(_CAPTURE_LIMIT)
+
+    def read_output() -> None:
+        assert process.stdout is not None
+        for line in process.stdout:
+            sys.stdout.write(line)
+            sys.stdout.flush()
+            captured.append(line)
+
+    reader = threading.Thread(target=read_output, daemon=True)
+    reader.start()
+    timed_out = False
     try:
-        completed = subprocess.run(
-            ["bash", "-o", "pipefail", "-c", command],
-            cwd=working_directory,
-            check=False,
-            timeout=timeout,
-        )
-    except subprocess.TimeoutExpired as exc:
-        raise WorkflowExecutionError(f"command timed out after {timeout:g} seconds") from exc
-    return completed.returncode
+        return_code = process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        os.killpg(process.pid, signal.SIGTERM)
+        try:
+            return_code = process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            os.killpg(process.pid, signal.SIGKILL)
+            return_code = process.wait()
+    reader.join(timeout=5)
+    return CommandOutcome(
+        None if timed_out else return_code,
+        captured.value,
+        time.monotonic() - started,
+        timed_out,
+    )
+
+
+class _OutputTail:
+    """Keep a small beginning and bounded tail while output streams to the operator."""
+
+    def __init__(self, limit: int) -> None:
+        self._head_limit = min(32_000, limit // 4)
+        self._tail_limit = limit - self._head_limit
+        self._head = ""
+        self._tail: deque[str] = deque()
+        self._tail_size = 0
+        self._truncated = False
+
+    def append(self, text: str) -> None:
+        if len(self._head) < self._head_limit:
+            remaining = self._head_limit - len(self._head)
+            self._head += text[:remaining]
+            text = text[remaining:]
+        if not text:
+            return
+        self._tail.append(text)
+        self._tail_size += len(text)
+        while self._tail_size > self._tail_limit and self._tail:
+            removed = self._tail.popleft()
+            self._tail_size -= len(removed)
+            self._truncated = True
+
+    @property
+    def value(self) -> str:
+        tail = "".join(self._tail)
+        if not self._truncated:
+            return self._head + tail
+        return self._head + "\n...[output truncated]...\n" + tail

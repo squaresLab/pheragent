@@ -3,8 +3,10 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import threading
+import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -44,16 +46,19 @@ class AnalysisLLMConfig:
 class LLMRequestBudget:
     limit: int
     attempted: int = 0
+    _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
 
     @property
     def remaining(self) -> int:
-        return max(0, self.limit - self.attempted)
+        with self._lock:
+            return max(0, self.limit - self.attempted)
 
     def consume(self) -> bool:
-        if self.attempted >= self.limit:
-            return False
-        self.attempted += 1
-        return True
+        with self._lock:
+            if self.attempted >= self.limit:
+                return False
+            self.attempted += 1
+            return True
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,6 +70,7 @@ class ClassificationOutcome[T: BaseModel]:
     input_tokens_estimate: int
     warning: str | None = None
     failure_history_path: Path | None = None
+    duration_seconds: float = 0.0
 
 
 class CachedStructuredClassifier:
@@ -216,6 +222,7 @@ class CachedStructuredClassifier:
 
         content = ""
         usage: dict[str, int] = {}
+        started = time.monotonic()
         try:
             base_url = _resolve_openai_base_url(
                 configured_base_url=self._config.base_url,
@@ -293,6 +300,7 @@ class CachedStructuredClassifier:
                     if item
                 ),
                 failure_history_path=failure_path,
+                duration_seconds=round(time.monotonic() - started, 6),
             )
 
         usage["requests"] = max(1, int(usage.get("requests", 0)))
@@ -314,6 +322,7 @@ class CachedStructuredClassifier:
             usage,
             estimate,
             warning=cache_warning,
+            duration_seconds=round(time.monotonic() - started, 6),
         )
 
 

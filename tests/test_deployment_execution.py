@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
+from threading import Event
 
 import pytest
 import yaml
@@ -10,7 +12,12 @@ from pheragent.deployment.errors import (
     DeploymentInputError,
     WorkflowNotExecutableError,
 )
-from pheragent.deployment.execution import prepare_execution
+from pheragent.deployment.execution import CommandOutcome, prepare_execution
+from pheragent.deployment.recovery import (
+    RecoveryResolution,
+    RecoveryStatus,
+    ThreadedRecoveryQueue,
+)
 
 
 def _workflow_payload() -> dict[str, object]:
@@ -250,6 +257,158 @@ def test_execution_continues_a_successful_chain_after_an_independent_failure(
     assert report.completed == ("S002", "S003")
     assert [issue.step_id for issue in report.failed] == ["S001"]
     assert report.skipped == ()
+
+
+def test_execution_checkpoints_each_completed_step(tmp_path: Path) -> None:
+    workflow, source = _write_workflow(tmp_path)
+    prepared = prepare_execution(workflow, {"fixture": source})
+    output = tmp_path / "execution"
+
+    def runner(command: str, _cwd: Path, _timeout: float) -> int:
+        if command == "printf application":
+            checkpoint = json.loads((output / "execution.json").read_text(encoding="utf-8"))
+            assert checkpoint["completed"] == ["S001"]
+        return 0
+
+    prepared.execute(
+        approval_token=prepared.approval_token,
+        timeout=10,
+        output_directory=output,
+        command_runner=runner,
+    )
+
+
+def test_execution_repairs_failure_while_independent_work_continues(tmp_path: Path) -> None:
+    payload = _workflow_payload()
+    steps = payload["steps"]
+    assert isinstance(steps, list)
+    by_id = {step["id"]: step for step in steps}
+    by_id["S001"]["command"] = "install database"
+    by_id["S002"]["command"] = "configure application"
+    by_id["S003"]["command"] = "validate application"
+    steps.append(
+        {
+            "id": "S004",
+            "kind": "component",
+            "targets": [{"id": "C004_cache", "name": "Cache"}],
+            "executor": "shell",
+            "source_ref": {"repo_id": "fixture", "path": "deploy.sh"},
+            "working_directory": ".",
+            "command": "install cache",
+            "required_inputs": [],
+            "after": [],
+            "status": "ready",
+            "blockers": [],
+        }
+    )
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "deploy.sh").write_text("#!/bin/bash\n", encoding="utf-8")
+    workflow = tmp_path / "deployment-workflow.yaml"
+    workflow.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
+    prepared = prepare_execution(workflow, {"fixture": source})
+    recovery_started = Event()
+    release_recovery = Event()
+    calls: list[str] = []
+
+    def resolve(failure):
+        recovery_started.set()
+        assert release_recovery.wait(timeout=2)
+        return RecoveryResolution(
+            failure_id=failure.id,
+            step_id=failure.step_id,
+            status=RecoveryStatus.RESOLVED,
+            reason="sandbox validation passed",
+        )
+
+    def runner(command: str, _cwd: Path, _timeout: float) -> CommandOutcome:
+        calls.append(command)
+        if command == "install database" and calls.count(command) == 1:
+            return CommandOutcome.failed(1, "repo bitnami not found")
+        if command == "install cache":
+            assert recovery_started.wait(timeout=2)
+            release_recovery.set()
+        return CommandOutcome.succeeded("ok")
+
+    with ThreadedRecoveryQueue(resolve, workers=2) as recovery_queue:
+        report = prepared.execute(
+            approval_token=prepared.approval_token,
+            timeout=10,
+            command_runner=runner,
+            recovery_queue=recovery_queue,
+            max_repair_attempts=2,
+        )
+
+    assert calls == [
+        "install cache",
+        "install database",
+        "install database",
+        "configure application",
+        "validate application",
+    ] or calls == [
+        "install database",
+        "install cache",
+        "install database",
+        "configure application",
+        "validate application",
+    ]
+    assert set(report.completed) == {"S001", "S002", "S003", "S004"}
+    assert report.failed == ()
+    assert report.skipped == ()
+    assert len([attempt for attempt in report.attempts if attempt.step_id == "S001"]) == 2
+
+
+def test_execution_keeps_exhausted_failure_and_skips_only_its_descendants(
+    tmp_path: Path,
+) -> None:
+    payload = _workflow_payload()
+    steps = payload["steps"]
+    assert isinstance(steps, list)
+    steps.append(
+        {
+            "id": "S004",
+            "kind": "component",
+            "targets": [{"id": "C004_cache", "name": "Cache"}],
+            "executor": "shell",
+            "source_ref": {"repo_id": "fixture", "path": "deploy.sh"},
+            "working_directory": ".",
+            "command": "install cache",
+            "required_inputs": [],
+            "after": [],
+            "status": "ready",
+            "blockers": [],
+        },
+    )
+    source = tmp_path / "source"
+    source.mkdir()
+    workflow = tmp_path / "deployment-workflow.yaml"
+    workflow.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
+    prepared = prepare_execution(workflow, {"fixture": source})
+
+    def resolve(failure):
+        return RecoveryResolution(
+            failure_id=failure.id,
+            step_id=failure.step_id,
+            status=RecoveryStatus.EXHAUSTED,
+            reason="repair budget exhausted",
+        )
+
+    with ThreadedRecoveryQueue(resolve, workers=2) as recovery_queue:
+        report = prepared.execute(
+            approval_token=prepared.approval_token,
+            timeout=10,
+            command_runner=lambda command, _cwd, _timeout: (
+                CommandOutcome.failed(1, "still broken")
+                if command == "printf database"
+                else CommandOutcome.succeeded("ok")
+            ),
+            recovery_queue=recovery_queue,
+            max_repair_attempts=1,
+        )
+
+    assert report.completed == ("S004",)
+    assert [issue.step_id for issue in report.failed] == ["S001"]
+    assert {issue.step_id for issue in report.skipped} == {"S002", "S003"}
 
 
 def test_trial_mode_executes_only_ready_dependency_closed_steps(tmp_path: Path) -> None:

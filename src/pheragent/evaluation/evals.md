@@ -168,4 +168,16 @@ recommended.
 
 ## Phase 3
 
+Phase 3 is measured from the sealed execution run. It does not ask an LLM to judge its own fix.
+
+- **Failure capture rate:** failed command attempts represented in the compact failure bundle.
+- **Sandbox validation success rate:** proposed fixes that pass the safe local checks.
+- **Live repair success rate:** resolved steps that later complete on the target system.
+- **Mean attempts before success:** command attempts required by successfully repaired steps.
+- **Resource use:** unresolved failures, duration, and recorded tokens. Cost stays unavailable until
+  the model provider supplies reliable pricing data.
+
+These measures separate diagnosis from real recovery. A patch passing local checks is useful, but
+it is not counted as a successful repair until the deployment command succeeds.
+
 ## Phase 4

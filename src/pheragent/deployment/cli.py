@@ -9,13 +9,19 @@ from typing import Any
 import yaml
 from pydantic import ValidationError
 
-from .analysis_llm import DEFAULT_ANALYSIS_MODEL
+from .analysis_llm import (
+    DEFAULT_ANALYSIS_MODEL,
+    AnalysisLLMConfig,
+    ClassificationOutcome,
+    LLMRequestBudget,
+)
 from .analyzer import AnalysisConfig, AnalysisResult, run_repository_analysis
 from .artifacts import analysis_metrics, publish_analysis_artifacts
 from .enums import AnalysisTreatment
 from .errors import DeploymentError, DeploymentInputError
-from .execution import prepare_execution
+from .execution import ExecutionReport, prepare_execution
 from .output import create_timestamped_run_directory
+from .recovery import RecoveryAgent, ThreadedRecoveryQueue
 from .run_records import RunRecorder
 from .runtime_context import (
     RuntimeInspectionConfig,
@@ -166,6 +172,23 @@ def _add_run_parser(commands: Any) -> None:
         help="Approval token printed by an identical dry-run; required with --execute.",
     )
     run.add_argument("--command-timeout", type=_positive_float, default=900.0)
+    run.add_argument(
+        "--output",
+        type=Path,
+        default=None,
+        help="Execution-run root; defaults beside the analysis runs directory.",
+    )
+    run.add_argument("--repair-model", default=DEFAULT_ANALYSIS_MODEL)
+    run.add_argument("--repair-workers", type=_positive_int, default=2)
+    run.add_argument("--max-repair-attempts", type=_positive_int, default=2)
+    run.add_argument("--repair-max-requests", type=_positive_int, default=8)
+    run.add_argument("--repair-max-tokens", type=_positive_int, default=3000)
+    run.add_argument("--repair-llm-timeout", type=_positive_float, default=120.0)
+    run.add_argument(
+        "--repair-reasoning-effort",
+        choices=("none", "minimal", "low", "medium", "high", "xhigh", "max"),
+        default="low",
+    )
 
 
 def run_deployment_command(args: argparse.Namespace) -> int:
@@ -242,6 +265,8 @@ def _run_analyze(args: argparse.Namespace) -> int:
             progress=progress,
         )
         published = publish_analysis_artifacts(run_dir, result, debug=args.debug)
+        for outcome in _analysis_outcomes(result):
+            _record_llm_call(recorder, outcome, model=_analysis_model(args))
         recorder.complete(
             metrics=analysis_metrics(result),
             sources=result.acquisition.manifest.model_dump(mode="json"),
@@ -270,12 +295,7 @@ def _analysis_config(args: argparse.Namespace, output_root: Path) -> AnalysisCon
         strict=args.strict,
         source_timeout=args.source_timeout,
         gold_path=None,
-        model=(
-            args.model
-            or os.getenv("PHERAGENT_MODEL")
-            or os.getenv("OPENAI_MODEL")
-            or DEFAULT_ANALYSIS_MODEL
-        ),
+        model=_analysis_model(args),
         api_key_env=args.openai_api_key_env,
         base_url_env=args.openai_base_url_env,
         base_url=args.openai_base_url,
@@ -347,6 +367,15 @@ def _context_system_name(context_path: Path) -> str:
     return system
 
 
+def _analysis_model(args: argparse.Namespace) -> str:
+    return (
+        args.model
+        or os.getenv("PHERAGENT_MODEL")
+        or os.getenv("OPENAI_MODEL")
+        or DEFAULT_ANALYSIS_MODEL
+    )
+
+
 def _run_workflow(args: argparse.Namespace) -> int:
     source_roots = _parse_source_roots(args.source_root)
     prepared = prepare_execution(
@@ -360,11 +389,78 @@ def _run_workflow(args: argparse.Namespace) -> int:
         return 0 if prepared.executable else 1
     if not args.approve:
         raise DeploymentInputError("--execute requires the approval token printed by a dry-run")
-    report = prepared.execute(
-        approval_token=args.approve,
-        timeout=args.command_timeout,
-        progress=lambda message: print(f"execute: {message}", file=sys.stderr, flush=True),
+    output_root = args.output.expanduser().resolve() if args.output else _execution_output_root(
+        args.workflow
     )
+    run_dir = create_timestamped_run_directory(
+        output_root,
+        name=f"{prepared.workflow.system}-{args.block or 'all'}",
+    )
+    recorder = RunRecorder.start(
+        run_dir,
+        run_kind="deployment_execution",
+        analysis_method="queued-recovery-v1",
+        inputs={
+            "workflow": args.workflow,
+            "source_roots": source_roots,
+            "block": args.block,
+            "allow_unready": args.allow_unready,
+            "repair": {
+                "model": args.repair_model,
+                "workers": args.repair_workers,
+                "max_attempts": args.max_repair_attempts,
+                "max_requests": args.repair_max_requests,
+            },
+        },
+    )
+
+    def progress(message: str) -> None:
+        recorder.record_event("execution", message)
+        print(f"execute: {message}", file=sys.stderr, flush=True)
+
+    budget = LLMRequestBudget(args.repair_max_requests)
+    agent = RecoveryAgent.create(
+        AnalysisLLMConfig(
+            model=args.repair_model,
+            timeout=args.repair_llm_timeout,
+            max_output_tokens=args.repair_max_tokens,
+            max_requests=args.repair_max_requests,
+            cache_dir=output_root / ".llm-cache",
+            reasoning_effort=args.repair_reasoning_effort,
+        ),
+        budget,
+        sandbox_root=output_root / ".recovery-workspaces" / run_dir.name,
+    )
+    try:
+        with ThreadedRecoveryQueue(agent.resolve, workers=args.repair_workers) as recovery_queue:
+            report = prepared.execute(
+                approval_token=args.approve,
+                timeout=args.command_timeout,
+                progress=progress,
+                recovery_queue=recovery_queue,
+                max_repair_attempts=args.max_repair_attempts,
+                output_directory=run_dir,
+            )
+        for resolution in report.recoveries:
+            for call in resolution.llm_calls:
+                recorder.record_event(
+                    "llm",
+                    str(call["stage"]),
+                    {"model": args.repair_model, **call},
+                )
+        recorder.complete(
+            metrics=_execution_metrics(report),
+            sources={source_id: path for source_id, path in source_roots.items()},
+            llm={
+                "model": args.repair_model,
+                "usage": _recovery_usage(report),
+                "requests_attempted": budget.attempted,
+            },
+        )
+    except Exception as exc:
+        recorder.fail(exc)
+        raise
+    print(f"execution run: {run_dir}")
     if report.successful:
         print(f"execution complete: {len(report.completed)} operation(s)")
         return 0
@@ -379,6 +475,66 @@ def _run_workflow(args: argparse.Namespace) -> int:
     for issue in report.skipped:
         print(f"skipped: {issue.step_id}: {issue.reason}", file=sys.stderr)
     return 1
+
+
+def _execution_output_root(workflow: Path) -> Path:
+    resolved = workflow.expanduser().resolve()
+    if resolved.parent.parent.name == "runs":
+        return resolved.parent.parent.parent / "execution-runs"
+    return Path(".pheragent/deployment-executions").resolve()
+
+
+def _execution_metrics(report: ExecutionReport) -> dict[str, Any]:
+    return {
+        "completed_steps": len(report.completed),
+        "failed_steps": len(report.failed),
+        "skipped_steps": len(report.skipped),
+        "execution_attempts": len(report.attempts),
+        "failures_captured": len(report.failures_seen),
+        "repair_attempts": len(report.recoveries),
+        "repair_successes": sum(
+            resolution.status.value == "resolved" for resolution in report.recoveries
+        ),
+        "duration_seconds": round(
+            sum(attempt.duration_seconds for attempt in report.attempts),
+            6,
+        ),
+    }
+
+
+def _recovery_usage(report: ExecutionReport) -> dict[str, int]:
+    usage: dict[str, int] = {}
+    for recovery in report.recoveries:
+        for key, value in recovery.usage.items():
+            usage[key] = usage.get(key, 0) + int(value)
+    return usage
+
+
+def _analysis_outcomes(result: AnalysisResult) -> list[ClassificationOutcome[Any]]:
+    outcomes = [result.investigation.plan_outcome, result.investigation.synthesis_outcome]
+    follow_up = result.investigation.follow_up_outcome
+    if follow_up is not None and all(follow_up is not outcome for outcome in outcomes):
+        outcomes.append(follow_up)
+    return outcomes
+
+
+def _record_llm_call(
+    recorder: RunRecorder,
+    outcome: ClassificationOutcome[Any],
+    *,
+    model: str,
+) -> None:
+    recorder.record_event(
+        "llm",
+        outcome.stage,
+        {
+            "model": model,
+            "status": outcome.status,
+            "usage": outcome.usage,
+            "input_tokens_estimate": outcome.input_tokens_estimate,
+            "duration_seconds": outcome.duration_seconds,
+        },
+    )
 
 
 def _parse_source_roots(values: list[str]) -> dict[str, Path]:

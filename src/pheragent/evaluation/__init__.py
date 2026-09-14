@@ -16,6 +16,7 @@ from .phase_one import (
     evaluate_relevance,
     evaluate_validity,
 )
+from .recovery import RecoveryEvaluationReport, RecoveryUsage, evaluate_recovery
 
 __all__ = [
     "EvaluationDimension",
@@ -26,10 +27,13 @@ __all__ = [
     "PhaseOneEvaluationInput",
     "PhaseOneEvaluationReport",
     "PhaseOneRunReport",
+    "RecoveryEvaluationReport",
+    "RecoveryUsage",
     "evaluate_completeness",
     "evaluate_consistency",
     "evaluate_deployability",
     "evaluate_phase_one",
     "evaluate_relevance",
+    "evaluate_recovery",
     "evaluate_validity",
 ]
