@@ -78,7 +78,7 @@ parse_arguments() {
 
 # Run every AWS command with the explicitly supplied SSO profile.
 aws_cli() {
-  aws --profile "$AWS_PROFILE" "$@"
+  aws --profile "$AWS_PROFILE" --region "$EC2_REGION" --no-cli-pager "$@"
 }
 
 # Validate the selected SSO profile and provide a login hint on failure.
@@ -168,6 +168,7 @@ up_workflow() {
     --instance-ids "${INSTANCE_IDS[@]}" \
     --query 'StartingInstances[].{InstanceId:InstanceId,Previous:PreviousState.Name,Current:CurrentState.Name}' \
     --output table
+  aws_cli ec2 wait instance-running --instance-ids "${INSTANCE_IDS[@]}"
   status_workflow
 }
 
@@ -183,6 +184,7 @@ down_workflow() {
     --instance-ids "${INSTANCE_IDS[@]}" \
     --query 'StoppingInstances[].{InstanceId:InstanceId,Previous:PreviousState.Name,Current:CurrentState.Name}' \
     --output table
+  aws_cli ec2 wait instance-stopped --instance-ids "${INSTANCE_IDS[@]}"
   status_workflow
 }
 

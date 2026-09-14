@@ -319,8 +319,7 @@ def _print_analysis_summary(
     ]
     if (
         result.investigation.follow_up_outcome is not None
-        and result.investigation.follow_up_outcome
-        is not result.investigation.synthesis_outcome
+        and result.investigation.follow_up_outcome is not result.investigation.synthesis_outcome
     ):
         outcomes.append(result.investigation.follow_up_outcome)
     for outcome in outcomes:
@@ -356,18 +355,30 @@ def _run_workflow(args: argparse.Namespace) -> int:
         allow_unready=args.allow_unready,
         block_id=args.block,
     )
-    print(prepared.render(), end="")
     if not args.execute:
+        print(prepared.render(), end="")
         return 0 if prepared.executable else 1
     if not args.approve:
         raise DeploymentInputError("--execute requires the approval token printed by a dry-run")
-    completed = prepared.execute(
+    report = prepared.execute(
         approval_token=args.approve,
         timeout=args.command_timeout,
         progress=lambda message: print(f"execute: {message}", file=sys.stderr, flush=True),
     )
-    print(f"execution complete: {len(completed)} operation(s)")
-    return 0
+    if report.successful:
+        print(f"execution complete: {len(report.completed)} operation(s)")
+        return 0
+    print(
+        "execution incomplete: "
+        f"{len(report.completed)} completed, {len(report.failed)} failed, "
+        f"{len(report.skipped)} skipped; selected block was not deployed",
+        file=sys.stderr,
+    )
+    for issue in report.failed:
+        print(f"failed: {issue.step_id}: {issue.reason}", file=sys.stderr)
+    for issue in report.skipped:
+        print(f"skipped: {issue.step_id}: {issue.reason}", file=sys.stderr)
+    return 1
 
 
 def _parse_source_roots(values: list[str]) -> dict[str, Path]:

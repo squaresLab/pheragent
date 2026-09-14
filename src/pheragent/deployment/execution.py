@@ -23,6 +23,7 @@ from .workflow import operation_fingerprint, ordered_workflow_steps
 
 CommandRunner = Callable[[str, Path, float], int]
 ProgressCallback = Callable[[str], None]
+_FAILURE_POLICY = "continue-independent"
 
 
 @dataclass(frozen=True, slots=True)
@@ -31,6 +32,27 @@ class ExecutionOperation:
 
     step: DeploymentWorkflowStep
     working_directory: Path
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutionIssue:
+    """One operation that failed or could not run."""
+
+    step_id: str
+    reason: str
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutionReport:
+    """Final outcome after every runnable dependency branch has been attempted."""
+
+    completed: tuple[str, ...]
+    failed: tuple[ExecutionIssue, ...]
+    skipped: tuple[ExecutionIssue, ...]
+
+    @property
+    def successful(self) -> bool:
+        return not self.failed and not self.skipped
 
 
 @dataclass(frozen=True, slots=True)
@@ -69,6 +91,7 @@ class PreparedExecution:
             f"Trial override: {str(self.allow_unready).lower()}",
             f"Selected block: {_block_label(self.selected_block)}",
             f"Selected plan executable: {str(self.executable).lower()}",
+            "Failure policy: continue independent operations; skip failed descendants",
             f"Ordered operations: {len(self.operations)}",
             "",
         ]
@@ -129,8 +152,8 @@ class PreparedExecution:
         timeout: float,
         progress: ProgressCallback | None = None,
         command_runner: CommandRunner | None = None,
-    ) -> tuple[str, ...]:
-        """Execute sequentially and stop at the first failed operation."""
+    ) -> ExecutionReport:
+        """Execute every viable branch while respecting failed dependencies."""
         if not self.executable:
             raise WorkflowNotExecutableError("deployment workflow is not ready for execution")
         if approval_token != self.approval_token:
@@ -140,21 +163,40 @@ class PreparedExecution:
         notify = progress or (lambda _message: None)
         runner = command_runner or _run_command
         completed: list[str] = []
+        failed: list[ExecutionIssue] = []
+        skipped: list[ExecutionIssue] = []
+        unsuccessful: set[str] = set()
         total = len(self.operations)
         for index, operation in enumerate(self.operations, start=1):
             step = operation.step
+            blocked_by = [dependency for dependency in step.after if dependency in unsuccessful]
+            if blocked_by:
+                reason = "unsuccessful prerequisite(s): " + ", ".join(blocked_by)
+                notify(f"[{index}/{total}] {step.id}: skipped; {reason}")
+                skipped.append(ExecutionIssue(step.id, reason))
+                unsuccessful.add(step.id)
+                continue
             command = step.command
             if command is None:  # Protected by executable; keeps the boundary explicit.
                 raise WorkflowNotExecutableError(f"workflow step {step.id} has no command")
             notify(f"[{index}/{total}] {step.id}: {command}")
-            return_code = runner(command, operation.working_directory, timeout)
+            try:
+                return_code = runner(command, operation.working_directory, timeout)
+            except WorkflowExecutionError as exc:
+                reason = str(exc)
+                notify(f"[{index}/{total}] {step.id}: failed; {reason}")
+                failed.append(ExecutionIssue(step.id, reason))
+                unsuccessful.add(step.id)
+                continue
             if return_code != 0:
-                raise WorkflowExecutionError(
-                    f"workflow step {step.id} failed with exit code {return_code}; "
-                    "execution stopped"
-                )
+                reason = f"exit code {return_code}"
+                notify(f"[{index}/{total}] {step.id}: failed; {reason}")
+                failed.append(ExecutionIssue(step.id, reason))
+                unsuccessful.add(step.id)
+                continue
             completed.append(step.id)
-        return tuple(completed)
+            notify(f"[{index}/{total}] {step.id}: completed")
+        return ExecutionReport(tuple(completed), tuple(failed), tuple(skipped))
 
 
 def prepare_execution(
@@ -358,6 +400,7 @@ def _approval_token(
         "workflow": workflow.model_dump(mode="json", exclude_none=True),
         "source_roots": {source_id: str(path) for source_id, path in sorted(source_roots.items())},
         "execution_order": [operation.step.id for operation in operations],
+        "failure_policy": _FAILURE_POLICY,
         "allow_unready": allow_unready,
         "selected_block": selected_block.id if selected_block else None,
     }

@@ -8,7 +8,6 @@ import yaml
 from pheragent.cli import main
 from pheragent.deployment.errors import (
     DeploymentInputError,
-    WorkflowExecutionError,
     WorkflowNotExecutableError,
 )
 from pheragent.deployment.execution import prepare_execution
@@ -167,8 +166,34 @@ def test_execution_requires_the_exact_dry_run_approval(tmp_path: Path) -> None:
     assert calls == []
 
 
-def test_execution_stops_at_first_failed_operation(tmp_path: Path) -> None:
-    workflow, source = _write_workflow(tmp_path)
+def test_execution_skips_failed_descendants_and_continues_independent_branch(
+    tmp_path: Path,
+) -> None:
+    payload = _workflow_payload()
+    steps = payload["steps"]
+    assert isinstance(steps, list)
+    steps.extend(
+        [
+            {
+                "id": "S004",
+                "kind": "component",
+                "targets": [{"id": "C004_cache", "name": "Cache"}],
+                "executor": "shell",
+                "source_ref": {"repo_id": "fixture", "path": "deploy.sh"},
+                "working_directory": ".",
+                "command": "printf cache",
+                "required_inputs": [],
+                "after": [],
+                "status": "ready",
+                "blockers": [],
+            }
+        ]
+    )
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "deploy.sh").write_text("#!/bin/bash\n", encoding="utf-8")
+    workflow = tmp_path / "deployment-workflow.yaml"
+    workflow.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
     prepared = prepare_execution(workflow, {"fixture": source})
     calls: list[str] = []
 
@@ -176,14 +201,55 @@ def test_execution_stops_at_first_failed_operation(tmp_path: Path) -> None:
         calls.append(command)
         return 9 if command == "printf application" else 0
 
-    with pytest.raises(WorkflowExecutionError, match="S002 failed with exit code 9"):
-        prepared.execute(
-            approval_token=prepared.approval_token,
-            timeout=10,
-            command_runner=runner,
-        )
+    report = prepared.execute(
+        approval_token=prepared.approval_token,
+        timeout=10,
+        command_runner=runner,
+    )
 
-    assert calls == ["printf database", "printf application"]
+    assert calls == ["printf database", "printf cache", "printf application"]
+    assert report.completed == ("S001", "S004")
+    assert [(issue.step_id, issue.reason) for issue in report.failed] == [("S002", "exit code 9")]
+    assert [(issue.step_id, issue.reason) for issue in report.skipped] == [
+        ("S003", "unsuccessful prerequisite(s): S002")
+    ]
+    assert report.successful is False
+
+
+def test_execution_continues_a_successful_chain_after_an_independent_failure(
+    tmp_path: Path,
+) -> None:
+    payload = _workflow_payload()
+    steps = payload["steps"]
+    assert isinstance(steps, list)
+    by_id = {step["id"]: step for step in steps}
+    by_id["S001"]["command"] = "install postgres"
+    by_id["S002"]["command"] = "install minio"
+    by_id["S002"]["after"] = []
+    by_id["S003"]["command"] = "configure minio credentials"
+    steps[:] = [by_id["S001"], by_id["S002"], by_id["S003"]]
+
+    source = tmp_path / "source"
+    source.mkdir()
+    workflow = tmp_path / "deployment-workflow.yaml"
+    workflow.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
+    prepared = prepare_execution(workflow, {"fixture": source})
+    calls: list[str] = []
+
+    def runner(command: str, _cwd: Path, _timeout: float) -> int:
+        calls.append(command)
+        return 1 if command == "install postgres" else 0
+
+    report = prepared.execute(
+        approval_token=prepared.approval_token,
+        timeout=10,
+        command_runner=runner,
+    )
+
+    assert calls == ["install postgres", "install minio", "configure minio credentials"]
+    assert report.completed == ("S002", "S003")
+    assert [issue.step_id for issue in report.failed] == ["S001"]
+    assert report.skipped == ()
 
 
 def test_trial_mode_executes_only_ready_dependency_closed_steps(tmp_path: Path) -> None:
@@ -209,7 +275,7 @@ def test_trial_mode_executes_only_ready_dependency_closed_steps(tmp_path: Path) 
         allow_unready=True,
     )
     calls: list[str] = []
-    completed = prepared.execute(
+    report = prepared.execute(
         approval_token=prepared.approval_token,
         timeout=10,
         command_runner=lambda command, _cwd, _timeout: calls.append(command) or 0,
@@ -218,7 +284,8 @@ def test_trial_mode_executes_only_ready_dependency_closed_steps(tmp_path: Path) 
     assert prepared.executable is True
     assert [operation.step.id for operation in prepared.operations] == ["S001"]
     assert [step.id for step in prepared.excluded_steps] == ["S002", "S003"]
-    assert completed == ("S001",)
+    assert report.completed == ("S001",)
+    assert report.successful is True
     assert calls == ["printf database"]
 
 
