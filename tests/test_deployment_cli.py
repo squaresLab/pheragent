@@ -6,8 +6,9 @@ import pytest
 
 from pheragent.cli import _build_parser
 from pheragent.deployment.analysis_llm import DEFAULT_ANALYSIS_MODEL
-from pheragent.deployment.cli import _analysis_config
+from pheragent.deployment.cli import _analysis_config, _terminal_approval
 from pheragent.deployment.enums import AnalysisTreatment
+from pheragent.deployment.recovery import RecoveryResolution, RecoveryStatus
 
 
 @pytest.fixture(autouse=True)
@@ -58,6 +59,27 @@ def test_deployment_run_accepts_one_block_scope(tmp_path: Path) -> None:
 
     assert args.block == "B6"
     assert args.allow_unready is True
+
+
+def test_terminal_approval_offers_only_yes_no_or_view(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    answers = iter(("v", "y"))
+    monkeypatch.setattr("builtins.input", lambda _prompt: next(answers))
+    resolution = RecoveryResolution(
+        failure_id="failure-1",
+        step_id="S001",
+        status=RecoveryStatus.NEEDS_HUMAN,
+        reason="verify the exact image",
+        patch="--- a/values.yaml\n+++ b/values.yaml\n",
+        approval_items=("image: docker.io/example/minio@sha256:123",),
+    )
+
+    assert _terminal_approval(resolution)
+    output = capsys.readouterr().out
+    assert "docker.io/example/minio@sha256:123" in output
+    assert resolution.patch in output
 
 
 def test_deployment_runtime_inspection_options(tmp_path: Path) -> None:

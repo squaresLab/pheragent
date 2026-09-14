@@ -59,6 +59,8 @@ class CommandOutcome:
 
 
 CommandRunner = Callable[[str, Path, float], CommandOutcome | int]
+RepairApproval = Callable[[RecoveryResolution], bool]
+PatchPromoter = Callable[[str, str], Path]
 
 
 class RecoveryQueue(Protocol):
@@ -215,6 +217,9 @@ class PreparedExecution:
         recovery_queue: RecoveryQueue | None = None,
         max_repair_attempts: int = 2,
         output_directory: Path | None = None,
+        execution_roots: Mapping[str, Path] | None = None,
+        promote_patch: PatchPromoter | None = None,
+        approve_repair: RepairApproval | None = None,
     ) -> ExecutionReport:
         """Run ready work while failed branches recover within a fixed budget."""
         if not self.executable:
@@ -236,6 +241,9 @@ class PreparedExecution:
             timeout=timeout,
             output_directory=output,
             notify=progress or (lambda _message: None),
+            execution_roots=execution_roots,
+            promote_patch=promote_patch,
+            approve_repair=approve_repair,
         )
         if output:
             _write_execution_artifacts(output, report)
@@ -251,16 +259,22 @@ def _execute_operations(
     timeout: float,
     output_directory: Path | None,
     notify: ProgressCallback,
+    execution_roots: Mapping[str, Path] | None,
+    promote_patch: PatchPromoter | None,
+    approve_repair: RepairApproval | None,
 ) -> ExecutionReport:
     operations = {operation.step.id: operation for operation in prepared.operations}
     states = dict.fromkeys(operations, "pending")
-    working_directories = {
-        step_id: operation.working_directory for step_id, operation in operations.items()
-    }
+    active_roots = _execution_roots(prepared.source_roots, execution_roots)
     source_roots = {
-        step_id: prepared.source_roots[
-            (operation.step.operation_source_ref or operation.step.source_ref).repo_id
-        ]
+        step_id: active_roots[_step_repo_id(operation.step)]
+        for step_id, operation in operations.items()
+    }
+    working_directories = {
+        step_id: source_roots[step_id]
+        / operation.working_directory.relative_to(
+            prepared.source_roots[_step_repo_id(operation.step)]
+        )
         for step_id, operation in operations.items()
     }
     attempt_counts = dict.fromkeys(operations, 0)
@@ -272,6 +286,7 @@ def _execute_operations(
     attempts: list[ExecutionAttempt] = []
     recoveries: list[RecoveryResolution] = []
     failures_seen: list[RecoveryFailure] = []
+    pending_approvals: deque[RecoveryResolution] = deque()
 
     def checkpoint() -> None:
         if output_directory:
@@ -292,14 +307,14 @@ def _execute_operations(
             _accept_resolution(
                 resolution,
                 states=states,
-                working_directories=working_directories,
-                source_roots=source_roots,
                 latest_failures=latest_failures,
                 repair_counts=repair_counts,
                 max_repair_attempts=max_repair_attempts,
                 recovery_queue=recovery_queue,
                 recoveries=recoveries,
                 failed=failed,
+                pending_approvals=pending_approvals,
+                promote_patch=promote_patch,
                 notify=notify,
             )
             checkpoint()
@@ -362,16 +377,46 @@ def _execute_operations(
             _accept_resolution(
                 resolution,
                 states=states,
-                working_directories=working_directories,
-                source_roots=source_roots,
                 latest_failures=latest_failures,
                 repair_counts=repair_counts,
                 max_repair_attempts=max_repair_attempts,
                 recovery_queue=recovery_queue,
                 recoveries=recoveries,
                 failed=failed,
+                pending_approvals=pending_approvals,
+                promote_patch=promote_patch,
                 notify=notify,
             )
+            checkpoint()
+            continue
+        if pending_approvals:
+            proposed = pending_approvals.popleft()
+            if approve_repair and approve_repair(proposed):
+                approved = replace(
+                    proposed,
+                    status=RecoveryStatus.RESOLVED,
+                    reason=f"human approved: {proposed.reason}",
+                )
+                _accept_resolution(
+                    approved,
+                    states=states,
+                    latest_failures=latest_failures,
+                    repair_counts=repair_counts,
+                    max_repair_attempts=max_repair_attempts,
+                    recovery_queue=recovery_queue,
+                    recoveries=recoveries,
+                    failed=failed,
+                    pending_approvals=pending_approvals,
+                    promote_patch=promote_patch,
+                    notify=notify,
+                )
+            else:
+                states[proposed.step_id] = "failed"
+                failed[proposed.step_id] = ExecutionIssue(
+                    proposed.step_id,
+                    "repair was not approved",
+                )
+                notify(f"recovery: {proposed.step_id}: repair was not approved")
             checkpoint()
             continue
         if all(state in {"completed", "failed", "skipped"} for state in states.values()):
@@ -394,26 +439,45 @@ def _accept_resolution(
     resolution: RecoveryResolution,
     *,
     states: dict[str, str],
-    working_directories: dict[str, Path],
-    source_roots: dict[str, Path],
     latest_failures: dict[str, RecoveryFailure],
     repair_counts: dict[str, int],
     max_repair_attempts: int,
     recovery_queue: RecoveryQueue,
     recoveries: list[RecoveryResolution],
     failed: dict[str, ExecutionIssue],
+    pending_approvals: deque[RecoveryResolution],
+    promote_patch: PatchPromoter | None,
     notify: ProgressCallback,
 ) -> None:
     recoveries.append(resolution)
     step_id = resolution.step_id
     failure = latest_failures[step_id]
     if resolution.status == RecoveryStatus.RESOLVED:
-        if resolution.workspace_root:
-            relative = failure.working_directory.relative_to(failure.source_root)
-            source_roots[step_id] = resolution.workspace_root
-            working_directories[step_id] = resolution.workspace_root / relative
+        if resolution.patch:
+            if promote_patch is None:
+                states[step_id] = "failed"
+                failed[step_id] = ExecutionIssue(step_id, "repair workspace is unavailable")
+                notify(f"recovery: {step_id}: repair workspace is unavailable")
+                return
+            try:
+                promote_patch(failure.repo_id, resolution.patch)
+            except ValueError as exc:
+                states[step_id] = "failed"
+                failed[step_id] = ExecutionIssue(step_id, str(exc))
+                notify(f"recovery: {step_id}: {exc}")
+                return
         states[step_id] = "pending"
         notify(f"recovery: {step_id}: validated fix ready; retrying original command")
+        return
+    if (
+        resolution.status == RecoveryStatus.NEEDS_HUMAN
+        and resolution.patch
+        and resolution.validation
+        and resolution.validation.succeeded
+    ):
+        states[step_id] = "awaiting_approval"
+        pending_approvals.append(resolution)
+        notify(f"recovery: {step_id}: repair is ready for approval")
         return
     if (
         resolution.status == RecoveryStatus.RETRYABLE
@@ -435,6 +499,27 @@ def _accept_resolution(
     states[step_id] = "failed"
     failed[step_id] = ExecutionIssue(step_id, resolution.reason)
     notify(f"recovery: {step_id}: {resolution.status.value}; {resolution.reason}")
+
+
+def _execution_roots(
+    source_roots: Mapping[str, Path],
+    replacements: Mapping[str, Path] | None,
+) -> dict[str, Path]:
+    if replacements is None:
+        return dict(source_roots)
+    missing = set(source_roots) - set(replacements)
+    if missing:
+        raise DeploymentInputError(
+            "execution roots are missing source IDs: " + ", ".join(sorted(missing))
+        )
+    return {
+        source_id: replacements[source_id].expanduser().resolve(strict=True)
+        for source_id in source_roots
+    }
+
+
+def _step_repo_id(step: DeploymentWorkflowStep) -> str:
+    return (step.operation_source_ref or step.source_ref).repo_id
 
 
 def _skip_failed_descendants(
@@ -619,6 +704,7 @@ def _resolution_payload(resolution: RecoveryResolution) -> dict[str, Any]:
         "reason": resolution.reason,
         "scope": resolution.scope.value,
         "patch": resolution.patch,
+        "approval_items": resolution.approval_items,
         "probes": [
             {
                 "request": probe.request.model_dump(mode="json", exclude_none=True),

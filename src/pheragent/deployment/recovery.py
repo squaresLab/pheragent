@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import queue
+import re
 import shutil
 import subprocess
 import tempfile
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
@@ -86,7 +87,6 @@ class RecoveryFailure:
 @dataclass(frozen=True, slots=True)
 class PatchValidation:
     succeeded: bool
-    workspace: Path
     checks: tuple[str, ...]
     error: str = ""
 
@@ -99,7 +99,7 @@ class RecoveryResolution:
     reason: str
     scope: RecoveryScope = RecoveryScope.COMPONENT
     patch: str | None = None
-    workspace_root: Path | None = None
+    approval_items: tuple[str, ...] = ()
     probes: tuple[ProbeResult, ...] = ()
     usage: dict[str, int] = field(default_factory=dict)
     validation: PatchValidation | None = None
@@ -214,6 +214,7 @@ class RecoveryDecision(ContractModel):
     risk: RecoveryRisk
     requires_human_approval: bool
     human_message: str | None = Field(default=None, max_length=600)
+    approval_items: list[str] = Field(default_factory=list, max_length=8)
 
     @model_validator(mode="after")
     def validate_fix(self) -> RecoveryDecision:
@@ -222,8 +223,73 @@ class RecoveryDecision(ContractModel):
         return self
 
 
+class RunWorkspace:
+    """Own one writable source tree per deployment run and serialize accepted patches."""
+
+    def __init__(self, sources: Mapping[str, Path], root: Path) -> None:
+        self._sources = {
+            source_id: path.expanduser().resolve(strict=True)
+            for source_id, path in sources.items()
+        }
+        self.root = root.expanduser().resolve()
+        self.roots: dict[str, Path] = {}
+        self._git_worktrees: list[tuple[Path, Path]] = []
+        self._lock = threading.Lock()
+
+    def __enter__(self) -> RunWorkspace:
+        if self.root.exists():
+            raise ValueError(f"run workspace already exists: {self.root}")
+        self.root.mkdir(parents=True)
+        try:
+            for source_id, source in self._sources.items():
+                destination = self.root / source_id
+                self._materialize(source, destination)
+                self.roots[source_id] = destination
+        except Exception:
+            self.close()
+            raise
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        self.close()
+
+    def apply(self, source_id: str, patch: str) -> Path:
+        try:
+            source = self.roots[source_id]
+        except KeyError as exc:
+            raise ValueError(f"unknown run-workspace source: {source_id}") from exc
+        _validate_patch(patch)
+        with self._lock:
+            checked = _command(["git", "apply", "--check", "-"], source, input_text=patch)
+            if checked.returncode:
+                raise ValueError(f"accepted patch is stale: {_output(checked)}")
+            applied = _command(["git", "apply", "-"], source, input_text=patch)
+            if applied.returncode:
+                raise ValueError(f"could not promote accepted patch: {_output(applied)}")
+        return source
+
+    def close(self) -> None:
+        for source, destination in reversed(self._git_worktrees):
+            _command(["git", "worktree", "remove", "--force", str(destination)], source)
+        self._git_worktrees.clear()
+        if self.root.exists():
+            shutil.rmtree(self.root)
+
+    def _materialize(self, source: Path, destination: Path) -> None:
+        if _is_git_worktree(source):
+            created = _command(
+                ["git", "worktree", "add", "--detach", str(destination), "HEAD"],
+                source,
+            )
+            if created.returncode:
+                raise ValueError(f"could not create run workspace: {_output(created)}")
+            self._git_worktrees.append((source, destination))
+            return
+        shutil.copytree(source, destination)
+
+
 class PatchSandbox:
-    """Apply a bounded source patch to a disposable copy and run safe checks."""
+    """Validate a patch using disposable copies of only the files it changes."""
 
     def __init__(self, root: Path) -> None:
         self.root = root.expanduser().resolve()
@@ -233,24 +299,31 @@ class PatchSandbox:
         try:
             paths = _validate_patch(patch)
         except ValueError as exc:
-            return PatchValidation(False, self.root, (), str(exc))
+            return PatchValidation(False, (), str(exc))
         self.root.mkdir(parents=True, exist_ok=True)
         workspace = Path(tempfile.mkdtemp(prefix="attempt-", dir=self.root))
-        checkout = workspace / "source"
-        shutil.copytree(source, checkout, ignore=shutil.ignore_patterns(".git"))
-        applied = _command(["git", "apply", "--check", "-"], checkout, input_text=patch)
-        if applied.returncode:
-            return PatchValidation(False, checkout, (), _output(applied))
-        applied = _command(["git", "apply", "-"], checkout, input_text=patch)
-        if applied.returncode:
-            return PatchValidation(False, checkout, (), _output(applied))
-        checks: list[str] = ["git.apply"]
-        for path in paths:
-            error = _validate_changed_file(checkout / path)
-            if error:
-                return PatchValidation(False, checkout, tuple(checks), error)
-            checks.append(_check_name(path))
-        return PatchValidation(True, checkout, tuple(checks))
+        try:
+            for path in paths:
+                original = source / path
+                if not original.is_file():
+                    return PatchValidation(False, (), f"patched file is missing: {path}")
+                candidate = workspace / path
+                candidate.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(original, candidate)
+            applied = _command(["git", "apply", "--check", "-"], workspace, input_text=patch)
+            if applied.returncode:
+                return PatchValidation(False, (), _output(applied))
+            applied = _command(["git", "apply", "-"], workspace, input_text=patch)
+            if applied.returncode:
+                return PatchValidation(False, (), _output(applied))
+            checks: list[str] = ["git.apply"]
+            for path in paths:
+                if error := _validate_changed_file(workspace / path):
+                    return PatchValidation(False, tuple(checks), error)
+                checks.append(_check_name(path))
+            return PatchValidation(True, tuple(checks))
+        finally:
+            shutil.rmtree(workspace)
 
 
 class RecoveryAgent:
@@ -315,28 +388,9 @@ class RecoveryAgent:
                 probes,
                 outcomes,
                 scope=decision.scope,
-            )
-        if decision.requires_human_approval or decision.risk != RecoveryRisk.LOW:
-            return self._resolution(
-                failure,
-                RecoveryStatus.NEEDS_HUMAN,
-                decision.human_message or "repair requires human approval",
-                probes,
-                outcomes,
-                scope=decision.scope,
-                patch=decision.patch,
+                approval_items=_approval_items(decision, failure),
             )
         assert decision.patch is not None
-        if unsafe_reason := _unsafe_patch_reason(decision.patch):
-            return self._resolution(
-                failure,
-                RecoveryStatus.NEEDS_HUMAN,
-                unsafe_reason,
-                probes,
-                outcomes,
-                scope=decision.scope,
-                patch=decision.patch,
-            )
         validation = self._sandbox.validate(failure.source_root, decision.patch)
         if not validation.succeeded:
             return self._resolution(
@@ -347,6 +401,20 @@ class RecoveryAgent:
                 outcomes,
                 scope=decision.scope,
                 patch=decision.patch,
+                approval_items=_approval_items(decision, failure),
+                validation=validation,
+            )
+        unsafe_reason = _unsafe_patch_reason(decision.patch)
+        if decision.requires_human_approval or decision.risk != RecoveryRisk.LOW or unsafe_reason:
+            return self._resolution(
+                failure,
+                RecoveryStatus.NEEDS_HUMAN,
+                decision.human_message or unsafe_reason or "repair requires human approval",
+                probes,
+                outcomes,
+                scope=decision.scope,
+                patch=decision.patch,
+                approval_items=_approval_items(decision, failure),
                 validation=validation,
             )
         return self._resolution(
@@ -357,7 +425,7 @@ class RecoveryAgent:
             outcomes,
             scope=decision.scope,
             patch=decision.patch,
-            workspace_root=validation.workspace,
+            approval_items=_approval_items(decision, failure),
             validation=validation,
         )
 
@@ -396,7 +464,7 @@ class RecoveryAgent:
         *,
         scope: RecoveryScope = RecoveryScope.COMPONENT,
         patch: str | None = None,
-        workspace_root: Path | None = None,
+        approval_items: tuple[str, ...] = (),
         validation: PatchValidation | None = None,
     ) -> RecoveryResolution:
         return RecoveryResolution(
@@ -406,7 +474,7 @@ class RecoveryAgent:
             reason=redact_secrets(reason),
             scope=scope,
             patch=patch,
-            workspace_root=workspace_root,
+            approval_items=approval_items,
             probes=probes,
             usage=aggregate_usage(*outcomes),
             validation=validation,
@@ -463,6 +531,41 @@ def _unsafe_patch_reason(patch: str) -> str | None:
         "eval ": "dynamic shell execution requires human approval",
     }
     return next((reason for marker, reason in forbidden.items() if marker in normalized), None)
+
+
+def _approval_items(
+    decision: RecoveryDecision,
+    failure: RecoveryFailure,
+) -> tuple[str, ...]:
+    items = list(decision.approval_items)
+    evidence = failure.output_excerpt + "\n" + (decision.patch or "")
+    items.extend(f"image: {match}" for match in _image_references(evidence))
+    added_lines = "\n".join(
+        line[1:]
+        for line in (decision.patch or "").splitlines()
+        if line.startswith("+") and not line.startswith("+++")
+    )
+    items.extend(f"source: {match}" for match in re.findall(r"https?://[^\s\"']+", added_lines))
+    return tuple(dict.fromkeys(redact_secrets(item) for item in items))[:8]
+
+
+def _image_references(text: str) -> tuple[str, ...]:
+    pattern = re.compile(
+        r"(?<![\w.-])(?:[a-z0-9.-]+(?::\d+)?/)+[a-z0-9._-]+"
+        r"(?:@[sS][hH][aA]256:[a-fA-F0-9]{64}|:[a-zA-Z0-9._-]+)"
+    )
+    matches = []
+    for match in pattern.finditer(text):
+        prefix = text[max(0, match.start() - 8) : match.start()].casefold()
+        if prefix.endswith(("http://", "https://")):
+            continue
+        matches.append(match.group())
+    return tuple(dict.fromkeys(matches))
+
+
+def _is_git_worktree(path: Path) -> bool:
+    completed = _command(["git", "rev-parse", "--is-inside-work-tree"], path)
+    return completed.returncode == 0 and completed.stdout.strip() == "true"
 
 
 def _validate_changed_file(path: Path) -> str | None:
@@ -557,5 +660,8 @@ operation. Prefer the smallest source-grounded fix. You may request only the nam
 probes defined by the response schema. Never expose secrets, invent credentials, remove persistent
 data, or change unrelated components. A patch must be a unified diff against existing files. Mark
 destructive, privileged, external-download, image-verification, credential, or uncertain changes
-as requiring human approval. If the evidence is insufficient, say so instead of guessing.
+as requiring human approval. List the exact image, external source, or security setting in
+approval_items. If allowing a non-standard image, identify that exact image from the failure;
+never propose a broad unbounded image exception. If the evidence is insufficient, say so instead
+of guessing.
 """.strip()

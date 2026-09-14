@@ -14,8 +14,10 @@ from pheragent.deployment.errors import (
 )
 from pheragent.deployment.execution import CommandOutcome, prepare_execution
 from pheragent.deployment.recovery import (
+    PatchValidation,
     RecoveryResolution,
     RecoveryStatus,
+    RunWorkspace,
     ThreadedRecoveryQueue,
 )
 
@@ -356,6 +358,60 @@ def test_execution_repairs_failure_while_independent_work_continues(tmp_path: Pa
     assert report.failed == ()
     assert report.skipped == ()
     assert len([attempt for attempt in report.attempts if attempt.step_id == "S001"]) == 2
+
+
+def test_approved_patch_is_shared_with_retry_and_later_steps(tmp_path: Path) -> None:
+    workflow, source = _write_workflow(tmp_path)
+    prepared = prepare_execution(workflow, {"fixture": source})
+    patch = """\
+--- a/deploy.sh
++++ b/deploy.sh
+@@ -1 +1,2 @@
+ #!/bin/bash
++# repaired
+"""
+    attempts = 0
+
+    def resolve(failure):
+        return RecoveryResolution(
+            failure_id=failure.id,
+            step_id=failure.step_id,
+            status=RecoveryStatus.NEEDS_HUMAN,
+            reason="review the exact source patch",
+            patch=patch,
+            approval_items=("image: docker.io/example/minio@sha256:123",),
+            validation=PatchValidation(True, ("git.apply", "shell.syntax")),
+        )
+
+    def runner(command: str, cwd: Path, _timeout: float) -> CommandOutcome:
+        nonlocal attempts
+        if command == "printf database":
+            attempts += 1
+            if attempts == 1:
+                return CommandOutcome.failed(1, "image approval required")
+        if attempts > 1:
+            assert "# repaired" in cwd.joinpath("deploy.sh").read_text(encoding="utf-8")
+        return CommandOutcome.succeeded()
+
+    with (
+        RunWorkspace({"fixture": source}, tmp_path / "workspace") as workspace,
+        ThreadedRecoveryQueue(resolve, workers=1) as recovery_queue,
+    ):
+        report = prepared.execute(
+            approval_token=prepared.approval_token,
+            timeout=10,
+            command_runner=runner,
+            recovery_queue=recovery_queue,
+            execution_roots=workspace.roots,
+            promote_patch=workspace.apply,
+            approve_repair=lambda resolution: resolution.approval_items == (
+                "image: docker.io/example/minio@sha256:123",
+            ),
+        )
+
+    assert report.successful
+    assert attempts == 2
+    assert "# repaired" not in source.joinpath("deploy.sh").read_text(encoding="utf-8")
 
 
 def test_execution_keeps_exhausted_failure_and_skips_only_its_descendants(

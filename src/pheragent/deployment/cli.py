@@ -21,7 +21,7 @@ from .enums import AnalysisTreatment
 from .errors import DeploymentError, DeploymentInputError
 from .execution import ExecutionReport, prepare_execution
 from .output import create_timestamped_run_directory
-from .recovery import RecoveryAgent, ThreadedRecoveryQueue
+from .recovery import RecoveryAgent, RecoveryResolution, RunWorkspace, ThreadedRecoveryQueue
 from .run_records import RunRecorder
 from .runtime_context import (
     RuntimeInspectionConfig,
@@ -419,28 +419,38 @@ def _run_workflow(args: argparse.Namespace) -> int:
         print(f"execute: {message}", file=sys.stderr, flush=True)
 
     budget = LLMRequestBudget(args.repair_max_requests)
-    agent = RecoveryAgent.create(
-        AnalysisLLMConfig(
-            model=args.repair_model,
-            timeout=args.repair_llm_timeout,
-            max_output_tokens=args.repair_max_tokens,
-            max_requests=args.repair_max_requests,
-            cache_dir=output_root / ".llm-cache",
-            reasoning_effort=args.repair_reasoning_effort,
-        ),
-        budget,
-        sandbox_root=output_root / ".recovery-workspaces" / run_dir.name,
-    )
+    workspace_root = output_root / ".workspaces" / run_dir.name
+    candidate_root = output_root / ".recovery-candidates" / run_dir.name
     try:
-        with ThreadedRecoveryQueue(agent.resolve, workers=args.repair_workers) as recovery_queue:
-            report = prepared.execute(
-                approval_token=args.approve,
-                timeout=args.command_timeout,
-                progress=progress,
-                recovery_queue=recovery_queue,
-                max_repair_attempts=args.max_repair_attempts,
-                output_directory=run_dir,
+        with RunWorkspace(source_roots, workspace_root) as workspace:
+            agent = RecoveryAgent.create(
+                AnalysisLLMConfig(
+                    model=args.repair_model,
+                    timeout=args.repair_llm_timeout,
+                    max_output_tokens=args.repair_max_tokens,
+                    max_requests=args.repair_max_requests,
+                    cache_dir=output_root / ".llm-cache",
+                    reasoning_effort=args.repair_reasoning_effort,
+                ),
+                budget,
+                sandbox_root=candidate_root,
             )
+            recovery_queue = ThreadedRecoveryQueue(
+                agent.resolve,
+                workers=args.repair_workers,
+            )
+            with recovery_queue:
+                report = prepared.execute(
+                    approval_token=args.approve,
+                    timeout=args.command_timeout,
+                    progress=progress,
+                    recovery_queue=recovery_queue,
+                    max_repair_attempts=args.max_repair_attempts,
+                    output_directory=run_dir,
+                    execution_roots=workspace.roots,
+                    promote_patch=workspace.apply,
+                    approve_repair=_terminal_approval if sys.stdin.isatty() else None,
+                )
         for resolution in report.recoveries:
             for call in resolution.llm_calls:
                 recorder.record_event(
@@ -475,6 +485,24 @@ def _run_workflow(args: argparse.Namespace) -> int:
     for issue in report.skipped:
         print(f"skipped: {issue.step_id}: {issue.reason}", file=sys.stderr)
     return 1
+
+
+def _terminal_approval(resolution: RecoveryResolution) -> bool:
+    print("\nHerAgent found a possible fix.")
+    print(f"Step: {resolution.step_id}")
+    print(f"Reason: {resolution.reason}")
+    for item in resolution.approval_items:
+        print(f"Approve: {item}")
+    while True:
+        choice = input("Apply this fix? [y]es / [n]o / [v]iew: ").strip().casefold()
+        if choice in {"y", "yes"}:
+            return True
+        if choice in {"", "n", "no"}:
+            return False
+        if choice in {"v", "view"}:
+            print(resolution.patch or "No source patch was proposed.")
+            continue
+        print("Please choose y, n, or v.")
 
 
 def _execution_output_root(workflow: Path) -> Path:

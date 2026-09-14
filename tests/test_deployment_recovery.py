@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -18,6 +19,7 @@ from pheragent.deployment.recovery import (
     RecoveryRisk,
     RecoveryScope,
     RecoveryStatus,
+    RunWorkspace,
     _unsafe_patch_reason,
 )
 
@@ -81,6 +83,7 @@ def test_patch_sandbox_validates_without_changing_source(tmp_path: Path) -> None
     source.mkdir()
     script = source / "install.sh"
     script.write_text("#!/bin/bash\nprintf old\\n\n", encoding="utf-8")
+    (source / "unrelated.bin").write_bytes(b"0" * 100_000)
     patch = """\
 --- a/install.sh
 +++ b/install.sh
@@ -94,9 +97,73 @@ def test_patch_sandbox_validates_without_changing_source(tmp_path: Path) -> None
 
     assert validation.succeeded is True
     assert script.read_text(encoding="utf-8") == "#!/bin/bash\nprintf old\\n\n"
-    assert (validation.workspace / "install.sh").read_text(encoding="utf-8") == (
-        "#!/bin/bash\nprintf new\\n\n"
+    assert list((tmp_path / "sandboxes").iterdir()) == []
+
+
+def test_run_workspace_promotes_patch_without_changing_source(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    script = source / "install.sh"
+    script.write_text("#!/bin/bash\nprintf old\\n\n", encoding="utf-8")
+    patch = """\
+--- a/install.sh
++++ b/install.sh
+@@ -1,2 +1,2 @@
+ #!/bin/bash
+-printf old\\n
++printf new\\n
+"""
+    workspace_root = tmp_path / "workspaces"
+
+    with RunWorkspace({"fixture": source}, workspace_root) as workspace:
+        run_source = workspace.roots["fixture"]
+        workspace.apply("fixture", patch)
+
+        assert run_source != source
+        assert run_source.joinpath("install.sh").read_text(encoding="utf-8").endswith(
+            "printf new\\n\n"
+        )
+        assert script.read_text(encoding="utf-8").endswith("printf old\\n\n")
+
+    assert not workspace_root.exists()
+
+
+def test_run_workspace_shares_git_objects_and_cleans_worktree(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    script = source / "install.sh"
+    script.write_text("#!/bin/bash\nprintf old\\n\n", encoding="utf-8")
+    subprocess.run(["git", "init", "-q"], cwd=source, check=True)
+    subprocess.run(["git", "add", "install.sh"], cwd=source, check=True)
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=HerAgent Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-qm",
+            "fixture",
+        ],
+        cwd=source,
+        check=True,
     )
+    workspace_root = tmp_path / "workspace"
+
+    with RunWorkspace({"fixture": source}, workspace_root) as workspace:
+        git_marker = workspace.roots["fixture"] / ".git"
+        assert git_marker.is_file()
+        assert "gitdir:" in git_marker.read_text(encoding="utf-8")
+
+    listed = subprocess.run(
+        ["git", "worktree", "list", "--porcelain"],
+        cwd=source,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert str(workspace_root) not in listed.stdout
 
 
 @pytest.mark.parametrize(
@@ -171,10 +238,6 @@ def test_recovery_agent_returns_only_a_sandbox_validated_fix(tmp_path: Path) -> 
     assert resolution.status == RecoveryStatus.RESOLVED
     assert resolution.validation is not None
     assert resolution.validation.succeeded
-    assert resolution.workspace_root is not None
-    assert (resolution.workspace_root / "install.sh").read_text(encoding="utf-8").endswith(
-        "printf new\\n\n"
-    )
     assert resolution.llm_calls == (
         {
             "stage": "deployment_recovery",
@@ -183,4 +246,68 @@ def test_recovery_agent_returns_only_a_sandbox_validated_fix(tmp_path: Path) -> 
             "input_tokens_estimate": 90,
             "duration_seconds": 0.25,
         },
+    )
+
+
+def test_image_verification_bypass_names_the_exact_image_for_approval(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    script = source / "install.sh"
+    script.write_text("#!/bin/bash\nhelm install minio chart\n", encoding="utf-8")
+    patch = """\
+--- a/install.sh
++++ b/install.sh
+@@ -1,2 +1,2 @@
+ #!/bin/bash
+-helm install minio chart
++helm install minio chart --set global.security.allowInsecureImages=true
+"""
+    decision = RecoveryDecision(
+        status=RecoveryDecisionStatus.PROPOSED_FIX,
+        scope=RecoveryScope.COMPONENT,
+        root_cause="The chart rejected one non-standard image.",
+        patch=patch,
+        risk=RecoveryRisk.MEDIUM,
+        requires_human_approval=True,
+    )
+
+    class Classifier:
+        def classify(self, **_kwargs: object) -> ClassificationOutcome[RecoveryDecision]:
+            return ClassificationOutcome(decision, "deployment_recovery", "llm", {}, 80)
+
+    agent = RecoveryAgent(
+        classifier=Classifier(),
+        probe_runner=ProbeRunner(command_runner=lambda *_args: (0, "ok")),
+        sandbox=PatchSandbox(tmp_path / "sandboxes"),
+        model="test-model",
+    )
+    resolution = agent.resolve(
+        RecoveryFailure(
+            id="S001-attempt-1",
+            step_id="S001",
+            block_id="B7",
+            component_ids=("C004_minio",),
+            executor="shell",
+            command="./install.sh",
+            repo_id="fixture",
+            source_path="install.sh",
+            source_root=source,
+            working_directory=source,
+            attempt=1,
+            exit_code=1,
+            timed_out=False,
+            duration_seconds=1.0,
+            output_excerpt=(
+                "Unrecognized images:\n"
+                "- docker.io/mosipid/minio:2025.2.28-debian-12-r1\n"
+                "See https://github.com/bitnami/charts/issues/30850"
+            ),
+        )
+    )
+
+    assert resolution.status == RecoveryStatus.NEEDS_HUMAN
+    assert resolution.validation is not None
+    assert resolution.validation.succeeded
+    assert resolution.approval_items == (
+        "image: docker.io/mosipid/minio:2025.2.28-debian-12-r1",
     )
