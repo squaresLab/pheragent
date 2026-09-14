@@ -451,7 +451,7 @@ class RecoveryAgent:
             ),
             response_model=RecoveryDecision,
             validate=lambda _decision: None,
-            output_token_limit=3_000,
+            output_token_limit=6_000,
         )
 
     def _resolution(

@@ -111,7 +111,7 @@ def plan_investigation_with_llm(
         ),
         response_model=InvestigationPlan,
         validate=lambda plan: _validate_plan(plan),
-        output_token_limit=1800,
+        output_token_limit=3600,
     )
 
 
