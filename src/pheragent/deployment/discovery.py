@@ -194,24 +194,6 @@ def discover_repository(
     )
 
 
-def bind_retrieved_installation_routes(
-    signals: DeploymentSignalBundle,
-    observations: tuple[EvidenceObservation, ...],
-    sources: dict[str, AcquiredSource],
-) -> tuple[DeploymentSignalBundle, list[str]]:
-    """Attach source-grounded installer commands recovered during retrieval."""
-    return _bind_retrieved_installation_routes(signals, observations, sources)
-
-
-def apply_investigation_synthesis(
-    signals: DeploymentSignalBundle,
-    synthesis: InvestigationSynthesis,
-    observations: tuple[EvidenceObservation, ...],
-) -> DeploymentSignalBundle:
-    """Merge semantic decisions without discarding deterministic candidates."""
-    return _apply_investigation_synthesis(signals, synthesis, observations)
-
-
 def _repository_files(
     inventory: RepositoryInventory,
     context: DeploymentContext,
@@ -1632,11 +1614,12 @@ def _number_components(
     ], id_map
 
 
-def _bind_retrieved_installation_routes(
+def bind_retrieved_installation_routes(
     signals: DeploymentSignalBundle,
     observations: tuple[EvidenceObservation, ...],
     sources: dict[str, AcquiredSource],
 ) -> tuple[DeploymentSignalBundle, list[str]]:
+    """Attach source-grounded installer commands recovered during retrieval."""
     """Bind manifest-like components to nearby or calling installers.
 
     This is intentionally structural: it uses repository paths and explicit file
@@ -1791,11 +1774,12 @@ def _required_shell_inputs(lines: list[str]) -> list[str]:
     return sorted(environment | positional)
 
 
-def _apply_investigation_synthesis(
+def apply_investigation_synthesis(
     signals: DeploymentSignalBundle,
     synthesis: InvestigationSynthesis,
     observations: tuple[EvidenceObservation, ...],
 ) -> DeploymentSignalBundle:
+    """Merge semantic decisions without discarding deterministic candidates."""
     """Apply complete, grounded classifications while retaining every invoked operation."""
     group_by_id = {
         component_id: group

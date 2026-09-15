@@ -11,12 +11,23 @@ from typing import Any
 from .redaction import redact_secrets
 from .serialization import write_json
 
+RECORDS_DIRECTORY = ".heragent"
+
+
+def run_record_path(run_dir: Path, name: str) -> Path:
+    """Return the internal record path, falling back to pre-0.3 runs."""
+    run = run_dir.expanduser().resolve()
+    current = run / RECORDS_DIRECTORY / name
+    legacy = run / name
+    return legacy if legacy.is_file() and not current.exists() else current
+
 
 class RunRecorder:
     """Own the lifecycle and integrity metadata of one immutable analysis run."""
 
     def __init__(self, run_dir: Path, manifest: dict[str, Any]) -> None:
         self.run_dir = run_dir.expanduser().resolve()
+        self.records_dir = self.run_dir / RECORDS_DIRECTORY
         self.manifest = manifest
         self.started_at = time.monotonic()
 
@@ -31,12 +42,12 @@ class RunRecorder:
     ) -> RunRecorder:
         resolved = run_dir.expanduser().resolve()
         resolved.mkdir(parents=True, exist_ok=True)
-        if (resolved / "run-manifest.json").exists():
+        if run_record_path(resolved, "run-manifest.json").exists():
             raise ValueError(f"run directory is already recorded: {resolved}")
         recorder = cls(
             resolved,
             {
-                "manifest_version": "0.2",
+                "manifest_version": "0.3",
                 "run_id": resolved.name,
                 "run_kind": run_kind,
                 "analysis_method": analysis_method,
@@ -63,7 +74,8 @@ class RunRecorder:
             "message": redact_secrets(message),
             "details": _redact(details or {}),
         }
-        path = self.run_dir / "events.jsonl"
+        path = self.records_dir / "events.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(event, sort_keys=True, ensure_ascii=False) + "\n")
 
@@ -74,7 +86,7 @@ class RunRecorder:
         sources: dict[str, Any],
         llm: dict[str, Any],
     ) -> None:
-        write_json(self.run_dir / "metrics.json", metrics)
+        write_json(self.records_dir / "metrics.json", metrics)
         self.manifest.update(
             {
                 "status": "completed",
@@ -105,7 +117,7 @@ class RunRecorder:
         self._write_manifest()
 
     def _write_manifest(self) -> None:
-        write_json(self.run_dir / "run-manifest.json", self.manifest)
+        write_json(self.records_dir / "run-manifest.json", self.manifest)
 
 
 def _artifact_hashes(run_dir: Path) -> dict[str, str]:

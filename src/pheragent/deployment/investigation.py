@@ -88,11 +88,10 @@ class InvestigationResult:
     synthesis_input: dict[str, Any]
     synthesis: InvestigationSynthesis | None
     synthesis_outcome: ClassificationOutcome[InvestigationSynthesis]
-    follow_up_queries: tuple[InvestigationQuery, ...] = ()
-    follow_up_outcome: ClassificationOutcome[InvestigationSynthesis] | None = None
-    follow_up_status: str = "not_requested"
-    follow_up_accepted: bool = False
-    unresolved_before_follow_up: int = 0
+    outcomes: tuple[ClassificationOutcome[Any], ...] = ()
+    synthesis_rounds: int = 0
+    initial_unresolved: int = 0
+    stop_reason: str = "synthesis_unavailable"
 
 
 def plan_investigation_with_llm(
@@ -300,7 +299,7 @@ def build_synthesis_input(
     return payload
 
 
-def build_follow_up_queries(
+def build_gap_queries(
     questions: list[AnalysisQuestion],
     components: list[CandidateComponent],
     *,
@@ -308,12 +307,12 @@ def build_follow_up_queries(
 ) -> tuple[InvestigationQuery, ...]:
     """Translate unresolved semantic questions into bounded retrieval queries."""
     return tuple(
-        _follow_up_query(index, question, components)
+        _gap_query(index, question, components)
         for index, question in enumerate(questions, start=1)
     )[:limit]
 
 
-def _follow_up_query(
+def _gap_query(
     index: int,
     question: AnalysisQuestion,
     components: list[CandidateComponent],
@@ -324,7 +323,7 @@ def _follow_up_query(
     raw_terms = [*([component.name] if component else []), safe_question, safe_reason]
     terms = list(dict.fromkeys(term for term in raw_terms if term))[:5]
     return InvestigationQuery(
-        id=f"follow-up-{index:02d}",
+        id=f"gap-{index:02d}",
         purpose=InvestigationPurpose.MISSING_COMPONENTS,
         terms=terms,
         source_scope=SourceScope.BOTH,

@@ -43,7 +43,7 @@ from .functional_blocks import build_functional_blocks
 from .inventory import RepositoryInventoryBuilder
 from .investigation import (
     InvestigationResult,
-    build_follow_up_queries,
+    build_gap_queries,
     build_plan_input,
     build_synthesis_input,
     plan_investigation_with_llm,
@@ -62,8 +62,9 @@ from .source_manager import AcquisitionResult, SourceManager
 from .workflow import build_deployment_workflow
 
 ProgressCallback = Callable[[str], None]
-_MAX_FOLLOW_UP_OBSERVATIONS = 8
-_MAX_FOLLOW_UP_EVIDENCE_CHARACTERS = 4_000
+_MAX_INVESTIGATION_TURNS = 5
+_MAX_ROUND_OBSERVATIONS = 8
+_MAX_ROUND_EVIDENCE_CHARACTERS = 4_000
 
 
 @dataclass(slots=True)
@@ -124,339 +125,314 @@ def run_repository_analysis(
     *,
     progress: ProgressCallback | None = None,
 ) -> AnalysisResult:
-    return RepositoryAnalysisPipeline(config, progress=progress).run()
-
-
-class RepositoryAnalysisPipeline:
     """Orchestrates Phase 1 while keeping discovery and model judgment separate."""
+    notify = progress or (lambda _message: None)
+    context = _load_context(config.context_path)
+    sources_config = config.sources or _sources_config(
+        config.repositories,
+        config.documentation,
+        context.system,
+    )
+    source_purposes = _source_purposes(sources_config)
+    notify(f"acquiring {len(sources_config.sources)} source(s)")
+    acquisition = SourceManager(
+        cache_dir=config.cache_dir,
+        config_dir=config.context_path.expanduser().resolve().parent,
+        strict=config.strict,
+        timeout=config.source_timeout,
+        progress=notify,
+    ).acquire(sources_config)
+    notify("inventorying repositories")
+    inventory = RepositoryInventoryBuilder().build(acquisition.sources)
+    source_by_id = {source.id: source for source in acquisition.sources}
+    discovery = discover_repository(
+        inventory,
+        context,
+        source_by_id,
+        source_purposes,
+        node_budget=config.node_budget,
+    )
+    files = list(discovery.files)
+    nodes = discovery.reference_nodes
+    reference_relations = discovery.reference_relations
+    roots = discovery.roots
+    selected = discovery.selected_paths
+    signals = discovery.signals
+    warnings = list(discovery.warnings)
+    outlines = discovery.outlines
+    notify(f"extracting deterministic evidence from {len(files)} file(s)")
 
-    def __init__(
-        self,
-        config: AnalysisConfig,
-        *,
-        progress: ProgressCallback | None = None,
-    ) -> None:
-        self.config = config
-        self.notify = progress or (lambda _message: None)
-
-    def run(self) -> AnalysisResult:
-        config = self.config
-        notify = self.notify
-        context = _load_context(config.context_path)
-        sources_config = config.sources or _sources_config(
-            config.repositories,
-            config.documentation,
-            context.system,
-        )
-        source_purposes = _source_purposes(sources_config)
-        notify(f"acquiring {len(sources_config.sources)} source(s)")
-        acquisition = SourceManager(
-            cache_dir=config.cache_dir,
-            config_dir=config.context_path.expanduser().resolve().parent,
-            strict=config.strict,
-            timeout=config.source_timeout,
-            progress=notify,
-        ).acquire(sources_config)
-        notify("inventorying repositories")
-        inventory = RepositoryInventoryBuilder().build(acquisition.sources)
-        source_by_id = {source.id: source for source in acquisition.sources}
-        discovery = discover_repository(
-            inventory,
-            context,
-            source_by_id,
-            source_purposes,
-            node_budget=config.node_budget,
-        )
-        files = list(discovery.files)
-        nodes = discovery.reference_nodes
-        reference_relations = discovery.reference_relations
-        roots = discovery.roots
-        selected = discovery.selected_paths
-        signals = discovery.signals
-        warnings = list(discovery.warnings)
-        outlines = discovery.outlines
-        notify(f"extracting deterministic evidence from {len(files)} file(s)")
-
-        knowledge_graph = None
-        guided_queries = ()
-        if config.treatment == AnalysisTreatment.HYBRID_GRAPH:
-            knowledge_graph = project_deployment_knowledge(
-                signals,
-                list(nodes),
-                list(reference_relations),
-            )
-            guided_queries = graph_gap_queries(knowledge_graph)
-            notify(
-                f"projected {len(knowledge_graph.nodes)} graph node(s), "
-                f"{len(knowledge_graph.edges)} edge(s), and {len(knowledge_graph.gaps)} gap(s)"
-            )
-
-        llm_config = AnalysisLLMConfig(
-            enabled=(
-                config.llm_enabled
-                and config.treatment != AnalysisTreatment.DETERMINISTIC
-            ),
-            model=config.model,
-            api_key_env=config.api_key_env,
-            base_url_env=config.base_url_env,
-            base_url=config.base_url,
-            timeout=config.llm_timeout,
-            max_output_tokens=config.llm_max_output_tokens,
-            max_requests=config.llm_max_requests,
-            cache_dir=config.llm_cache_dir,
-            retry_failed=config.retry_failed_llm,
-            refresh_cache=config.refresh_llm,
-            reasoning_effort=config.llm_reasoning_effort,
-        )
-        request_budget = LLMRequestBudget(limit=config.llm_max_requests)
-        classifier = CachedStructuredClassifier(llm_config, request_budget)
-
-        notify(f"selected {len(roots)} deployment root(s) and {len(selected)} evidence node(s)")
-        runtime_context = compact_runtime_context(config.runtime_context)
-        plan_input = build_plan_input(
-            context,
-            outlines,
+    knowledge_graph = None
+    guided_queries = ()
+    if config.treatment == AnalysisTreatment.HYBRID_GRAPH:
+        knowledge_graph = project_deployment_knowledge(
             signals,
-            runtime_context=runtime_context,
+            list(nodes),
+            list(reference_relations),
         )
-        notify(f"planning bounded evidence investigation from {len(outlines)} source outline(s)")
-        plan_outcome = plan_investigation_with_llm(plan_input, classifier=classifier)
-        plan = plan_outcome.value or default_investigation_plan()
-        if plan_outcome.warning:
-            warnings.append(plan_outcome.warning)
+        guided_queries = graph_gap_queries(knowledge_graph)
+        notify(
+            f"projected {len(knowledge_graph.nodes)} graph node(s), "
+            f"{len(knowledge_graph.edges)} edge(s), and {len(knowledge_graph.gaps)} gap(s)"
+        )
 
-        retrieval_queries = schedule_investigation_queries(
-            plan,
-            guided_queries=guided_queries,
+    llm_config = AnalysisLLMConfig(
+        enabled=(config.llm_enabled and config.treatment != AnalysisTreatment.DETERMINISTIC),
+        model=config.model,
+        api_key_env=config.api_key_env,
+        base_url_env=config.base_url_env,
+        base_url=config.base_url,
+        timeout=config.llm_timeout,
+        max_output_tokens=config.llm_max_output_tokens,
+        max_requests=config.llm_max_requests,
+        cache_dir=config.llm_cache_dir,
+        retry_failed=config.retry_failed_llm,
+        refresh_cache=config.refresh_llm,
+        reasoning_effort=config.llm_reasoning_effort,
+    )
+    request_budget = LLMRequestBudget(limit=config.llm_max_requests)
+    classifier = CachedStructuredClassifier(llm_config, request_budget)
+
+    notify(f"selected {len(roots)} deployment root(s) and {len(selected)} evidence node(s)")
+    runtime_context = compact_runtime_context(config.runtime_context)
+    plan_input = build_plan_input(
+        context,
+        outlines,
+        signals,
+        runtime_context=runtime_context,
+    )
+    notify(f"planning bounded evidence investigation from {len(outlines)} source outline(s)")
+    plan_outcome = plan_investigation_with_llm(plan_input, classifier=classifier)
+    plan = plan_outcome.value or default_investigation_plan()
+    if plan_outcome.warning:
+        warnings.append(plan_outcome.warning)
+
+    retrieval_queries = schedule_investigation_queries(
+        plan,
+        guided_queries=guided_queries,
+    )
+    notify(f"running {len(retrieval_queries)} bounded read-only retrieval queries")
+    observations, mandatory_probes = collect_investigation_evidence(
+        queries=retrieval_queries,
+        sources=source_by_id,
+        source_purposes=source_purposes,
+        searchable_paths=discovery.searchable_paths,
+        retrieval_documents=discovery.retrieval_documents,
+        reference_relations=discovery.reference_relations,
+        roots=[root.source_ref for root in roots],
+        components=signals.candidate_components,
+        budget=EvidenceBudget(
+            max_observations=config.investigation_max_observations,
+            max_characters=config.investigation_max_evidence_chars,
+        ),
+    )
+    signals, route_warnings = bind_retrieved_installation_routes(
+        signals,
+        observations,
+        source_by_id,
+    )
+    warnings.extend(route_warnings)
+    notify(
+        f"collected {len(observations)} redacted evidence observation(s) "
+        f"under a {config.investigation_max_evidence_chars}-character budget"
+    )
+    synthesis_input = build_synthesis_input(
+        context,
+        signals,
+        observations,
+        mandatory_probes,
+        runtime_context=runtime_context,
+    )
+    notify("synthesizing grounded deployment facts and component decisions")
+    synthesis_outcome = synthesize_investigation_with_llm(
+        synthesis_input,
+        components=signals.candidate_components,
+        context=context,
+        evidence_ids={observation.id for observation in observations},
+        classifier=classifier,
+    )
+    synthesis = synthesis_outcome.value
+    if synthesis is not None:
+        synthesis, reconciliation_warnings = reconcile_investigation_synthesis(
+            synthesis,
+            components=signals.candidate_components,
+            context=context,
+            evidence_ids={observation.id for observation in observations},
         )
-        notify(f"running {len(retrieval_queries)} bounded read-only retrieval queries")
-        observations, mandatory_probes = collect_investigation_evidence(
-            queries=retrieval_queries,
-            sources=source_by_id,
+        warnings.extend(reconciliation_warnings)
+    if synthesis_outcome.warning:
+        warnings.append(synthesis_outcome.warning)
+
+    settled_signals = (
+        apply_investigation_synthesis(signals, synthesis, observations)
+        if synthesis is not None
+        else signals
+    )
+    outcomes = [plan_outcome, synthesis_outcome]
+    all_queries = list(retrieval_queries)
+    synthesis_rounds = int(synthesis is not None)
+    initial_unresolved = len(synthesis.unresolved) if synthesis else 0
+    stop_reason = "synthesis_unavailable"
+    while synthesis is not None and synthesis.unresolved:
+        if request_budget.remaining < 1 or len(outcomes) >= _MAX_INVESTIGATION_TURNS:
+            stop_reason = "budget_exhausted"
+            break
+        round_queries = build_gap_queries(
+            synthesis.unresolved,
+            settled_signals.candidate_components,
+        )
+        if not round_queries:
+            stop_reason = "no_queries"
+            break
+        all_queries.extend(round_queries)
+        notify(f"probing {len(round_queries)} uncovered deployment fact(s)")
+        focused_evidence = collect_query_evidence(
+            queries=round_queries,
             source_purposes=source_purposes,
-            searchable_paths=discovery.searchable_paths,
             retrieval_documents=discovery.retrieval_documents,
             reference_relations=discovery.reference_relations,
-            roots=[root.source_ref for root in roots],
-            components=signals.candidate_components,
+            components=settled_signals.candidate_components,
+            budget=EvidenceBudget(
+                max_observations=min(
+                    _MAX_ROUND_OBSERVATIONS,
+                    config.investigation_max_observations,
+                ),
+                max_characters=min(
+                    _MAX_ROUND_EVIDENCE_CHARACTERS,
+                    config.investigation_max_evidence_chars,
+                ),
+                results_per_query=1,
+            ),
+        )
+        known_evidence = {observation.id for observation in observations}
+        novel_evidence = tuple(
+            observation for observation in focused_evidence if observation.id not in known_evidence
+        )
+        if not novel_evidence:
+            stop_reason = "no_new_evidence"
+            break
+        observations = merge_investigation_evidence(
+            observations,
+            novel_evidence,
             budget=EvidenceBudget(
                 max_observations=config.investigation_max_observations,
                 max_characters=config.investigation_max_evidence_chars,
             ),
         )
-        signals, route_warnings = bind_retrieved_installation_routes(
-            signals,
-            observations,
+        settled_signals, route_warnings = bind_retrieved_installation_routes(
+            settled_signals,
+            novel_evidence,
             source_by_id,
         )
         warnings.extend(route_warnings)
-        notify(
-            f"collected {len(observations)} redacted evidence observation(s) "
-            f"under a {config.investigation_max_evidence_chars}-character budget"
-        )
-        synthesis_input = build_synthesis_input(
+        next_input = build_synthesis_input(
             context,
-            signals,
+            settled_signals,
             observations,
             mandatory_probes,
+            questions_to_recheck=synthesis.unresolved,
             runtime_context=runtime_context,
         )
-        notify("synthesizing grounded deployment facts and component decisions")
-        synthesis_outcome = synthesize_investigation_with_llm(
-            synthesis_input,
-            components=signals.candidate_components,
+        notify(f"revisiting unresolved deployment facts (round {synthesis_rounds + 1})")
+        next_outcome = synthesize_investigation_with_llm(
+            next_input,
+            components=settled_signals.candidate_components,
             context=context,
             evidence_ids={observation.id for observation in observations},
             classifier=classifier,
+            stage=f"investigation_synthesis_{synthesis_rounds + 1}",
         )
-        synthesis = synthesis_outcome.value
-        if synthesis is not None:
-            synthesis, reconciliation_warnings = reconcile_investigation_synthesis(
-                synthesis,
-                components=signals.candidate_components,
-                context=context,
-                evidence_ids={observation.id for observation in observations},
-            )
-            warnings.extend(reconciliation_warnings)
-        if synthesis_outcome.warning:
-            warnings.append(synthesis_outcome.warning)
-
-        settled_signals = (
-            apply_investigation_synthesis(signals, synthesis, observations)
-            if synthesis is not None
-            else signals
-        )
-        outcomes = [plan_outcome, synthesis_outcome]
-        follow_up_queries = build_follow_up_queries(
-            synthesis.unresolved if synthesis else [],
-            settled_signals.candidate_components,
-        )
-        follow_up_outcome = None
-        follow_up_status = "not_requested_no_synthesis"
-        follow_up_accepted = False
-        unresolved_before_follow_up = len(synthesis.unresolved) if synthesis else 0
-        novel_evidence = ()
-        if follow_up_queries:
-            notify(f"probing {len(follow_up_queries)} uncovered deployment fact(s)")
-            focused_evidence = collect_query_evidence(
-                queries=follow_up_queries,
-                source_purposes=source_purposes,
-                retrieval_documents=discovery.retrieval_documents,
-                reference_relations=discovery.reference_relations,
-                components=settled_signals.candidate_components,
-                budget=EvidenceBudget(
-                    max_observations=min(
-                        _MAX_FOLLOW_UP_OBSERVATIONS,
-                        config.investigation_max_observations,
-                    ),
-                    max_characters=min(
-                        _MAX_FOLLOW_UP_EVIDENCE_CHARACTERS,
-                        config.investigation_max_evidence_chars,
-                    ),
-                    results_per_query=1,
-                ),
-            )
-            known_evidence = {observation.id for observation in observations}
-            novel_evidence = tuple(
-                observation
-                for observation in focused_evidence
-                if observation.id not in known_evidence
-            )
-            if novel_evidence:
-                observations = merge_investigation_evidence(
-                    observations,
-                    novel_evidence,
-                    budget=EvidenceBudget(
-                        max_observations=config.investigation_max_observations,
-                        max_characters=config.investigation_max_evidence_chars,
-                    ),
-                )
-        if synthesis is not None and not synthesis.unresolved:
-            follow_up_status = "not_requested_no_unresolved"
-        elif synthesis is not None and (
-            config.llm_max_requests < 3 or request_budget.remaining < 1
-        ):
-            follow_up_status = "not_requested_budget_exhausted"
-        elif synthesis is not None and not follow_up_queries:
-            follow_up_status = "not_requested_no_queries"
-        elif synthesis is not None and not novel_evidence:
-            follow_up_status = "not_requested_no_new_evidence"
-        elif synthesis is not None:
-            follow_up_input = build_synthesis_input(
-                context,
-                settled_signals,
-                observations,
-                mandatory_probes,
-                questions_to_recheck=synthesis.unresolved,
-                runtime_context=runtime_context,
-            )
-            notify("re-synthesizing unresolved deployment questions")
-            follow_up_outcome = synthesize_investigation_with_llm(
-                follow_up_input,
-                components=settled_signals.candidate_components,
-                context=context,
-                evidence_ids={observation.id for observation in observations},
-                classifier=classifier,
-                stage="investigation_follow_up_synthesis",
-            )
-            outcomes.append(follow_up_outcome)
-            if follow_up_outcome.value is None:
-                follow_up_status = "failed"
-            else:
-                follow_up_synthesis, follow_up_warnings = reconcile_investigation_synthesis(
-                    follow_up_outcome.value,
-                    components=settled_signals.candidate_components,
-                    context=context,
-                    evidence_ids={observation.id for observation in observations},
-                )
-                warnings.extend(follow_up_warnings)
-                if len(follow_up_synthesis.unresolved) < len(synthesis.unresolved):
-                    synthesis = follow_up_synthesis
-                    synthesis_outcome = follow_up_outcome
-                    synthesis_input = follow_up_input
-                    settled_signals = apply_investigation_synthesis(
-                        settled_signals,
-                        synthesis,
-                        observations,
-                    )
-                    follow_up_status = "accepted"
-                    follow_up_accepted = True
-                else:
-                    follow_up_status = "rejected_no_improvement"
-            if follow_up_outcome.warning:
-                warnings.append(follow_up_outcome.warning)
-
-        signals = settled_signals
-
-        retrieval_queries = (*retrieval_queries, *follow_up_queries)
-
-        investigation = InvestigationResult(
-            plan_input=plan_input,
-            plan=plan,
-            plan_outcome=plan_outcome,
-            observations=observations,
-            mandatory_probes=mandatory_probes,
-            synthesis_input=synthesis_input,
-            synthesis=synthesis,
-            synthesis_outcome=synthesis_outcome,
-            follow_up_queries=follow_up_queries,
-            follow_up_outcome=follow_up_outcome,
-            follow_up_status=follow_up_status,
-            follow_up_accepted=follow_up_accepted,
-            unresolved_before_follow_up=unresolved_before_follow_up,
-        )
-        workflow = build_deployment_workflow(
+        outcomes.append(next_outcome)
+        if next_outcome.warning:
+            warnings.append(next_outcome.warning)
+        if next_outcome.value is None:
+            stop_reason = "invalid_response"
+            break
+        next_synthesis, next_warnings = reconcile_investigation_synthesis(
+            next_outcome.value,
+            components=settled_signals.candidate_components,
             context=context,
-            signals=signals,
-            observations=observations,
-            synthesis=synthesis,
-            llm_completed=synthesis is not None,
-            mandatory_probes=mandatory_probes,
-            documentation_expected=(
-                SourcePurpose.DOCUMENTATION in source_purposes.values()
-            ),
+            evidence_ids={observation.id for observation in observations},
+        )
+        warnings.extend(next_warnings)
+        if len(next_synthesis.unresolved) >= len(synthesis.unresolved):
+            stop_reason = "no_new_decisions"
+            break
+        synthesis = next_synthesis
+        synthesis_outcome = next_outcome
+        synthesis_input = next_input
+        synthesis_rounds += 1
+        settled_signals = apply_investigation_synthesis(
+            settled_signals,
+            synthesis,
+            observations,
         )
 
-        gold = _load_gold(config.gold_path)
-        usage = aggregate_usage(*outcomes)
-        statuses = {outcome.stage: outcome.status for outcome in outcomes}
-        document = build_functional_blocks(
-            context,
-            signals,
-            source_by_id,
-            gold,
-            llm_usage=usage,
-            llm_stage_statuses=statuses,
-        )
-        failure_paths = tuple(
-            path
-            for path in (outcome.failure_history_path for outcome in outcomes)
-            if path is not None
-        )
-        return AnalysisResult(
-            context=context,
-            acquisition=acquisition,
-            inventory=inventory,
-            repository_files=tuple(files),
-            investigation=investigation,
-            workflow=workflow,
-            reference_nodes=tuple(nodes),
-            reference_relations=tuple(reference_relations),
-            signals=signals,
-            document=document,
-            selected_paths=tuple(sorted(selected)),
-            warnings=tuple(warnings),
-            llm_usage=usage,
-            llm_stage_statuses=statuses,
-            llm_failure_history_paths=failure_paths,
-            knowledge_graph=knowledge_graph,
-            graph_queries=tuple(query.reason_code for query in guided_queries),
-            retrieval_queries=retrieval_queries,
-            evidence_characters=sum(
-                len(observation.excerpt or "") for observation in observations
-            ),
-            runtime_context=config.runtime_context,
-        )
+    if synthesis is not None and not synthesis.unresolved:
+        stop_reason = "complete"
+
+    signals = settled_signals
+
+    investigation = InvestigationResult(
+        plan_input=plan_input,
+        plan=plan,
+        plan_outcome=plan_outcome,
+        observations=observations,
+        mandatory_probes=mandatory_probes,
+        synthesis_input=synthesis_input,
+        synthesis=synthesis,
+        synthesis_outcome=synthesis_outcome,
+        outcomes=tuple(outcomes),
+        synthesis_rounds=synthesis_rounds,
+        initial_unresolved=initial_unresolved,
+        stop_reason=stop_reason,
+    )
+    workflow = build_deployment_workflow(
+        context=context,
+        signals=signals,
+        observations=observations,
+        synthesis=synthesis,
+        llm_completed=synthesis is not None,
+        mandatory_probes=mandatory_probes,
+        documentation_expected=(SourcePurpose.DOCUMENTATION in source_purposes.values()),
+    )
+
+    gold = _load_gold(config.gold_path)
+    usage = aggregate_usage(*outcomes)
+    statuses = {outcome.stage: outcome.status for outcome in outcomes}
+    document = build_functional_blocks(
+        context,
+        signals,
+        source_by_id,
+        gold,
+        llm_usage=usage,
+        llm_stage_statuses=statuses,
+    )
+    failure_paths = tuple(
+        path for path in (outcome.failure_history_path for outcome in outcomes) if path is not None
+    )
+    return AnalysisResult(
+        context=context,
+        acquisition=acquisition,
+        inventory=inventory,
+        repository_files=tuple(files),
+        investigation=investigation,
+        workflow=workflow,
+        reference_nodes=tuple(nodes),
+        reference_relations=tuple(reference_relations),
+        signals=signals,
+        document=document,
+        selected_paths=tuple(sorted(selected)),
+        warnings=tuple(warnings),
+        llm_usage=usage,
+        llm_stage_statuses=statuses,
+        llm_failure_history_paths=failure_paths,
+        knowledge_graph=knowledge_graph,
+        graph_queries=tuple(query.reason_code for query in guided_queries),
+        retrieval_queries=tuple(all_queries),
+        evidence_characters=sum(len(observation.excerpt or "") for observation in observations),
+        runtime_context=config.runtime_context,
+    )
 
 
 def _load_context(path: Path) -> DeploymentContext:

@@ -166,7 +166,7 @@ def collect_query_evidence(
     components: list[CandidateComponent],
     budget: EvidenceBudget,
 ) -> tuple[EvidenceObservation, ...]:
-    """Collect only evidence requested by a follow-up investigation."""
+    """Collect only evidence requested for unresolved deployment facts."""
     collector = _EvidenceCollector(budget)
     retriever = DeploymentRetrievalEngine(
         list(retrieval_documents),

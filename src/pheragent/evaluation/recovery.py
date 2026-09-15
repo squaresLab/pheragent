@@ -8,6 +8,7 @@ from typing import Any
 from pydantic import Field
 
 from pheragent.deployment.models import ContractModel
+from pheragent.deployment.run_records import run_record_path
 
 
 class RecoveryUsage(ContractModel):
@@ -32,9 +33,9 @@ class RecoveryEvaluationReport(ContractModel):
 def evaluate_recovery(run_directory: Path) -> RecoveryEvaluationReport:
     """Measure recorded recovery behavior without judging its proposed explanation."""
     run = run_directory.expanduser().resolve(strict=True)
-    execution = _read_object(run / "execution.json")
-    bundle = _read_object(run / "failure-bundle.json")
-    manifest = _read_object(run / "run-manifest.json")
+    execution = _read_object(run_record_path(run, "execution.json"))
+    bundle = _read_object(run_record_path(run, "failure-bundle.json"))
+    manifest = _read_object(run_record_path(run, "run-manifest.json"))
     attempts = _objects(execution.get("attempts"))
     recoveries = _objects(execution.get("recoveries"))
     failures = _objects(bundle.get("failures"))

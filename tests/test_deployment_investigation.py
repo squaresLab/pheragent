@@ -432,11 +432,11 @@ def test_semantic_gap_prevents_the_model_from_stopping_early(
     assert result.workflow.coverage.semantic_coverage_complete is False
     assert result.workflow.ready_for_execution is False
     assert any("Worker configuration" in item.reason for item in result.workflow.unresolved)
-    assert result.investigation.follow_up_status == "not_requested_budget_exhausted"
+    assert result.investigation.stop_reason == "budget_exhausted"
     assert len(requests) == 2
 
 
-def test_follow_up_synthesis_accepts_fewer_unresolved_questions(
+def test_investigation_repeats_when_new_evidence_resolves_a_question(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -472,25 +472,25 @@ def test_follow_up_synthesis_accepts_fewer_unresolved_questions(
     )
 
     assert len(requests) == 3
-    assert result.investigation.follow_up_status == "accepted"
-    assert result.investigation.follow_up_accepted is True
+    assert result.investigation.stop_reason == "complete"
+    assert result.investigation.synthesis_rounds == 2
     assert result.investigation.synthesis is not None
     assert result.investigation.synthesis.unresolved == []
-    assert result.llm_stage_statuses["investigation_follow_up_synthesis"] == "llm"
+    assert result.llm_stage_statuses["investigation_synthesis_2"] == "llm"
     assert all("disposition" in component for component in requests[2]["components"])
     evidence_locations = [
         (observation.query_id, observation.path)
         for observation in result.investigation.observations
-        if observation.query_id and observation.query_id.startswith("follow-up")
+        if observation.query_id and observation.query_id.startswith("gap-")
     ]
     assert any(
-        observation.query_id == "follow-up-01"
+        observation.query_id == "gap-01"
         and observation.path == "deployment/worker/tuning.md"
         for observation in result.investigation.observations
     ), evidence_locations
 
 
-def test_failed_follow_up_preserves_initial_synthesis(
+def test_invalid_investigation_round_preserves_initial_synthesis(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -506,7 +506,7 @@ def test_failed_follow_up_preserves_initial_synthesis(
         nonlocal synthesis_calls
         synthesis_calls += 1
         if synthesis_calls == 2:
-            return {"invalid": "follow-up response"}
+            return {"invalid": "later investigation response"}
         response = _empty_synthesis(request)
         response["unresolved"] = [
             {
@@ -529,11 +529,11 @@ def test_failed_follow_up_preserves_initial_synthesis(
         )
     )
 
-    assert result.investigation.follow_up_status == "failed"
-    assert result.investigation.follow_up_accepted is False
+    assert result.investigation.stop_reason == "invalid_response"
+    assert result.investigation.synthesis_rounds == 1
     assert result.investigation.synthesis is not None
     assert len(result.investigation.synthesis.unresolved) == 1
-    assert result.llm_stage_statuses["investigation_follow_up_synthesis"] == "invalid_response"
+    assert result.llm_stage_statuses["investigation_synthesis_2"] == "invalid_response"
 
 
 def test_grounded_operation_can_be_bound_to_its_owning_component(
@@ -603,10 +603,10 @@ def test_grounded_operation_can_be_bound_to_its_owning_component(
     owner_step = next(
         item
         for item in result.workflow.steps
-        if item.kind == "component" and item.component_id == action.owner_component_id
+        if item.kind == "component" and item.targets[0].id == action.owner_component_id
     )
     assert step.kind == "action"
-    assert step.component_name == "MinIO"
+    assert step.targets[0].name == "MinIO"
     assert owner_step.id in step.after
 
 
@@ -1024,7 +1024,7 @@ def test_context_provided_block_is_a_hard_execution_boundary(
         if component.name == "Ingress controller"
     )
     assert ingress.disposition == "deployment_component"
-    assert any(step.component_name == "Ingress controller" for step in result.workflow.steps)
+    assert any(step.targets[0].name == "Ingress controller" for step in result.workflow.steps)
 
 
 def test_llm_can_add_a_documented_external_requirement_missing_from_repo_candidates(

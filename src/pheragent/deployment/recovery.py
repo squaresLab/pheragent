@@ -22,6 +22,7 @@ from .analysis_llm import (
     aggregate_usage,
     strict_response_format,
 )
+from .analysis_models import AnalysisExecutor, AnalysisSourceRef
 from .models import ContractModel
 from .probes import ProbeRequest, ProbeResult, ProbeRunner, default_probes
 from .redaction import redact_secrets
@@ -40,10 +41,45 @@ class RecoveryStatus(StrEnum):
     EXHAUSTED = "exhausted"
 
 
-class RecoveryScope(StrEnum):
-    COMPONENT = "component"
-    BLOCK = "block"
-    ENVIRONMENT = "environment"
+class FailureKind(StrEnum):
+    COMPONENT_LOCAL = "component_local"
+    MISSING_WORKFLOW_STEP = "missing_workflow_step"
+    MISSING_COMPONENT = "missing_component"
+    UPSTREAM_DEPENDENCY = "upstream_dependency"
+    ENVIRONMENT_CONSTRAINT = "environment_constraint"
+    UNKNOWN = "unknown"
+
+
+class PlanUpdateKind(StrEnum):
+    INSERT_BEFORE = "insert_before"
+    REVISIT = "revisit"
+
+
+class WorkflowPlanUpdate(ContractModel):
+    """One bounded edit the executor can validate and apply to its live plan."""
+
+    kind: PlanUpdateKind
+    reason: str = Field(min_length=1, max_length=600)
+    prerequisite_step_id: str | None = Field(default=None, pattern=r"^S[0-9]+$")
+    component_name: str | None = Field(default=None, min_length=1, max_length=120)
+    block_id: str | None = Field(default=None, pattern=r"^B[0-9]+$")
+    executor: AnalysisExecutor | None = None
+    source_ref: AnalysisSourceRef | None = None
+    working_directory: str | None = None
+    command: str | None = Field(default=None, min_length=1, max_length=2_000)
+    required_inputs: list[str] = Field(default_factory=list, max_length=12)
+
+    @model_validator(mode="after")
+    def validate_shape(self) -> WorkflowPlanUpdate:
+        if self.kind == PlanUpdateKind.REVISIT:
+            if not self.prerequisite_step_id:
+                raise ValueError("a revisit update requires prerequisite_step_id")
+            return self
+        if not all((self.executor, self.source_ref, self.command)):
+            raise ValueError("an insert_before update requires executor, source_ref, and command")
+        if self.component_name and not self.block_id:
+            raise ValueError("a newly discovered component requires block_id")
+        return self
 
 
 @dataclass(frozen=True, slots=True)
@@ -64,6 +100,7 @@ class RecoveryFailure:
     duration_seconds: float
     output_excerpt: str
     history: tuple[str, ...] = ()
+    plan_context: dict[str, Any] = field(default_factory=dict)
 
     def prompt_payload(self) -> dict[str, Any]:
         return {
@@ -81,6 +118,7 @@ class RecoveryFailure:
             "duration_seconds": self.duration_seconds,
             "output_excerpt": self.output_excerpt,
             "history": self.history,
+            "plan_context": self.plan_context,
         }
 
 
@@ -97,7 +135,8 @@ class RecoveryResolution:
     step_id: str
     status: RecoveryStatus
     reason: str
-    scope: RecoveryScope = RecoveryScope.COMPONENT
+    failure_kind: FailureKind = FailureKind.UNKNOWN
+    plan_update: WorkflowPlanUpdate | None = None
     patch: str | None = None
     approval_items: tuple[str, ...] = ()
     probes: tuple[ProbeResult, ...] = ()
@@ -206,7 +245,7 @@ class RecoveryRisk(StrEnum):
 
 class RecoveryDecision(ContractModel):
     status: RecoveryDecisionStatus
-    scope: RecoveryScope
+    failure_kind: FailureKind
     root_cause: str = Field(min_length=1, max_length=600)
     evidence_refs: list[str] = Field(default_factory=list, max_length=8)
     additional_probes: list[ProbeRequest] = Field(default_factory=list, max_length=4)
@@ -215,11 +254,18 @@ class RecoveryDecision(ContractModel):
     requires_human_approval: bool
     human_message: str | None = Field(default=None, max_length=600)
     approval_items: list[str] = Field(default_factory=list, max_length=8)
+    plan_update: WorkflowPlanUpdate | None = None
 
     @model_validator(mode="after")
     def validate_fix(self) -> RecoveryDecision:
-        if self.status == RecoveryDecisionStatus.PROPOSED_FIX and not self.patch:
-            raise ValueError("a proposed fix requires a patch")
+        if self.patch and self.plan_update:
+            raise ValueError("a recovery decision cannot mix a patch and plan update")
+        if (
+            self.status == RecoveryDecisionStatus.PROPOSED_FIX
+            and not self.patch
+            and self.plan_update is None
+        ):
+            raise ValueError("a proposed fix requires a patch or plan update")
         return self
 
 
@@ -234,6 +280,7 @@ class RunWorkspace:
         self.root = root.expanduser().resolve()
         self.roots: dict[str, Path] = {}
         self._git_worktrees: list[tuple[Path, Path]] = []
+        self._changed_files = {source_id: set() for source_id in self._sources}
         self._lock = threading.Lock()
 
     def __enter__(self) -> RunWorkspace:
@@ -258,7 +305,7 @@ class RunWorkspace:
             source = self.roots[source_id]
         except KeyError as exc:
             raise ValueError(f"unknown run-workspace source: {source_id}") from exc
-        _validate_patch(patch)
+        changed_files = _validate_patch(patch)
         with self._lock:
             checked = _command(["git", "apply", "--check", "-"], source, input_text=patch)
             if checked.returncode:
@@ -266,7 +313,20 @@ class RunWorkspace:
             applied = _command(["git", "apply", "-"], source, input_text=patch)
             if applied.returncode:
                 raise ValueError(f"could not promote accepted patch: {_output(applied)}")
+            self._changed_files[source_id].update(changed_files)
         return source
+
+    def export_changes(self, destination: Path) -> tuple[Path, ...]:
+        """Copy accepted source files without duplicating unchanged repositories."""
+        exported = []
+        for source_id, paths in self._changed_files.items():
+            for relative in sorted(paths):
+                source = self.roots[source_id] / relative
+                target = destination / source_id / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source, target)
+                exported.append(target)
+        return tuple(exported)
 
     def close(self) -> None:
         for source, destination in reversed(self._git_worktrees):
@@ -288,58 +348,54 @@ class RunWorkspace:
         shutil.copytree(source, destination)
 
 
-class PatchSandbox:
-    """Validate a patch using disposable copies of only the files it changes."""
-
-    def __init__(self, root: Path) -> None:
-        self.root = root.expanduser().resolve()
-
-    def validate(self, source_root: Path, patch: str) -> PatchValidation:
-        source = source_root.expanduser().resolve(strict=True)
-        try:
-            paths = _validate_patch(patch)
-        except ValueError as exc:
-            return PatchValidation(False, (), str(exc))
-        self.root.mkdir(parents=True, exist_ok=True)
-        workspace = Path(tempfile.mkdtemp(prefix="attempt-", dir=self.root))
-        try:
-            for path in paths:
-                original = source / path
-                if not original.is_file():
-                    return PatchValidation(False, (), f"patched file is missing: {path}")
-                candidate = workspace / path
-                candidate.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(original, candidate)
-            applied = _command(["git", "apply", "--check", "-"], workspace, input_text=patch)
-            if applied.returncode:
-                return PatchValidation(False, (), _output(applied))
-            applied = _command(["git", "apply", "-"], workspace, input_text=patch)
-            if applied.returncode:
-                return PatchValidation(False, (), _output(applied))
-            checks: list[str] = ["git.apply"]
-            for path in paths:
-                if error := _validate_changed_file(workspace / path):
-                    return PatchValidation(False, tuple(checks), error)
-                checks.append(_check_name(path))
-            return PatchValidation(True, tuple(checks))
-        finally:
-            shutil.rmtree(workspace)
+def validate_patch(source_root: Path, patch: str, sandbox_root: Path) -> PatchValidation:
+    """Validate a patch in a disposable sparse copy without changing its source."""
+    source = source_root.expanduser().resolve(strict=True)
+    try:
+        paths = _validate_patch(patch)
+    except ValueError as exc:
+        return PatchValidation(False, (), str(exc))
+    root = sandbox_root.expanduser().resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    workspace = Path(tempfile.mkdtemp(prefix="attempt-", dir=root))
+    try:
+        for path in paths:
+            original = source / path
+            if not original.is_file():
+                return PatchValidation(False, (), f"patched file is missing: {path}")
+            candidate = workspace / path
+            candidate.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(original, candidate)
+        applied = _command(["git", "apply", "--check", "-"], workspace, input_text=patch)
+        if applied.returncode:
+            return PatchValidation(False, (), _output(applied))
+        applied = _command(["git", "apply", "-"], workspace, input_text=patch)
+        if applied.returncode:
+            return PatchValidation(False, (), _output(applied))
+        checks: list[str] = ["git.apply"]
+        for path in paths:
+            if error := _validate_changed_file(workspace / path):
+                return PatchValidation(False, tuple(checks), error)
+            checks.append(_check_name(path))
+        return PatchValidation(True, tuple(checks))
+    finally:
+        shutil.rmtree(workspace)
 
 
 class RecoveryAgent:
-    """Investigate one failed operation and return a sandbox-tested source repair."""
+    """Classify one failure and return one validated source repair or plan update."""
 
     def __init__(
         self,
         *,
         classifier: RecoveryClassifier,
         probe_runner: ProbeRunner,
-        sandbox: PatchSandbox,
+        sandbox_root: Path,
         model: str,
     ) -> None:
         self._classifier = classifier
         self._probe_runner = probe_runner
-        self._sandbox = sandbox
+        self._sandbox_root = sandbox_root
         self.model = model
 
     @classmethod
@@ -353,7 +409,7 @@ class RecoveryAgent:
         return cls(
             classifier=CachedStructuredClassifier(config, budget),
             probe_runner=ProbeRunner(),
-            sandbox=PatchSandbox(sandbox_root),
+            sandbox_root=sandbox_root,
             model=config.model,
         )
 
@@ -387,24 +443,32 @@ class RecoveryAgent:
                 reason,
                 probes,
                 outcomes,
-                scope=decision.scope,
+                failure_kind=decision.failure_kind,
                 approval_items=_approval_items(decision, failure),
             )
-        assert decision.patch is not None
-        validation = self._sandbox.validate(failure.source_root, decision.patch)
+        validation = (
+            validate_patch(failure.source_root, decision.patch, self._sandbox_root)
+            if decision.patch
+            else _validate_plan_update(failure, decision.plan_update)
+        )
         if not validation.succeeded:
             return self._resolution(
                 failure,
                 RecoveryStatus.RETRYABLE,
-                f"sandbox validation failed: {validation.error}",
+                f"repair validation failed: {validation.error}",
                 probes,
                 outcomes,
-                scope=decision.scope,
+                failure_kind=decision.failure_kind,
                 patch=decision.patch,
+                plan_update=decision.plan_update,
                 approval_items=_approval_items(decision, failure),
                 validation=validation,
             )
-        unsafe_reason = _unsafe_patch_reason(decision.patch)
+        unsafe_reason = (
+            _unsafe_patch_reason(decision.patch)
+            if decision.patch
+            else _unsafe_plan_update_reason(decision.plan_update)
+        )
         if decision.requires_human_approval or decision.risk != RecoveryRisk.LOW or unsafe_reason:
             return self._resolution(
                 failure,
@@ -412,8 +476,9 @@ class RecoveryAgent:
                 decision.human_message or unsafe_reason or "repair requires human approval",
                 probes,
                 outcomes,
-                scope=decision.scope,
+                failure_kind=decision.failure_kind,
                 patch=decision.patch,
+                plan_update=decision.plan_update,
                 approval_items=_approval_items(decision, failure),
                 validation=validation,
             )
@@ -423,8 +488,9 @@ class RecoveryAgent:
             decision.root_cause,
             probes,
             outcomes,
-            scope=decision.scope,
+            failure_kind=decision.failure_kind,
             patch=decision.patch,
+            plan_update=decision.plan_update,
             approval_items=_approval_items(decision, failure),
             validation=validation,
         )
@@ -462,8 +528,9 @@ class RecoveryAgent:
         probes: tuple[ProbeResult, ...],
         outcomes: list[ClassificationOutcome[Any]],
         *,
-        scope: RecoveryScope = RecoveryScope.COMPONENT,
+        failure_kind: FailureKind = FailureKind.UNKNOWN,
         patch: str | None = None,
+        plan_update: WorkflowPlanUpdate | None = None,
         approval_items: tuple[str, ...] = (),
         validation: PatchValidation | None = None,
     ) -> RecoveryResolution:
@@ -472,8 +539,9 @@ class RecoveryAgent:
             step_id=failure.step_id,
             status=status,
             reason=redact_secrets(reason),
-            scope=scope,
+            failure_kind=failure_kind,
             patch=patch,
+            plan_update=plan_update,
             approval_items=approval_items,
             probes=probes,
             usage=aggregate_usage(*outcomes),
@@ -506,12 +574,61 @@ def _validate_patch(patch: str) -> tuple[Path, ...]:
     return tuple(dict.fromkeys(paths))
 
 
+def _validate_plan_update(
+    failure: RecoveryFailure,
+    update: WorkflowPlanUpdate | None,
+) -> PatchValidation:
+    if update is None:
+        return PatchValidation(False, (), "recovery returned no plan update")
+    if update.kind == PlanUpdateKind.REVISIT:
+        known = {
+            str(step.get("id"))
+            for step in failure.plan_context.get("steps", [])
+            if isinstance(step, dict)
+        }
+        if update.prerequisite_step_id not in known:
+            return PatchValidation(False, (), "revisited step is not in the current plan")
+        return PatchValidation(True, ("workflow.step_exists",))
+
+    assert update.source_ref is not None
+    assert update.command is not None
+    if update.source_ref.repo_id != failure.repo_id:
+        return PatchValidation(False, (), "a plan update must use the failed step's source")
+    source = (failure.source_root / update.source_ref.path).resolve()
+    if not source.is_relative_to(failure.source_root) or not source.is_file():
+        return PatchValidation(False, (), "plan update source does not exist")
+    workdir = (
+        failure.source_root / (update.working_directory or Path(update.source_ref.path).parent)
+    ).resolve()
+    if not workdir.is_relative_to(failure.source_root) or not workdir.is_dir():
+        return PatchValidation(False, (), "plan update working directory does not exist")
+    executable = update.command.strip().split(maxsplit=1)[0]
+    if executable.startswith("./") and (workdir / executable[2:]).is_file():
+        return PatchValidation(True, ("workflow.source_exists", "workflow.command_exists"))
+    content = " ".join(source.read_text(encoding="utf-8", errors="replace").split())
+    if " ".join(update.command.split()) not in content:
+        return PatchValidation(False, (), "plan update command is not grounded in its source")
+    return PatchValidation(True, ("workflow.source_exists", "workflow.command_grounded"))
+
+
 def _unsafe_patch_reason(patch: str) -> str | None:
     normalized = "\n".join(
         line[1:].casefold()
         for line in patch.splitlines()
         if line.startswith("+") and not line.startswith("+++")
     )
+    return _unsafe_command_reason(normalized)
+
+
+def _unsafe_plan_update_reason(update: WorkflowPlanUpdate | None) -> str | None:
+    if update is None or update.kind == PlanUpdateKind.REVISIT:
+        return None
+    return _unsafe_command_reason(update.command.casefold()) or (
+        "a newly introduced deployment command requires human approval"
+    )
+
+
+def _unsafe_command_reason(normalized: str) -> str | None:
     forbidden = {
         "allowinsecureimages": "disabling image verification requires human approval",
         "rm -rf": "destructive commands require human approval",
@@ -538,7 +655,8 @@ def _approval_items(
     failure: RecoveryFailure,
 ) -> tuple[str, ...]:
     items = list(decision.approval_items)
-    evidence = failure.output_excerpt + "\n" + (decision.patch or "")
+    update_command = decision.plan_update.command if decision.plan_update else ""
+    evidence = failure.output_excerpt + "\n" + (decision.patch or "") + "\n" + update_command
     items.extend(f"image: {match}" for match in _image_references(evidence))
     added_lines = "\n".join(
         line[1:]
@@ -546,6 +664,8 @@ def _approval_items(
         if line.startswith("+") and not line.startswith("+++")
     )
     items.extend(f"source: {match}" for match in re.findall(r"https?://[^\s\"']+", added_lines))
+    if decision.plan_update:
+        items.append(f"plan: {decision.plan_update.reason}")
     return tuple(dict.fromkeys(redact_secrets(item) for item in items))[:8]
 
 
@@ -663,5 +783,9 @@ destructive, privileged, external-download, image-verification, credential, or u
 as requiring human approval. List the exact image, external source, or security setting in
 approval_items. If allowing a non-standard image, identify that exact image from the failure;
 never propose a broad unbounded image exception. If the evidence is insufficient, say so instead
-of guessing.
+of guessing. Classify the failure as component_local, missing_workflow_step, missing_component,
+upstream_dependency, environment_constraint, or unknown. Use a source patch for a local installer
+bug. Use one insert_before plan update only when an existing source contains the missing command.
+Use revisit only when a named existing workflow step must run again. Never return both a patch and
+a plan update, and never invent a component, command, source path, or workflow step.
 """.strip()

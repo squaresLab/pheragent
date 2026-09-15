@@ -54,7 +54,9 @@ def test_research_run_uses_product_analyzer_and_seals_results(
     assert exit_code == 0
     study_root = tmp_path / "graph-retrieval-pilot"
     run_dir = next((study_root / "runs").iterdir())
-    manifest = json.loads((run_dir / "run-manifest.json").read_text(encoding="utf-8"))
+    manifest = json.loads(
+        (run_dir / ".heragent" / "run-manifest.json").read_text(encoding="utf-8")
+    )
     assert manifest["run_kind"] == "research"
     assert manifest["analysis_method"] == "a0"
     assert manifest["status"] == "completed"

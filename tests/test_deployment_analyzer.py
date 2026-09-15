@@ -370,7 +370,7 @@ def test_analysis_pipeline_makes_two_bounded_llm_calls(
     }
     assert second.document.evaluation.llm_requests == 0
     assert first.workflow.ready_for_execution is True
-    workflow_steps = {step.component_name: step for step in first.workflow.steps}
+    workflow_steps = {step.targets[0].name: step for step in first.workflow.steps}
     assert workflow_steps["PostgreSQL"].command == "./install.sh"
     assert workflow_steps["PostgreSQL"].operation_source_ref is not None
     assert set(workflow_steps["Kernel"].after) >= {
@@ -479,10 +479,13 @@ def test_analyze_cli_writes_execution_readiness_outputs_in_timestamped_run(
     assert len(run_directories) == 1
     assert run_directories[0].name.endswith("-fixture")
     assert sorted(path.name for path in run_directories[0].iterdir()) == [
-        "analysis-report.md",
+        ".heragent",
         "deployment-workflow.yaml",
-        "events.jsonl",
         "functional-blocks.yaml",
+        "unresolved-work.yaml",
+    ]
+    assert sorted(path.name for path in (run_directories[0] / ".heragent").iterdir()) == [
+        "events.jsonl",
         "metrics.json",
         "run-manifest.json",
     ]
@@ -491,7 +494,9 @@ def test_analyze_cli_writes_execution_readiness_outputs_in_timestamped_run(
         (run_directories[0] / "deployment-workflow.yaml").read_text(encoding="utf-8")
     )
     manifest = json.loads(
-        (run_directories[0] / "run-manifest.json").read_text(encoding="utf-8")
+        (run_directories[0] / ".heragent" / "run-manifest.json").read_text(
+            encoding="utf-8"
+        )
     )
     assert workflow["ready_for_execution"] is False
     assert manifest["analysis_method"] == "deployment-analysis-v1"

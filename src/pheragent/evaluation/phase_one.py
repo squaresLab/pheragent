@@ -33,6 +33,7 @@ from pheragent.deployment.analysis_models import (
     WorkflowStepStatus,
 )
 from pheragent.deployment.redaction import redact_secrets
+from pheragent.deployment.run_records import run_record_path
 
 from ._evidence import (
     DeploymentEntity,
@@ -1352,7 +1353,7 @@ def _selected_source_paths(
 
 
 def _run_signature(run_directory: Path) -> str | None:
-    path = run_directory / "run-manifest.json"
+    path = run_record_path(run_directory, "run-manifest.json")
     try:
         manifest = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError, json.JSONDecodeError:

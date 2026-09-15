@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from enum import StrEnum
-from typing import Any
 
 from pydantic import Field, model_validator
 
@@ -374,39 +373,12 @@ class DeploymentWorkflowStep(ContractModel):
     status: WorkflowStepStatus
     blockers: list[str] = Field(default_factory=list)
 
-    @model_validator(mode="before")
-    @classmethod
-    def accept_legacy_component_fields(cls, value: Any) -> Any:
-        """Read earlier one-component workflows without exposing that shape to callers."""
-        if not isinstance(value, dict) or "targets" in value:
-            return value
-        component_id = value.get("component_id")
-        component_name = value.get("component_name")
-        if component_id is None or component_name is None:
-            return value
-        normalized = dict(value)
-        normalized.pop("component_id")
-        normalized.pop("component_name")
-        normalized["targets"] = [{"id": component_id, "name": component_name}]
-        return normalized
-
     @model_validator(mode="after")
     def validate_targets(self) -> DeploymentWorkflowStep:
         target_ids = [target.id for target in self.targets]
         if len(target_ids) != len(set(target_ids)):
             raise ValueError(f"workflow step {self.id} contains duplicate component targets")
         return self
-
-    @property
-    def component_id(self) -> str:
-        """Return the primary target for compatibility with one-component callers."""
-        return self.targets[0].id
-
-    @property
-    def component_name(self) -> str:
-        """Return the primary target name for compatibility with one-component callers."""
-        return self.targets[0].name
-
 
 class DeploymentWorkflow(ContractModel):
     version: str = "0.1"

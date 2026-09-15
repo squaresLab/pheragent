@@ -16,7 +16,11 @@ from .analysis_llm import (
     LLMRequestBudget,
 )
 from .analyzer import AnalysisConfig, AnalysisResult, run_repository_analysis
-from .artifacts import analysis_metrics, publish_analysis_artifacts
+from .artifacts import (
+    analysis_metrics,
+    publish_analysis_artifacts,
+    publish_execution_artifacts,
+)
 from .enums import AnalysisTreatment
 from .errors import DeploymentError, DeploymentInputError
 from .execution import ExecutionReport, prepare_execution
@@ -96,10 +100,7 @@ def _add_analyze_parser(commands: Any) -> None:
         "--llm-max-requests",
         type=_positive_int,
         default=2,
-        help=(
-            "Hard cap for investigation planning and synthesis requests; "
-            "set at least 3 to enable one unresolved-question follow-up."
-        ),
+        help="Analysis request cap; the bounded investigation never exceeds five calls.",
     )
     analyze.add_argument(
         "--investigation-max-observations",
@@ -264,8 +265,8 @@ def _run_analyze(args: argparse.Namespace) -> int:
             _analysis_config(args, output_root),
             progress=progress,
         )
-        published = publish_analysis_artifacts(run_dir, result, debug=args.debug)
-        for outcome in _analysis_outcomes(result):
+        publish_analysis_artifacts(run_dir, result, debug=args.debug)
+        for outcome in result.investigation.outcomes:
             _record_llm_call(recorder, outcome, model=_analysis_model(args))
         recorder.complete(
             metrics=analysis_metrics(result),
@@ -280,8 +281,7 @@ def _run_analyze(args: argparse.Namespace) -> int:
         progress(f"failed; run directory retained at {run_dir}")
         raise
 
-    published_count = len(tuple(path for path in run_dir.rglob("*") if path.is_file()))
-    _print_analysis_summary(run_dir, result, max(len(published), published_count))
+    _print_analysis_summary(run_dir, result, debug=args.debug)
     return 0
 
 
@@ -318,43 +318,36 @@ def _analysis_config(args: argparse.Namespace, output_root: Path) -> AnalysisCon
 def _print_analysis_summary(
     run_dir: Path,
     result: AnalysisResult,
-    published_count: int,
+    *,
+    debug: bool,
 ) -> None:
     evaluation = result.document.evaluation
     print(f"run: {run_dir}")
     print(f"functional blocks: {run_dir / 'functional-blocks.yaml'}")
-    print(f"analysis report: {run_dir / 'analysis-report.md'}")
     print(f"deployment workflow: {run_dir / 'deployment-workflow.yaml'}")
-    if result.runtime_context is not None:
-        print(f"runtime context: {run_dir / 'runtime-context.json'}")
+    print(f"unresolved work: {run_dir / 'unresolved-work.yaml'}")
+    print(f"ready for execution: {str(result.workflow.ready_for_execution).lower()}")
+    print(
+        f"components: {evaluation.component_count}; "
+        f"executable routes: {evaluation.executable_route_coverage:.1%}; "
+        f"unresolved: {len(result.workflow.unresolved)}"
+    )
+    if not debug:
+        return
     print(
         "LLM stages: "
         + "; ".join(f"{stage}={status}" for stage, status in result.llm_stage_statuses.items())
     )
-    print(f"ready for execution: {str(result.workflow.ready_for_execution).lower()}")
     print(f"LLM requests this run: {evaluation.llm_requests}")
-    outcomes = [
-        result.investigation.plan_outcome,
-        result.investigation.synthesis_outcome,
-    ]
-    if (
-        result.investigation.follow_up_outcome is not None
-        and result.investigation.follow_up_outcome is not result.investigation.synthesis_outcome
-    ):
-        outcomes.append(result.investigation.follow_up_outcome)
-    for outcome in outcomes:
+    for outcome in result.investigation.outcomes:
         if outcome.value is None and outcome.warning:
             print(f"LLM {outcome.stage}: {outcome.warning}")
-    print(f"follow-up synthesis: {result.investigation.follow_up_status}")
+    print(
+        f"investigation: {result.investigation.synthesis_rounds} synthesis round(s); "
+        f"stopped={result.investigation.stop_reason}"
+    )
     for failure_path in result.llm_failure_history_paths:
         print(f"LLM failure history: {failure_path}")
-    print(
-        f"components: {evaluation.component_count} from "
-        f"{evaluation.candidate_component_count} candidate(s); "
-        f"deployability coverage: {evaluation.deployability_coverage:.1%}; "
-        f"forbidden components: {evaluation.forbidden_component_count}"
-    )
-    print(f"published files: {published_count}")
 
 
 def _context_system_name(context_path: Path) -> str:
@@ -446,11 +439,12 @@ def _run_workflow(args: argparse.Namespace) -> int:
                     progress=progress,
                     recovery_queue=recovery_queue,
                     max_repair_attempts=args.max_repair_attempts,
-                    output_directory=run_dir,
+                    output_directory=recorder.records_dir,
                     execution_roots=workspace.roots,
                     promote_patch=workspace.apply,
                     approve_repair=_terminal_approval if sys.stdin.isatty() else None,
                 )
+            publish_execution_artifacts(run_dir, prepared, report, workspace)
         for resolution in report.recoveries:
             for call in resolution.llm_calls:
                 recorder.record_event(
@@ -500,7 +494,17 @@ def _terminal_approval(resolution: RecoveryResolution) -> bool:
         if choice in {"", "n", "no"}:
             return False
         if choice in {"v", "view"}:
-            print(resolution.patch or "No source patch was proposed.")
+            if resolution.patch:
+                print(resolution.patch)
+            elif resolution.plan_update:
+                print(
+                    yaml.safe_dump(
+                        resolution.plan_update.model_dump(mode="json", exclude_none=True),
+                        sort_keys=False,
+                    )
+                )
+            else:
+                print("No change was proposed.")
             continue
         print("Please choose y, n, or v.")
 
@@ -523,6 +527,11 @@ def _execution_metrics(report: ExecutionReport) -> dict[str, Any]:
         "repair_successes": sum(
             resolution.status.value == "resolved" for resolution in report.recoveries
         ),
+        "plan_updates": sum(resolution.plan_update is not None for resolution in report.recoveries),
+        "failure_kinds": {
+            kind: sum(resolution.failure_kind.value == kind for resolution in report.recoveries)
+            for kind in sorted({resolution.failure_kind.value for resolution in report.recoveries})
+        },
         "duration_seconds": round(
             sum(attempt.duration_seconds for attempt in report.attempts),
             6,
@@ -536,14 +545,6 @@ def _recovery_usage(report: ExecutionReport) -> dict[str, int]:
         for key, value in recovery.usage.items():
             usage[key] = usage.get(key, 0) + int(value)
     return usage
-
-
-def _analysis_outcomes(result: AnalysisResult) -> list[ClassificationOutcome[Any]]:
-    outcomes = [result.investigation.plan_outcome, result.investigation.synthesis_outcome]
-    follow_up = result.investigation.follow_up_outcome
-    if follow_up is not None and all(follow_up is not outcome for outcome in outcomes):
-        outcomes.append(follow_up)
-    return outcomes
 
 
 def _record_llm_call(

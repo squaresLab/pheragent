@@ -20,12 +20,13 @@ def test_run_recorder_seals_outputs_and_redacts_secrets(tmp_path: Path) -> None:
         llm={"usage": {"requests": 0}},
     )
 
-    manifest = json.loads((run_dir / "run-manifest.json").read_text(encoding="utf-8"))
+    records = run_dir / ".heragent"
+    manifest = json.loads((records / "run-manifest.json").read_text(encoding="utf-8"))
     assert manifest["status"] == "completed"
     assert manifest["inputs"]["password"] == "password=[REDACTED]"
     assert "artifact.yaml" in manifest["artifacts"]
-    assert "metrics.json" in manifest["artifacts"]
-    assert len((run_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()) == 2
+    assert ".heragent/metrics.json" in manifest["artifacts"]
+    assert len((records / "events.jsonl").read_text(encoding="utf-8").splitlines()) == 2
 
 
 def test_run_recorder_preserves_failed_run(tmp_path: Path) -> None:
@@ -39,6 +40,8 @@ def test_run_recorder_preserves_failed_run(tmp_path: Path) -> None:
 
     recorder.fail(ValueError("token=unsafe"))
 
-    manifest = json.loads((run_dir / "run-manifest.json").read_text(encoding="utf-8"))
+    manifest = json.loads(
+        (run_dir / ".heragent" / "run-manifest.json").read_text(encoding="utf-8")
+    )
     assert manifest["status"] == "failed"
     assert manifest["error"]["message"] == "token=[REDACTED]"

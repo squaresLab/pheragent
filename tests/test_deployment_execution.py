@@ -8,17 +8,21 @@ import pytest
 import yaml
 
 from pheragent.cli import main
+from pheragent.deployment.artifacts import publish_execution_artifacts
 from pheragent.deployment.errors import (
     DeploymentInputError,
     WorkflowNotExecutableError,
 )
 from pheragent.deployment.execution import CommandOutcome, prepare_execution
 from pheragent.deployment.recovery import (
+    FailureKind,
     PatchValidation,
+    PlanUpdateKind,
     RecoveryResolution,
     RecoveryStatus,
     RunWorkspace,
     ThreadedRecoveryQueue,
+    WorkflowPlanUpdate,
 )
 
 
@@ -88,6 +92,8 @@ def _write_workflow(tmp_path: Path) -> tuple[Path, Path]:
 
 def _write_functional_blocks(tmp_path: Path) -> None:
     payload = {
+        "system": "fixture",
+        "deployment": {},
         "blocks": [
             {
                 "id": "B0",
@@ -133,7 +139,16 @@ def _write_functional_blocks(tmp_path: Path) -> None:
                     },
                 ],
             },
-        ]
+        ],
+        "evaluation": {
+            "component_count": 3,
+            "deployable_component_count": 3,
+            "deployability_coverage": 1.0,
+            "grounded_component_rate": 1.0,
+            "forbidden_component_count": 0,
+            "relation_count": 2,
+            "source_derived_relation_count": 2,
+        },
     }
     (tmp_path / "functional-blocks.yaml").write_text(
         yaml.safe_dump(payload, sort_keys=False),
@@ -408,10 +423,19 @@ def test_approved_patch_is_shared_with_retry_and_later_steps(tmp_path: Path) -> 
                 "image: docker.io/example/minio@sha256:123",
             ),
         )
+        publish_execution_artifacts(tmp_path / "artifacts", prepared, report, workspace)
 
     assert report.successful
     assert attempts == 2
+    assert len(report.recoveries) == 1
+    assert report.recoveries[0].status == RecoveryStatus.RESOLVED
     assert "# repaired" not in source.joinpath("deploy.sh").read_text(encoding="utf-8")
+    artifacts = tmp_path / "artifacts"
+    assert "# repaired" in (
+        artifacts / "updated-source" / "fixture" / "deploy.sh"
+    ).read_text(encoding="utf-8")
+    assert "human approved" in (artifacts / "changes.md").read_text(encoding="utf-8")
+    assert yaml.safe_load((artifacts / "unresolved-work.yaml").read_text())["complete"] is True
 
 
 def test_execution_keeps_exhausted_failure_and_skips_only_its_descendants(
@@ -465,6 +489,169 @@ def test_execution_keeps_exhausted_failure_and_skips_only_its_descendants(
     assert report.completed == ("S004",)
     assert [issue.step_id for issue in report.failed] == ["S001"]
     assert {issue.step_id for issue in report.skipped} == {"S002", "S003"}
+
+
+def test_execution_inserts_discovered_prerequisite_and_revises_artifacts(
+    tmp_path: Path,
+) -> None:
+    workflow, source = _write_workflow(tmp_path)
+    _write_functional_blocks(tmp_path)
+    (source / "prerequisite.sh").write_text("#!/bin/bash\nprintf ready\n", encoding="utf-8")
+    prepared = prepare_execution(workflow, {"fixture": source})
+    calls: list[str] = []
+
+    def resolve(failure):
+        return RecoveryResolution(
+            failure_id=failure.id,
+            step_id=failure.step_id,
+            status=RecoveryStatus.RESOLVED,
+            reason="The database requires a source-backed prerequisite.",
+            failure_kind=FailureKind.MISSING_COMPONENT,
+            plan_update=WorkflowPlanUpdate(
+                kind=PlanUpdateKind.INSERT_BEFORE,
+                reason="Install the prerequisite before the database.",
+                component_name="Storage Provisioner",
+                block_id="B1",
+                executor="shell",
+                source_ref={"repo_id": "fixture", "path": "prerequisite.sh"},
+                working_directory=".",
+                command="./prerequisite.sh",
+            ),
+            validation=PatchValidation(True, ("workflow.command_exists",)),
+        )
+
+    def runner(command: str, _cwd: Path, _timeout: float) -> CommandOutcome:
+        calls.append(command)
+        if command == "printf database" and calls.count(command) == 1:
+            return CommandOutcome.failed(1, "storage provisioner is required")
+        return CommandOutcome.succeeded()
+
+    with (
+        RunWorkspace({"fixture": source}, tmp_path / "workspace") as workspace,
+        ThreadedRecoveryQueue(resolve, workers=1) as recovery_queue,
+    ):
+        report = prepared.execute(
+            approval_token=prepared.approval_token,
+            timeout=10,
+            command_runner=runner,
+            recovery_queue=recovery_queue,
+            execution_roots=workspace.roots,
+        )
+        publish_execution_artifacts(tmp_path / "artifacts", prepared, report, workspace)
+
+    assert calls == [
+        "printf database",
+        "./prerequisite.sh",
+        "printf database",
+        "printf application",
+        "printf validation",
+    ]
+    assert report.successful
+    assert report.workflow is not None
+    revised = {step.id: step for step in report.workflow.steps}
+    assert revised["S001"].after == ["S004"]
+    assert revised["S004"].command == "./prerequisite.sh"
+    assert report.functional_blocks is not None
+    states = {block.id: block.state for block in report.functional_blocks.blocks}
+    assert states == {"B0": "provided", "B1": "deployed", "B2": "deployed"}
+    assert any(
+        component.name == "Storage Provisioner"
+        for block in report.functional_blocks.blocks
+        for component in block.components
+    )
+    stored_workflow = yaml.safe_load(
+        (tmp_path / "artifacts" / "deployment-workflow.yaml").read_text()
+    )
+    assert next(step for step in stored_workflow["steps"] if step["id"] == "S001")[
+        "after"
+    ] == ["S004"]
+    stored_blocks = yaml.safe_load(
+        (tmp_path / "artifacts" / "functional-blocks.yaml").read_text()
+    )
+    assert {block["id"]: block["state"] for block in stored_blocks["blocks"]} == {
+        "B0": "provided",
+        "B1": "deployed",
+        "B2": "deployed",
+    }
+    assert "insert_before" in (tmp_path / "artifacts" / "changes.md").read_text()
+
+
+def test_execution_revisits_upstream_step_then_resumes(tmp_path: Path) -> None:
+    workflow, source = _write_workflow(tmp_path)
+    _write_functional_blocks(tmp_path)
+    prepared = prepare_execution(workflow, {"fixture": source})
+    calls: list[str] = []
+
+    def resolve(failure):
+        return RecoveryResolution(
+            failure_id=failure.id,
+            step_id=failure.step_id,
+            status=RecoveryStatus.RESOLVED,
+            reason="The database prerequisite must be reconciled again.",
+            failure_kind=FailureKind.UPSTREAM_DEPENDENCY,
+            plan_update=WorkflowPlanUpdate(
+                kind=PlanUpdateKind.REVISIT,
+                reason="Revisit the existing database step.",
+                prerequisite_step_id="S001",
+            ),
+            validation=PatchValidation(True, ("workflow.step_exists",)),
+        )
+
+    def runner(command: str, _cwd: Path, _timeout: float) -> CommandOutcome:
+        calls.append(command)
+        if command == "printf application" and calls.count(command) == 1:
+            return CommandOutcome.failed(1, "database schema is not ready")
+        return CommandOutcome.succeeded()
+
+    with ThreadedRecoveryQueue(resolve, workers=1) as recovery_queue:
+        report = prepared.execute(
+            approval_token=prepared.approval_token,
+            timeout=10,
+            command_runner=runner,
+            recovery_queue=recovery_queue,
+        )
+
+    assert calls == [
+        "printf database",
+        "printf application",
+        "printf database",
+        "printf application",
+        "printf validation",
+    ]
+    assert report.successful
+    assert report.recoveries[0].failure_kind == FailureKind.UPSTREAM_DEPENDENCY
+
+
+def test_execution_rejects_plan_update_that_creates_cycle(tmp_path: Path) -> None:
+    workflow, source = _write_workflow(tmp_path)
+    prepared = prepare_execution(workflow, {"fixture": source})
+
+    def resolve(failure):
+        return RecoveryResolution(
+            failure_id=failure.id,
+            step_id=failure.step_id,
+            status=RecoveryStatus.RESOLVED,
+            reason="Incorrectly revisit a dependent step.",
+            failure_kind=FailureKind.UPSTREAM_DEPENDENCY,
+            plan_update=WorkflowPlanUpdate(
+                kind=PlanUpdateKind.REVISIT,
+                reason="This would introduce a cycle.",
+                prerequisite_step_id="S002",
+            ),
+            validation=PatchValidation(True, ("workflow.step_exists",)),
+        )
+
+    with ThreadedRecoveryQueue(resolve, workers=1) as recovery_queue:
+        report = prepared.execute(
+            approval_token=prepared.approval_token,
+            timeout=10,
+            command_runner=lambda *_args: CommandOutcome.failed(1, "failure"),
+            recovery_queue=recovery_queue,
+            max_repair_attempts=1,
+        )
+
+    assert report.failed[0].step_id == "S001"
+    assert "cycle" in report.failed[0].reason
 
 
 def test_trial_mode_executes_only_ready_dependency_closed_steps(tmp_path: Path) -> None:
@@ -548,7 +735,7 @@ def test_block_selection_rejects_non_provided_prerequisites(tmp_path: Path) -> N
         )
 
 
-def test_legacy_duplicate_stack_commands_are_rejected(tmp_path: Path) -> None:
+def test_duplicate_stack_commands_are_rejected(tmp_path: Path) -> None:
     payload = _workflow_payload()
     steps = payload["steps"]
     assert isinstance(steps, list)
@@ -558,11 +745,6 @@ def test_legacy_duplicate_stack_commands_are_rejected(tmp_path: Path) -> None:
     assert isinstance(second, dict)
     first["command"] = "docker compose up"
     second["command"] = "docker compose up"
-    for step in (first, second):
-        target = step.pop("targets")[0]
-        step["component_id"] = target["id"]
-        step["component_name"] = target["name"]
-
     source = tmp_path / "source"
     source.mkdir()
     workflow = tmp_path / "legacy-workflow.yaml"

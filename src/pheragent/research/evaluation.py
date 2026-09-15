@@ -9,6 +9,7 @@ from typing import Any
 
 import yaml
 
+from pheragent.deployment.run_records import run_record_path
 from pheragent.deployment.serialization import write_text
 
 
@@ -22,9 +23,12 @@ def summarize_study(study_root: Path) -> None:
 
 def _load_rows(study_root: Path) -> list[dict[str, Any]]:
     rows = []
-    for manifest_path in sorted((study_root / "runs").glob("*/run-manifest.json")):
+    for run_dir in sorted(path for path in (study_root / "runs").glob("*") if path.is_dir()):
+        manifest_path = run_record_path(run_dir, "run-manifest.json")
+        if not manifest_path.is_file():
+            continue
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        metrics_path = manifest_path.parent / "metrics.json"
+        metrics_path = run_record_path(run_dir, "metrics.json")
         metrics = (
             json.loads(metrics_path.read_text(encoding="utf-8"))
             if metrics_path.is_file()

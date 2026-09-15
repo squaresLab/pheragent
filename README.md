@@ -62,16 +62,17 @@ without paying repeated acquisition or synthesis costs. A normal run contains:
 
 ```text
 runs/<timestamp>-<run-name>/
-├── run-manifest.json
-├── events.jsonl
-├── metrics.json
 ├── functional-blocks.yaml
 ├── deployment-workflow.yaml
-└── analysis-report.md
+├── unresolved-work.yaml
+└── .heragent/                 # internal records used by evaluation
+    ├── run-manifest.json
+    ├── events.jsonl
+    └── metrics.json
 ```
 
 Use `--debug` to add the repository index, reference graph, candidate components,
-deployment signals, and compact LLM input beneath `debug/`. Analysis uses at most two
+deployment signals, and compact LLM input beneath `.heragent/debug/`. Analysis uses at most two
 schema-constrained LLM requests by default: one bounded retrieval plan and one grounded
 synthesis. The raw repository is never included in either request.
 
@@ -97,8 +98,7 @@ pheragent deployment run path/to/deployment-workflow.yaml \
 
 Dry-run is the default and never starts a repository command. If the workflow is ready,
 the output includes an approval token tied to the workflow, ordered commands, and source
-roots. Supply that token to execute the unchanged plan sequentially and stop at the first
-failure:
+roots. Supply that token to execute the unchanged plan:
 
 ```bash
 pheragent deployment run path/to/deployment-workflow.yaml \
@@ -116,8 +116,16 @@ Limit a trial to one discovered block whose block prerequisites are already prov
 selected block is included in the dry-run and approval token.
 
 Commands run on the machine hosting the CLI. Deployment scripts are responsible for
-reaching Kubernetes or worker nodes. This first execution slice does not yet perform
-automatic health validation, rollback, or repair.
+reaching Kubernetes or worker nodes. Failed operations enter bounded recovery while independent
+operations continue. The recovery worker classifies each failure and returns one of three small
+results: patch the current installer, insert one source-backed prerequisite before the failed step,
+or revisit an existing prerequisite. The main execution loop validates and applies plan changes,
+then resumes from the affected step. A newly introduced command requires terminal approval because
+it was not covered by the original dry-run token.
+
+A completed execution run keeps the revised functional blocks, revised workflow, unresolved work,
+accepted changed files, and short change notes at the run root. Logs and machine-readable traces
+remain under `.heragent/`.
 
 The MOSIP context deliberately supplies only the already-provisioned infrastructure
 and Kubernetes blocks. The analyzer discovers installer roots and service/application

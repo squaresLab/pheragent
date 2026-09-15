@@ -212,7 +212,7 @@ def test_owned_component_relation_does_not_create_owner_self_dependency() -> Non
     )
 
     assert len(workflow.steps) == 1
-    assert workflow.steps[0].component_id == owner.id
+    assert workflow.steps[0].targets[0].id == owner.id
     assert workflow.steps[0].after == []
 
 

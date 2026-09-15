@@ -11,16 +11,18 @@ from pheragent.deployment.analysis_llm import ClassificationOutcome
 from pheragent.deployment.execution import CommandOutcome, prepare_execution
 from pheragent.deployment.probes import ProbeRequest, ProbeRunner
 from pheragent.deployment.recovery import (
-    PatchSandbox,
+    FailureKind,
+    PlanUpdateKind,
     RecoveryAgent,
     RecoveryDecision,
     RecoveryDecisionStatus,
     RecoveryFailure,
     RecoveryRisk,
-    RecoveryScope,
     RecoveryStatus,
     RunWorkspace,
+    WorkflowPlanUpdate,
     _unsafe_patch_reason,
+    validate_patch,
 )
 
 
@@ -93,7 +95,7 @@ def test_patch_sandbox_validates_without_changing_source(tmp_path: Path) -> None
 +printf new\\n
 """
 
-    validation = PatchSandbox(tmp_path / "sandboxes").validate(source, patch)
+    validation = validate_patch(source, patch, tmp_path / "sandboxes")
 
     assert validation.succeeded is True
     assert script.read_text(encoding="utf-8") == "#!/bin/bash\nprintf old\\n\n"
@@ -191,7 +193,7 @@ def test_recovery_agent_returns_only_a_sandbox_validated_fix(tmp_path: Path) -> 
 """
     decision = RecoveryDecision(
         status=RecoveryDecisionStatus.PROPOSED_FIX,
-        scope=RecoveryScope.COMPONENT,
+        failure_kind=FailureKind.COMPONENT_LOCAL,
         root_cause="The installer uses the old command.",
         patch=patch,
         risk=RecoveryRisk.LOW,
@@ -212,7 +214,7 @@ def test_recovery_agent_returns_only_a_sandbox_validated_fix(tmp_path: Path) -> 
     agent = RecoveryAgent(
         classifier=Classifier(),
         probe_runner=ProbeRunner(command_runner=lambda *_args: (0, "ok")),
-        sandbox=PatchSandbox(tmp_path / "sandboxes"),
+        sandbox_root=tmp_path / "sandboxes",
         model="test-model",
     )
     failure = RecoveryFailure(
@@ -264,7 +266,7 @@ def test_image_verification_bypass_names_the_exact_image_for_approval(tmp_path: 
 """
     decision = RecoveryDecision(
         status=RecoveryDecisionStatus.PROPOSED_FIX,
-        scope=RecoveryScope.COMPONENT,
+        failure_kind=FailureKind.COMPONENT_LOCAL,
         root_cause="The chart rejected one non-standard image.",
         patch=patch,
         risk=RecoveryRisk.MEDIUM,
@@ -278,7 +280,7 @@ def test_image_verification_bypass_names_the_exact_image_for_approval(tmp_path: 
     agent = RecoveryAgent(
         classifier=Classifier(),
         probe_runner=ProbeRunner(command_runner=lambda *_args: (0, "ok")),
-        sandbox=PatchSandbox(tmp_path / "sandboxes"),
+        sandbox_root=tmp_path / "sandboxes",
         model="test-model",
     )
     resolution = agent.resolve(
@@ -311,3 +313,62 @@ def test_image_verification_bypass_names_the_exact_image_for_approval(tmp_path: 
     assert resolution.approval_items == (
         "image: docker.io/mosipid/minio:2025.2.28-debian-12-r1",
     )
+
+
+def test_recovery_agent_requires_approval_for_source_grounded_plan_update(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "prepare.sh").write_text("#!/bin/bash\nprintf ready\n", encoding="utf-8")
+    decision = RecoveryDecision(
+        status=RecoveryDecisionStatus.PROPOSED_FIX,
+        failure_kind=FailureKind.MISSING_WORKFLOW_STEP,
+        root_cause="The preparation step was omitted.",
+        plan_update=WorkflowPlanUpdate(
+            kind=PlanUpdateKind.INSERT_BEFORE,
+            reason="Run the repository's preparation script.",
+            executor="shell",
+            source_ref={"repo_id": "fixture", "path": "prepare.sh"},
+            working_directory=".",
+            command="./prepare.sh",
+        ),
+        risk=RecoveryRisk.LOW,
+        requires_human_approval=False,
+    )
+
+    class Classifier:
+        def classify(self, **_kwargs: object) -> ClassificationOutcome[RecoveryDecision]:
+            return ClassificationOutcome(decision, "deployment_recovery", "llm", {}, 80)
+
+    agent = RecoveryAgent(
+        classifier=Classifier(),
+        probe_runner=ProbeRunner(command_runner=lambda *_args: (0, "ok")),
+        sandbox_root=tmp_path / "sandboxes",
+        model="test-model",
+    )
+    resolution = agent.resolve(
+        RecoveryFailure(
+            id="S002-attempt-1",
+            step_id="S002",
+            block_id="B2",
+            component_ids=("C002_application",),
+            executor="shell",
+            command="./deploy.sh",
+            repo_id="fixture",
+            source_path="prepare.sh",
+            source_root=source,
+            working_directory=source,
+            attempt=1,
+            exit_code=1,
+            timed_out=False,
+            duration_seconds=1.0,
+            output_excerpt="preparation is missing",
+        )
+    )
+
+    assert resolution.status == RecoveryStatus.NEEDS_HUMAN
+    assert resolution.failure_kind == FailureKind.MISSING_WORKFLOW_STEP
+    assert resolution.plan_update == decision.plan_update
+    assert resolution.validation is not None
+    assert resolution.validation.succeeded
