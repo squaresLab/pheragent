@@ -60,6 +60,7 @@ class KubernetesResource(ContractModel):
     ready: int | None = Field(default=None, ge=0)
     desired: int | None = Field(default=None, ge=0)
     images: list[str] = Field(default_factory=list)
+    is_default: bool | None = None
 
 
 class KubernetesRuntimeContext(ContractModel):
@@ -73,6 +74,7 @@ class KubernetesRuntimeContext(ContractModel):
     services: list[KubernetesResource] = Field(default_factory=list)
     config_maps: list[KubernetesResource] = Field(default_factory=list)
     storage_classes: list[KubernetesResource] = Field(default_factory=list)
+    csi_drivers: list[KubernetesResource] = Field(default_factory=list)
     ingress_classes: list[KubernetesResource] = Field(default_factory=list)
     custom_resource_definitions: list[KubernetesResource] = Field(default_factory=list)
     helm_releases: list[KubernetesResource] = Field(default_factory=list)
@@ -145,13 +147,28 @@ def compact_runtime_context(snapshot: RuntimeContextSnapshot | None) -> dict[str
             "namespaces": kubernetes.namespaces[:_MAX_PROMPT_ITEMS],
             "nodes": _prompt_resources(kubernetes.nodes),
             "workloads": _prompt_resources(kubernetes.workloads, limit=75),
+            "services": _prompt_resources(kubernetes.services),
             "config_maps": _prompt_resources(kubernetes.config_maps),
             "storage_classes": _prompt_resources(kubernetes.storage_classes),
+            "csi_drivers": _prompt_resources(kubernetes.csi_drivers),
             "ingress_classes": _prompt_resources(kubernetes.ingress_classes),
+            "custom_resource_definitions": _prompt_resources(
+                kubernetes.custom_resource_definitions
+            ),
             "helm_releases": _prompt_resources(kubernetes.helm_releases),
         },
+        "probe_results": [
+            probe.model_dump(
+                mode="json",
+                include={"provider", "name", "succeeded", "error"},
+                exclude_none=True,
+            )
+            for probe in snapshot.probes
+        ],
         "interpretation": (
-            "Observed resource existence is not proof of health or deployment intent."
+            "Facts apply only to the named context at captured_at. A successful empty probe means "
+            "none were observed; a failed probe means unknown. Existence alone is not proof of "
+            "health or deployment intent."
         ),
     }
 
@@ -214,6 +231,7 @@ def _inspect_kubernetes(
         "services": ("get", "services", "-A"),
         "config_maps": ("get", "configmaps", "-A"),
         "storage_classes": ("get", "storageclasses"),
+        "csi_drivers": ("get", "csidrivers"),
         "ingress_classes": ("get", "ingressclasses"),
         "custom_resource_definitions": ("get", "crds"),
     }
@@ -265,6 +283,7 @@ def _inspect_kubernetes(
         services=resources.get("services", [])[:_MAX_ITEMS],
         config_maps=resources.get("config_maps", [])[:_MAX_ITEMS],
         storage_classes=resources.get("storage_classes", [])[:_MAX_ITEMS],
+        csi_drivers=resources.get("csi_drivers", [])[:_MAX_ITEMS],
         ingress_classes=resources.get("ingress_classes", [])[:_MAX_ITEMS],
         custom_resource_definitions=resources.get("custom_resource_definitions", [])[:_MAX_ITEMS],
         helm_releases=helm_releases[:_MAX_ITEMS],
@@ -380,6 +399,7 @@ def _kubernetes_resources(document: Any) -> list[KubernetesResource]:
                 ready=ready,
                 desired=desired,
                 images=_container_images(item),
+                is_default=_is_default_storage_class(kind, metadata),
             )
         )
     return sorted(resources, key=lambda item: (item.namespace or "", item.kind, item.name))
@@ -444,6 +464,19 @@ def _container_images(item: dict[str, Any]) -> list[str]:
     )
 
 
+def _is_default_storage_class(kind: str, metadata: dict[str, Any]) -> bool | None:
+    if kind != "StorageClass":
+        return None
+    annotations = metadata.get("annotations", {})
+    return any(
+        annotations.get(key) == "true"
+        for key in (
+            "storageclass.kubernetes.io/is-default-class",
+            "storageclass.beta.kubernetes.io/is-default-class",
+        )
+    )
+
+
 def _string(document: Any, key: str) -> str | None:
     value = document.get(key) if isinstance(document, dict) else None
     return value if isinstance(value, str) else None
@@ -463,7 +496,4 @@ def _prompt_resources(
     *,
     limit: int = _MAX_PROMPT_ITEMS,
 ) -> list[dict[str, Any]]:
-    return [
-        resource.model_dump(mode="json", exclude_none=True)
-        for resource in resources[:limit]
-    ]
+    return [resource.model_dump(mode="json", exclude_none=True) for resource in resources[:limit]]

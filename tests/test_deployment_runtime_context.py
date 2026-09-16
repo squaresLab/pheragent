@@ -22,25 +22,58 @@ def test_runtime_inspection_uses_fixed_read_only_probes(tmp_path: Path) -> None:
             payload = {"Account": "123", "Arn": "arn:aws:iam::123:user/test"}
         elif "describe-instances" in command:
             payload = {
-                "Reservations": [{"Instances": [{
-                    "InstanceId": "i-1",
-                    "State": {"Name": "running"},
-                    "Tags": [{"Key": "Name", "Value": "worker-1"}],
-                }]}]
+                "Reservations": [
+                    {
+                        "Instances": [
+                            {
+                                "InstanceId": "i-1",
+                                "State": {"Name": "running"},
+                                "Tags": [{"Key": "Name", "Value": "worker-1"}],
+                            }
+                        ]
+                    }
+                ]
             }
         elif "version" in command:
             payload = {"serverVersion": {"gitVersion": "v1.36.3"}}
         elif "namespaces" in command:
             payload = {"items": [{"kind": "Namespace", "metadata": {"name": "keycloak"}}]}
         elif "deployments,statefulsets,daemonsets,jobs,cronjobs" in command:
-            payload = {"items": [{
-                "kind": "Deployment",
-                "metadata": {"name": "keycloak", "namespace": "keycloak"},
-                "spec": {"replicas": 1, "template": {"spec": {"containers": [
-                    {"image": "keycloak:latest"}
-                ]}}},
-                "status": {"readyReplicas": 1},
-            }]}
+            payload = {
+                "items": [
+                    {
+                        "kind": "Deployment",
+                        "metadata": {"name": "keycloak", "namespace": "keycloak"},
+                        "spec": {
+                            "replicas": 1,
+                            "template": {"spec": {"containers": [{"image": "keycloak:latest"}]}},
+                        },
+                        "status": {"readyReplicas": 1},
+                    }
+                ]
+            }
+        elif "storageclasses" in command:
+            payload = {
+                "items": [
+                    {
+                        "kind": "StorageClass",
+                        "metadata": {
+                            "name": "longhorn",
+                            "annotations": {"storageclass.kubernetes.io/is-default-class": "true"},
+                        },
+                        "provisioner": "driver.longhorn.io",
+                    }
+                ]
+            }
+        elif "csidrivers" in command:
+            payload = {
+                "items": [
+                    {
+                        "kind": "CSIDriver",
+                        "metadata": {"name": "driver.longhorn.io"},
+                    }
+                ]
+            }
         elif command[0] == "helm":
             payload = [{"name": "istio", "namespace": "istio-system", "status": "deployed"}]
         else:
@@ -55,6 +88,8 @@ def test_runtime_inspection_uses_fixed_read_only_probes(tmp_path: Path) -> None:
     assert snapshot.aws.instances[0].name == "worker-1"
     assert snapshot.kubernetes.server_version == "v1.36.3"
     assert snapshot.kubernetes.workloads[0].ready == 1
+    assert snapshot.kubernetes.storage_classes[0].is_default is True
+    assert snapshot.kubernetes.csi_drivers[0].name == "driver.longhorn.io"
     assert snapshot.kubernetes.helm_releases[0].name == "istio"
     assert all(probe.succeeded for probe in snapshot.probes)
     assert all(
@@ -66,7 +101,13 @@ def test_runtime_inspection_uses_fixed_read_only_probes(tmp_path: Path) -> None:
     path = tmp_path / "runtime-context.json"
     write_json(path, snapshot)
     assert load_runtime_context(path) == snapshot
-    assert "probes" not in compact_runtime_context(snapshot)
+    prompt_context = compact_runtime_context(snapshot)
+    assert prompt_context is not None
+    assert prompt_context["kubernetes"]["services"] == []
+    assert prompt_context["kubernetes"]["custom_resource_definitions"] == []
+    assert prompt_context["kubernetes"]["storage_classes"][0]["is_default"] is True
+    assert prompt_context["kubernetes"]["csi_drivers"][0]["name"] == "driver.longhorn.io"
+    assert prompt_context["probe_results"][0]["succeeded"] is True
 
 
 def test_runtime_inspection_records_partial_failures() -> None:
@@ -77,5 +118,5 @@ def test_runtime_inspection_records_partial_failures() -> None:
 
     assert not snapshot.aws.available
     assert not snapshot.kubernetes.available
-    assert len(snapshot.probes) == 12
+    assert len(snapshot.probes) == 13
     assert all(probe.error == "token=[REDACTED]" for probe in snapshot.probes)
