@@ -307,10 +307,14 @@ class RunWorkspace:
             raise ValueError(f"unknown run-workspace source: {source_id}") from exc
         changed_files = _validate_patch(patch)
         with self._lock:
-            checked = _command(["git", "apply", "--check", "-"], source, input_text=patch)
+            checked = _command(
+                ["git", "apply", "--check", "--recount", "-"],
+                source,
+                input_text=patch,
+            )
             if checked.returncode:
                 raise ValueError(f"accepted patch is stale: {_output(checked)}")
-            applied = _command(["git", "apply", "-"], source, input_text=patch)
+            applied = _command(["git", "apply", "--recount", "-"], source, input_text=patch)
             if applied.returncode:
                 raise ValueError(f"could not promote accepted patch: {_output(applied)}")
             self._changed_files[source_id].update(changed_files)
@@ -366,10 +370,14 @@ def validate_patch(source_root: Path, patch: str, sandbox_root: Path) -> PatchVa
             candidate = workspace / path
             candidate.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(original, candidate)
-        applied = _command(["git", "apply", "--check", "-"], workspace, input_text=patch)
+        applied = _command(
+            ["git", "apply", "--check", "--recount", "-"],
+            workspace,
+            input_text=patch,
+        )
         if applied.returncode:
             return PatchValidation(False, (), _output(applied))
-        applied = _command(["git", "apply", "-"], workspace, input_text=patch)
+        applied = _command(["git", "apply", "--recount", "-"], workspace, input_text=patch)
         if applied.returncode:
             return PatchValidation(False, (), _output(applied))
         checks: list[str] = ["git.apply"]

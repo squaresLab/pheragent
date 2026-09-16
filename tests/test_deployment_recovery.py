@@ -102,6 +102,26 @@ def test_patch_sandbox_validates_without_changing_source(tmp_path: Path) -> None
     assert list((tmp_path / "sandboxes").iterdir()) == []
 
 
+def test_patch_sandbox_recounts_llm_diff_hunks(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    script = source / "install.sh"
+    script.write_text("#!/bin/bash\nprintf old\\n\n", encoding="utf-8")
+    patch = """\
+--- a/install.sh
++++ b/install.sh
+@@ -1,3 +1,3 @@
+ #!/bin/bash
+-printf old\\n
++printf new\\n
+"""
+
+    validation = validate_patch(source, patch, tmp_path / "sandboxes")
+
+    assert validation.succeeded is True
+    assert script.read_text(encoding="utf-8") == "#!/bin/bash\nprintf old\\n\n"
+
+
 def test_run_workspace_promotes_patch_without_changing_source(tmp_path: Path) -> None:
     source = tmp_path / "source"
     source.mkdir()
@@ -110,7 +130,7 @@ def test_run_workspace_promotes_patch_without_changing_source(tmp_path: Path) ->
     patch = """\
 --- a/install.sh
 +++ b/install.sh
-@@ -1,2 +1,2 @@
+@@ -1,3 +1,3 @@
  #!/bin/bash
 -printf old\\n
 +printf new\\n
