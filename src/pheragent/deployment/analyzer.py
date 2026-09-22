@@ -393,7 +393,9 @@ def run_repository_analysis(
     if synthesis is not None and not synthesis.unresolved:
         stop_reason = "complete"
 
-    signals = settled_signals
+    signals, rejected = _retain_executable_components(settled_signals)
+    if rejected:
+        warnings.append(f"excluded {rejected} component candidate(s) without deployment commands")
 
     investigation = InvestigationResult(
         plan_input=plan_input,
@@ -446,6 +448,47 @@ def run_repository_analysis(
         runtime_context=config.runtime_context,
         runtime_reconciliation=runtime_reconciliation,
     )
+
+
+def _retain_executable_components(
+    signals: DeploymentSignalBundle,
+) -> tuple[DeploymentSignalBundle, int]:
+    """Keep the product plan limited to components HerAgent can actually run."""
+    candidates = [
+        component
+        for component in signals.candidate_components
+        if component.deployment and component.deployment.command
+    ]
+    kept = {component.id for component in candidates}
+    known = {component.id for component in signals.candidate_components}
+    candidates = [
+        component.model_copy(update={"installed_by": None})
+        if component.installed_by not in kept
+        else component
+        for component in candidates
+    ]
+    return signals.model_copy(
+        update={
+            "candidate_components": candidates,
+            "deployment_actions": [
+                action
+                for action in signals.deployment_actions
+                if action.source_candidate_id in kept and action.owner_component_id in kept
+            ],
+            "relations": [
+                relation
+                for relation in signals.relations
+                if not ({relation.source, relation.target} & (known - kept))
+            ],
+            "deployment_stages": [
+                stage.model_copy(
+                    update={"component_ids": [item for item in stage.component_ids if item in kept]}
+                )
+                for stage in signals.deployment_stages
+                if set(stage.component_ids) & kept
+            ],
+        }
+    ), len(known - kept)
 
 
 def _load_context(path: Path) -> DeploymentContext:

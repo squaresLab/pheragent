@@ -421,7 +421,8 @@ def test_compose_preserves_health_dependency(tmp_path: Path) -> None:
     repository = tmp_path / "compose-repository"
     repository.mkdir()
     (repository / "compose.yaml").write_text(
-        """services:
+        """# Default deployment: docker compose -f compose.yaml up
+services:
   database:
     image: postgres:16
     healthcheck:
@@ -584,7 +585,7 @@ ansible-playbook playbooks/postgresql.yml
     assert all(item.source_ref.path == "deployment.md" for item in components.values())
 
 
-def test_terraform_and_ansible_preserve_explicit_vs_order_semantics(
+def test_commandless_terraform_and_ansible_units_are_excluded(
     tmp_path: Path,
 ) -> None:
     repository = tmp_path / "structured-repository"
@@ -617,25 +618,12 @@ module \"cluster\" {
         )
     )
 
-    relations = result.signals.relations
-    component_ids = {item.name.casefold(): item.id for item in result.signals.candidate_components}
-    assert any(
-        item.source == component_ids["cluster"]
-        and item.target == component_ids["network"]
-        and item.relation == "requires"
-        and item.strength == "explicit_dependency"
-        for item in relations
-    )
-    assert any(
-        item.source == component_ids["database"]
-        and item.target == component_ids["application"]
-        and item.relation == "ordered_before"
-        and item.strength == "declared_order"
-        for item in relations
-    )
+    assert result.signals.candidate_components == []
+    assert result.signals.relations == []
+    assert any("without deployment commands" in warning for warning in result.warnings)
 
 
-def test_terraform_resources_are_reduced_to_a_grounded_stack_candidate(
+def test_commandless_terraform_stack_is_excluded(
     tmp_path: Path,
 ) -> None:
     repository = tmp_path / "terraform-repository"
@@ -659,18 +647,10 @@ resource "aws_secretsmanager_secret" "credentials" {}
         )
     )
 
-    assert len(result.signals.candidate_components) == 1
-    candidate = result.signals.candidate_components[0]
-    assert candidate.name == "Database Infrastructure"
-    assert candidate.deployment.executor == "terraform"
-    assert candidate.materialized_names == [
-        "aws_db_instance.primary",
-        "aws_security_group.database",
-        "aws_secretsmanager_secret.credentials",
-    ]
+    assert result.signals.candidate_components == []
 
 
-def test_helm_kustomize_flux_and_argo_are_materialized_units(tmp_path: Path) -> None:
+def test_commandless_declarative_units_are_excluded(tmp_path: Path) -> None:
     repository = tmp_path / "gitops-repository"
     (repository / "charts/platform").mkdir(parents=True)
     (repository / "overlays/prod").mkdir(parents=True)
@@ -735,9 +715,7 @@ spec:
         )
     )
 
-    components = {item.name: item for item in result.signals.candidate_components}
-    assert {"Platform", "Redis", "Prod", "Web Api"} <= set(components)
-    assert components["Platform"].deployment.executor == "helm"
+    assert result.signals.candidate_components == []
 
     gitops_result = run_repository_analysis(
         AnalysisConfig(
@@ -748,12 +726,4 @@ spec:
             llm_enabled=False,
         )
     )
-    gitops_components = {item.name: item for item in gitops_result.signals.candidate_components}
-    assert {"Application", "Delivery"} <= set(gitops_components)
-    assert gitops_components["Delivery"].deployment.executor == "gitops"
-    assert any(
-        item.source == gitops_components["Application"].id
-        and item.target == "platform"
-        and item.relation == "health_gated_by"
-        for item in gitops_result.signals.relations
-    )
+    assert gitops_result.signals.candidate_components == []

@@ -143,6 +143,7 @@ class _ParsedArtifact:
     invocation_sequence: list[_ShellInvocation] = field(default_factory=list)
     validations: list[ValidationSignal] = field(default_factory=list)
     structured_components: list[tuple[str, AnalysisExecutor, int]] = field(default_factory=list)
+    component_commands: dict[int, str] = field(default_factory=dict)
     explicit_relations: list[AnalysisRelation] = field(default_factory=list)
     structural_score: float = 0.0
     compose_invocation: _ComposeInvocation | None = None
@@ -609,6 +610,9 @@ def _parse_markdown(artifact: _ParsedArtifact, text: str) -> None:
             if documented is not None:
                 component_name, executor = documented
                 artifact.structured_components.append((component_name, executor, line_number))
+                command = line.strip().strip("`").strip()
+                if _DEPLOYMENT_TOOL.match(command):
+                    artifact.component_commands[line_number] = command
     compose_invocation = _select_compose_invocation(artifact.path, text)
     if compose_invocation is not None:
         artifact.compose_invocation = compose_invocation
@@ -1428,6 +1432,28 @@ def _artifact_component_candidates(
         invocation, operation_source_ref = (
             compose_binding if compose_binding is not None else (None, None)
         )
+        documented_command = artifact.component_commands.get(line)
+        is_compose_command = executor == AnalysisExecutor.DOCKER_COMPOSE and invocation is not None
+        command = invocation.command if is_compose_command else documented_command
+        working_directory = (
+            invocation.working_directory
+            if is_compose_command
+            else PurePosixPath(artifact.path).parent.as_posix()
+            if command
+            else None
+        )
+        command_source = (
+            operation_source_ref
+            if is_compose_command
+            else AnalysisSourceRef(
+                repo_id=artifact.source_id,
+                path=artifact.path,
+                start_line=line,
+                end_line=line,
+            )
+            if command
+            else None
+        )
         candidates.append(
             _candidate_component(
                 source_id=artifact.source_id,
@@ -1437,19 +1463,9 @@ def _artifact_component_candidates(
                 executor=executor,
                 artifact_roles=sorted(artifact.roles),
                 artifact_scope=artifact.scope,
-                command=(
-                    invocation.command
-                    if executor == AnalysisExecutor.DOCKER_COMPOSE and invocation is not None
-                    else None
-                ),
-                working_directory=(
-                    invocation.working_directory
-                    if executor == AnalysisExecutor.DOCKER_COMPOSE and invocation is not None
-                    else None
-                ),
-                operation_source_ref=(
-                    operation_source_ref if executor == AnalysisExecutor.DOCKER_COMPOSE else None
-                ),
+                command=command,
+                working_directory=working_directory,
+                operation_source_ref=command_source,
             )
         )
     if terraform_resources:

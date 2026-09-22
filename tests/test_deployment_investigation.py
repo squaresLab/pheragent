@@ -708,7 +708,7 @@ def test_source_grounded_validation_gates_dependent_components(
     assert app.id not in worker.after
 
 
-def test_ungrounded_semantic_action_is_retained_but_blocked(
+def test_documented_semantic_action_uses_its_grounded_command(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -767,10 +767,8 @@ def test_ungrounded_semantic_action_is_retained_but_blocked(
     )
     assert tenant.disposition == "implementation_detail"
     action_step = next(step for step in result.workflow.steps if step.kind == "action")
-    assert action_step.status == "blocked"
-    assert "grounded invocation" in action_step.blockers[0]
-    assert any("retained blocked action" in warning for warning in result.warnings)
-    assert any("retained and blocked" in question.reason for question in result.workflow.unresolved)
+    assert action_step.status == "ready"
+    assert action_step.command == "kubectl apply -f tenant.yaml"
 
 
 def test_dynamic_scan_includes_unreferenced_installers(tmp_path: Path) -> None:
@@ -1331,9 +1329,7 @@ def test_llm_can_add_a_documented_external_requirement_missing_from_repo_candida
         )
     )
 
-    smtp = next(item for item in result.signals.candidate_components if item.name == "SMTP")
-    assert smtp.disposition == "external_dependency"
-    assert smtp.deployable is False
+    assert all(item.name != "SMTP" for item in result.signals.candidate_components)
     assert any(item.name == "SMTP" for item in result.signals.external_requirements)
 
 
