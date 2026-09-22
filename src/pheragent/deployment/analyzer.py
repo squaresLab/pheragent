@@ -22,7 +22,6 @@ from .analysis_models import (
     DeploymentSignalBundle,
     DeploymentWorkflow,
     FunctionalBlocksDocument,
-    GoldDefinition,
     ReferenceNode,
     RepositoryFile,
 )
@@ -31,7 +30,7 @@ from .discovery import (
     bind_retrieved_installation_routes,
     discover_repository,
 )
-from .enums import AnalysisTreatment, SourceKind
+from .enums import SourceKind
 from .evidence import (
     EvidenceBudget,
     collect_investigation_evidence,
@@ -50,14 +49,24 @@ from .investigation import (
     reconcile_investigation_synthesis,
     synthesize_investigation_with_llm,
 )
-from .investigation_models import InvestigationQuery, SourcePurpose, default_investigation_plan
-from .knowledge_graph import (
-    DeploymentKnowledgeGraph,
-    graph_gap_queries,
-    project_deployment_knowledge,
+from .investigation_models import (
+    InvestigationPurpose,
+    InvestigationQuery,
+    SourcePurpose,
+    SourceScope,
+    default_investigation_plan,
 )
 from .models import RepositoryInventory, SourcesConfig, SourceSpec
-from .runtime_context import RuntimeContextSnapshot, compact_runtime_context
+from .reconciliation import (
+    CapabilityStatus,
+    RuntimeReconciliation,
+    apply_runtime_reconciliation,
+    reconcile_provided_capabilities,
+)
+from .runtime_context import (
+    RuntimeContextSnapshot,
+    compact_runtime_context,
+)
 from .source_manager import AcquisitionResult, SourceManager
 from .workflow import build_deployment_workflow
 
@@ -76,7 +85,6 @@ class AnalysisConfig:
     node_budget: int = 200
     strict: bool = False
     source_timeout: float = 900.0
-    gold_path: Path | None = None
     model: str = DEFAULT_ANALYSIS_MODEL
     api_key_env: str = "OPENAI_API_KEY"
     base_url_env: str = "OPENAI_BASE_URL"
@@ -91,7 +99,6 @@ class AnalysisConfig:
     llm_enabled: bool = True
     investigation_max_observations: int = 32
     investigation_max_evidence_chars: int = 18_000
-    treatment: AnalysisTreatment = AnalysisTreatment.HYBRID
     sources: SourcesConfig | None = None
     runtime_context: RuntimeContextSnapshot | None = None
 
@@ -113,11 +120,10 @@ class AnalysisResult:
     llm_usage: dict[str, int]
     llm_stage_statuses: dict[str, str]
     llm_failure_history_paths: tuple[Path, ...]
-    knowledge_graph: DeploymentKnowledgeGraph | None
-    graph_queries: tuple[str, ...]
     retrieval_queries: tuple[InvestigationQuery, ...]
     evidence_characters: int
     runtime_context: RuntimeContextSnapshot | None
+    runtime_reconciliation: RuntimeReconciliation | None
 
 
 def run_repository_analysis(
@@ -128,6 +134,18 @@ def run_repository_analysis(
     """Orchestrates Phase 1 while keeping discovery and model judgment separate."""
     notify = progress or (lambda _message: None)
     context = _load_context(config.context_path)
+    runtime_reconciliation = (
+        reconcile_provided_capabilities(context, config.runtime_context)
+        if config.runtime_context
+        else None
+    )
+    incomplete_provided_blocks = {
+        check.block_id
+        for check in runtime_reconciliation.checks
+        if check.status == CapabilityStatus.MISSING
+    } if runtime_reconciliation else set()
+    if runtime_reconciliation is not None:
+        context = apply_runtime_reconciliation(context, runtime_reconciliation)
     sources_config = config.sources or _sources_config(
         config.repositories,
         config.documentation,
@@ -159,25 +177,21 @@ def run_repository_analysis(
     selected = discovery.selected_paths
     signals = discovery.signals
     warnings = list(discovery.warnings)
+    missing_capabilities = [
+        check.capability
+        for check in runtime_reconciliation.checks
+        if check.status == CapabilityStatus.MISSING
+    ] if runtime_reconciliation else []
+    if missing_capabilities:
+        warnings.append(
+            "runtime probes disproved provided capability claim(s): "
+            + ", ".join(missing_capabilities)
+        )
     outlines = discovery.outlines
     notify(f"extracting deterministic evidence from {len(files)} file(s)")
 
-    knowledge_graph = None
-    guided_queries = ()
-    if config.treatment == AnalysisTreatment.HYBRID_GRAPH:
-        knowledge_graph = project_deployment_knowledge(
-            signals,
-            list(nodes),
-            list(reference_relations),
-        )
-        guided_queries = graph_gap_queries(knowledge_graph)
-        notify(
-            f"projected {len(knowledge_graph.nodes)} graph node(s), "
-            f"{len(knowledge_graph.edges)} edge(s), and {len(knowledge_graph.gaps)} gap(s)"
-        )
-
     llm_config = AnalysisLLMConfig(
-        enabled=(config.llm_enabled and config.treatment != AnalysisTreatment.DETERMINISTIC),
+        enabled=config.llm_enabled,
         model=config.model,
         api_key_env=config.api_key_env,
         base_url_env=config.base_url_env,
@@ -195,6 +209,10 @@ def run_repository_analysis(
 
     notify(f"selected {len(roots)} deployment root(s) and {len(selected)} evidence node(s)")
     runtime_context = compact_runtime_context(config.runtime_context)
+    if runtime_context is not None and runtime_reconciliation is not None:
+        runtime_context["provided_capability_checks"] = [
+            check.model_dump(mode="json") for check in runtime_reconciliation.checks
+        ]
     plan_input = build_plan_input(
         context,
         outlines,
@@ -209,7 +227,7 @@ def run_repository_analysis(
 
     retrieval_queries = schedule_investigation_queries(
         plan,
-        guided_queries=guided_queries,
+        guided_queries=_runtime_gap_queries(runtime_reconciliation),
     )
     notify(f"running {len(retrieval_queries)} bounded read-only retrieval queries")
     observations, mandatory_probes = collect_investigation_evidence(
@@ -250,6 +268,7 @@ def run_repository_analysis(
         context=context,
         evidence_ids={observation.id for observation in observations},
         classifier=classifier,
+        incomplete_provided_blocks=incomplete_provided_blocks,
     )
     synthesis = synthesis_outcome.value
     if synthesis is not None:
@@ -258,6 +277,7 @@ def run_repository_analysis(
             components=signals.candidate_components,
             context=context,
             evidence_ids={observation.id for observation in observations},
+            incomplete_provided_blocks=incomplete_provided_blocks,
         )
         warnings.extend(reconciliation_warnings)
     if synthesis_outcome.warning:
@@ -340,6 +360,7 @@ def run_repository_analysis(
             context=context,
             evidence_ids={observation.id for observation in observations},
             classifier=classifier,
+            incomplete_provided_blocks=incomplete_provided_blocks,
             stage=f"investigation_synthesis_{synthesis_rounds + 1}",
         )
         outcomes.append(next_outcome)
@@ -353,6 +374,7 @@ def run_repository_analysis(
             components=settled_signals.candidate_components,
             context=context,
             evidence_ids={observation.id for observation in observations},
+            incomplete_provided_blocks=incomplete_provided_blocks,
         )
         warnings.extend(next_warnings)
         if len(next_synthesis.unresolved) >= len(synthesis.unresolved):
@@ -397,17 +419,9 @@ def run_repository_analysis(
         documentation_expected=(SourcePurpose.DOCUMENTATION in source_purposes.values()),
     )
 
-    gold = _load_gold(config.gold_path)
     usage = aggregate_usage(*outcomes)
     statuses = {outcome.stage: outcome.status for outcome in outcomes}
-    document = build_functional_blocks(
-        context,
-        signals,
-        source_by_id,
-        gold,
-        llm_usage=usage,
-        llm_stage_statuses=statuses,
-    )
+    document = build_functional_blocks(context, signals)
     failure_paths = tuple(
         path for path in (outcome.failure_history_path for outcome in outcomes) if path is not None
     )
@@ -427,11 +441,10 @@ def run_repository_analysis(
         llm_usage=usage,
         llm_stage_statuses=statuses,
         llm_failure_history_paths=failure_paths,
-        knowledge_graph=knowledge_graph,
-        graph_queries=tuple(query.reason_code for query in guided_queries),
         retrieval_queries=tuple(all_queries),
         evidence_characters=sum(len(observation.excerpt or "") for observation in observations),
         runtime_context=config.runtime_context,
+        runtime_reconciliation=runtime_reconciliation,
     )
 
 
@@ -443,14 +456,28 @@ def _load_context(path: Path) -> DeploymentContext:
     return DeploymentContext.model_validate(payload)
 
 
-def _load_gold(path: Path | None) -> GoldDefinition | None:
-    if path is None:
-        return None
-    resolved = path.expanduser().resolve()
-    payload = yaml.safe_load(resolved.read_text(encoding="utf-8"))
-    if not isinstance(payload, dict):
-        raise ValueError("gold definition must contain a YAML mapping")
-    return GoldDefinition.model_validate(payload)
+def _runtime_gap_queries(
+    reconciliation: RuntimeReconciliation | None,
+) -> tuple[InvestigationQuery, ...]:
+    if reconciliation is None:
+        return ()
+    return tuple(
+        InvestigationQuery(
+            id=f"runtime-gap-{index:02d}",
+            purpose=InvestigationPurpose.MISSING_COMPONENTS,
+            terms=[check.capability.replace("-", " "), "install", "setup"],
+            source_scope=SourceScope.BOTH,
+            reason_code="RUNTIME_CAPABILITY_MISSING",
+        )
+        for index, check in enumerate(
+            (
+                check
+                for check in reconciliation.checks
+                if check.status == CapabilityStatus.MISSING
+            ),
+            start=1,
+        )
+    )
 
 
 def _sources_config(

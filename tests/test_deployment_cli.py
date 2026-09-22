@@ -7,7 +7,6 @@ import pytest
 from pheragent.cli import _build_parser
 from pheragent.deployment.analysis_llm import DEFAULT_ANALYSIS_MODEL
 from pheragent.deployment.cli import _analysis_config, _terminal_approval
-from pheragent.deployment.enums import AnalysisTreatment
 from pheragent.deployment.recovery import RecoveryResolution, RecoveryStatus
 
 
@@ -40,7 +39,7 @@ def test_deployment_analyze_can_force_fresh_llm_requests(
     assert args.refresh_llm is True
     assert args.llm_reasoning_effort == "low"
     config = _analysis_config(args, tmp_path)
-    assert config.treatment == AnalysisTreatment.HYBRID
+    assert config.llm_enabled is True
     assert config.model == DEFAULT_ANALYSIS_MODEL
 
 
@@ -102,10 +101,8 @@ def test_deployment_runtime_inspection_options(tmp_path: Path) -> None:
     assert args.kube_context == "mosip"
 
 
-@pytest.mark.parametrize("research_option", ["--treatment", "--gold"])
-def test_deployment_analyze_hides_research_options(
+def test_deployment_analyze_hides_research_treatment(
     tmp_path: Path,
-    research_option: str,
 ) -> None:
     parser = _build_parser()
 
@@ -118,7 +115,7 @@ def test_deployment_analyze_hides_research_options(
                 str(tmp_path / "context.yaml"),
                 "--output",
                 str(tmp_path / "output"),
-                research_option,
-                "a2" if research_option == "--treatment" else "gold.yaml",
+                "--treatment",
+                "a1",
             ]
         )

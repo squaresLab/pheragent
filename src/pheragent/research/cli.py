@@ -7,10 +7,14 @@ from typing import Any
 
 from pydantic import ValidationError
 
-from pheragent.deployment.enums import AnalysisTreatment
-
-from .evaluation import summarize_study
-from .runner import describe_study, load_study, run_study, validate_study_inputs
+from .runner import (
+    ResearchTreatment,
+    describe_study,
+    load_study,
+    run_study,
+    summarize_study,
+    validate_study_inputs,
+)
 
 
 def add_research_parser(subparsers: Any) -> None:
@@ -26,7 +30,7 @@ def add_research_parser(subparsers: Any) -> None:
     run.add_argument(
         "--treatment",
         action="append",
-        choices=tuple(item.value for item in AnalysisTreatment),
+        choices=tuple(item.value for item in ResearchTreatment),
         default=[],
     )
     run.add_argument("--repetitions", type=_positive_int, default=None)
@@ -48,7 +52,7 @@ def run_research_command(args: argparse.Namespace) -> int:
             return 0
         if args.research_command != "run":
             raise ValueError(f"unsupported research command: {args.research_command}")
-        selected_treatments = {AnalysisTreatment(value) for value in args.treatment} or None
+        selected_treatments = {ResearchTreatment(value) for value in args.treatment} or None
         selected_cases = set(args.case) or None
         study = load_study(args.study)
         validate_study_inputs(args.study, study, selected_cases=selected_cases)

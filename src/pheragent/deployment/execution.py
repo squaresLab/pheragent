@@ -9,36 +9,30 @@ import sys
 import threading
 import time
 from collections import deque
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any, Protocol
 
-from pheragent.utils import slugify
-
 from .analysis_models import (
+    DeploymentActionType,
     DeploymentWorkflow,
     DeploymentWorkflowStep,
     FunctionalBlock,
     FunctionalBlocksDocument,
-    FunctionalComponent,
-    FunctionalDeployRef,
     WorkflowStepKind,
     WorkflowStepStatus,
-    WorkflowTarget,
 )
 from .errors import (
     DeploymentInputError,
     WorkflowExecutionError,
     WorkflowNotExecutableError,
 )
-from .graph import topological_levels
+from .reconciliation import apply_plan_update, invalidated_completed_steps
 from .recovery import (
-    PlanUpdateKind,
     RecoveryFailure,
     RecoveryResolution,
     RecoveryStatus,
-    WorkflowPlanUpdate,
 )
 from .redaction import redact_secrets
 from .serialization import load_yaml, write_json, write_text
@@ -116,6 +110,17 @@ class ExecutionAttempt:
 
 
 @dataclass(frozen=True, slots=True)
+class ComponentState:
+    """Observed deployment state for one workflow component."""
+
+    component_id: str
+    name: str
+    status: str
+    confidence: str
+    validation_steps: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
 class ExecutionReport:
     """Final outcome after every runnable dependency branch has been attempted."""
 
@@ -127,10 +132,17 @@ class ExecutionReport:
     failures_seen: tuple[RecoveryFailure, ...] = ()
     workflow: DeploymentWorkflow | None = None
     functional_blocks: FunctionalBlocksDocument | None = None
+    component_states: tuple[ComponentState, ...] = ()
 
     @property
     def successful(self) -> bool:
         return not self.failed and not self.skipped
+
+    @property
+    def verified(self) -> bool:
+        return self.successful and all(
+            state.status == "verified" for state in self.component_states
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -309,6 +321,13 @@ def _execute_operations(
     pending_approvals: deque[RecoveryResolution] = deque()
 
     def report() -> ExecutionReport:
+        component_states = _component_states(
+            workflow,
+            selected=set(states),
+            completed=set(completed),
+            failed=set(failed),
+            skipped=set(skipped),
+        )
         return ExecutionReport(
             tuple(completed),
             tuple(failed.values()),
@@ -317,7 +336,8 @@ def _execute_operations(
             tuple(recoveries),
             tuple(failures_seen),
             workflow,
-            _mark_deployed_blocks(functional_blocks, workflow, set(completed)),
+            _mark_deployed_blocks(functional_blocks, component_states),
+            component_states,
         )
 
     def checkpoint() -> None:
@@ -338,20 +358,25 @@ def _execute_operations(
                 if resolution.plan_update:
                     if not resolution.validation or not resolution.validation.succeeded:
                         raise ValueError("plan update has not passed bounded validation")
-                    workflow, functional_blocks, added, revisit = _revise_workflow(
+                    revision = apply_plan_update(
                         workflow,
                         functional_blocks,
                         resolution.plan_update,
-                        failure,
-                        selected_block=prepared.selected_block,
+                        failed_step_id=failure.step_id,
+                        failed_block_id=failure.block_id,
+                        selected_block_id=(
+                            prepared.selected_block.id if prepared.selected_block else None
+                        ),
                     )
+                    workflow = revision.workflow
+                    functional_blocks = revision.blocks
                     revised = {step.id: step for step in workflow.steps}
                     for current_id, operation in tuple(operations.items()):
                         operations[current_id] = replace(
                             operation,
                             step=revised[current_id],
                         )
-                    if added:
+                    if added := revision.added_step:
                         root = active_roots[_step_repo_id(added)]
                         operation = ExecutionOperation(
                             added,
@@ -363,12 +388,18 @@ def _execute_operations(
                         working_directories[added.id] = operation.working_directory
                         attempt_counts[added.id] = 0
                         repair_counts[added.id] = 0
-                    if revisit:
+                    if revisit := revision.revisit_step_id:
                         if revisit not in operations:
                             raise ValueError(
                                 f"cannot revisit {revisit} outside the selected execution scope"
                             )
-                        _reopen_completed_branch(revisit, operations, states, completed)
+                        for reopened in invalidated_completed_steps(
+                            workflow,
+                            revisit,
+                            set(completed),
+                        ):
+                            states[reopened] = "pending"
+                            completed.remove(reopened)
                     ordered = [
                         operations[item.id]
                         for item in ordered_workflow_steps(
@@ -409,6 +440,10 @@ def _execute_operations(
                 failure,
                 id=f"{step_id}-recovery-{repair_counts[step_id]}",
                 history=(*failure.history, resolution.reason),
+                evidence_signatures=(
+                    *failure.evidence_signatures,
+                    *([resolution.evidence_signature] if resolution.evidence_signature else []),
+                ),
             )
             latest_failures[step_id] = retried
             recovery_queue.submit(retried)
@@ -454,6 +489,7 @@ def _execute_operations(
                 workflow=workflow,
                 functional_blocks=functional_blocks,
                 source_root=source_roots[step.id],
+                source_roots=active_roots,
                 working_directory=working_directories[step.id],
                 attempt=attempt,
                 outcome=outcome,
@@ -533,155 +569,6 @@ def _execution_roots(
     }
 
 
-def _revise_workflow(
-    workflow: DeploymentWorkflow,
-    blocks: FunctionalBlocksDocument | None,
-    update: WorkflowPlanUpdate,
-    failure: RecoveryFailure,
-    *,
-    selected_block: FunctionalBlock | None,
-) -> tuple[
-    DeploymentWorkflow,
-    FunctionalBlocksDocument | None,
-    DeploymentWorkflowStep | None,
-    str | None,
-]:
-    steps = {step.id: step for step in workflow.steps}
-    try:
-        target = steps[failure.step_id]
-    except KeyError as exc:
-        raise ValueError(f"failed step is no longer in the workflow: {failure.step_id}") from exc
-    if update.kind == PlanUpdateKind.REVISIT:
-        prerequisite = update.prerequisite_step_id
-        if prerequisite not in steps or prerequisite == target.id:
-            raise ValueError("plan update names an invalid prerequisite step")
-        revised_target = target.model_copy(
-            update={"after": list(dict.fromkeys([*target.after, prerequisite]))}
-        )
-        revised = workflow.model_copy(
-            update={
-                "steps": [
-                    revised_target if step.id == target.id else step
-                    for step in workflow.steps
-                ]
-            }
-        )
-        return (
-            DeploymentWorkflow.model_validate(revised.model_dump(mode="python")),
-            blocks,
-            None,
-            prerequisite,
-        )
-
-    assert update.executor is not None
-    assert update.source_ref is not None
-    assert update.command is not None
-    if selected_block and update.block_id and update.block_id != selected_block.id:
-        raise ValueError("plan update cannot leave the selected block")
-    next_step_id = _next_identifier(steps, "S")
-    target_ids = target.targets
-    revised_blocks = blocks
-    if update.component_name:
-        if blocks is None:
-            raise ValueError("a new component requires functional-blocks.yaml")
-        block_id = update.block_id or failure.block_id
-        block_by_id = {block.id: block for block in blocks.blocks}
-        if block_id not in block_by_id or block_by_id[block_id].state == "provided":
-            raise ValueError("new component must belong to an existing discovered block")
-        component_id = _next_identifier(
-            (component.id for block in blocks.blocks for component in block.components),
-            "C",
-            slug=slugify(update.component_name),
-        )
-        component = FunctionalComponent(
-            id=component_id,
-            name=update.component_name,
-            implementation=update.component_name,
-            deployable=True,
-            external=False,
-            deploy=FunctionalDeployRef(
-                executor=update.executor,
-                ref=update.source_ref.path,
-                repo_id=update.source_ref.repo_id,
-                required_inputs=update.required_inputs,
-            ),
-        )
-        revised_block_values = []
-        for block in blocks.blocks:
-            changes: dict[str, Any] = {}
-            if block.id == block_id:
-                changes["components"] = [*block.components, component]
-            if (
-                failure.block_id
-                and block.id == failure.block_id
-                and block_id != failure.block_id
-            ):
-                changes["after"] = list(dict.fromkeys([*block.after, block_id]))
-            revised_block_values.append(block.model_copy(update=changes) if changes else block)
-        dependencies = {block.id: set(block.after) for block in revised_block_values}
-        revised_blocks = blocks.model_copy(
-            update={
-                "blocks": revised_block_values,
-                "levels": topological_levels(
-                    [block.id for block in revised_block_values],
-                    dependencies,
-                    cycle_label="functional block plan update",
-                ),
-            }
-        )
-        revised_blocks = FunctionalBlocksDocument.model_validate(
-            revised_blocks.model_dump(mode="python")
-        )
-        target_ids = [WorkflowTarget(id=component.id, name=component.name)]
-    added = DeploymentWorkflowStep(
-        id=next_step_id,
-        kind=WorkflowStepKind.COMPONENT,
-        targets=target_ids,
-        executor=update.executor,
-        source_ref=update.source_ref,
-        working_directory=(
-            update.working_directory or Path(update.source_ref.path).parent.as_posix()
-        ),
-        command=update.command,
-        required_inputs=update.required_inputs,
-        after=target.after,
-        status=WorkflowStepStatus.READY,
-    )
-    revised_target = target.model_copy(update={"after": [added.id]})
-    revised = workflow.model_copy(
-        update={
-            "steps": [
-                revised_target if step.id == target.id else step for step in workflow.steps
-            ]
-            + [added]
-        }
-    )
-    return (
-        DeploymentWorkflow.model_validate(revised.model_dump(mode="python")),
-        revised_blocks,
-        added,
-        None,
-    )
-
-
-def _next_identifier(
-    identifiers: Iterable[str],
-    prefix: str,
-    *,
-    slug: str | None = None,
-) -> str:
-    largest = max(
-        (
-            int(identifier[1:].split("_", 1)[0])
-            for identifier in identifiers
-            if isinstance(identifier, str) and identifier.startswith(prefix)
-        ),
-        default=0,
-    )
-    base = f"{prefix}{largest + 1:03d}"
-    return f"{base}_{slug or 'component'}" if prefix == "C" else base
-
-
 def _step_repo_id(step: DeploymentWorkflowStep) -> str:
     return (step.operation_source_ref or step.source_ref).repo_id
 
@@ -710,29 +597,6 @@ def _skip_failed_descendants(
             skipped[step_id] = ExecutionIssue(step_id, reason)
             notify(f"{step_id}: skipped; {reason}")
             changed = True
-
-
-def _reopen_completed_branch(
-    root: str,
-    operations: Mapping[str, ExecutionOperation],
-    states: dict[str, str],
-    completed: list[str],
-) -> None:
-    """Invalidate only completed work downstream of a revisited prerequisite."""
-    reopened = {root}
-    changed = True
-    while changed:
-        changed = False
-        for step_id, operation in operations.items():
-            if step_id not in reopened and any(
-                dependency in reopened for dependency in operation.step.after
-            ):
-                reopened.add(step_id)
-                changed = True
-    for step_id in reopened:
-        if states[step_id] == "completed":
-            states[step_id] = "pending"
-            completed.remove(step_id)
 
 
 def _next_ready_operation(
@@ -785,6 +649,7 @@ def _build_failure(
     workflow: DeploymentWorkflow,
     functional_blocks: FunctionalBlocksDocument | None,
     source_root: Path,
+    source_roots: Mapping[str, Path],
     working_directory: Path,
     attempt: int,
     outcome: CommandOutcome,
@@ -803,6 +668,7 @@ def _build_failure(
         repo_id=source.repo_id,
         source_path=source.path,
         source_root=source_root,
+        source_roots=source_roots,
         working_directory=working_directory,
         attempt=attempt,
         exit_code=outcome.return_code,
@@ -828,31 +694,76 @@ def _component_block_id(
 
 def _mark_deployed_blocks(
     document: FunctionalBlocksDocument | None,
-    workflow: DeploymentWorkflow,
-    completed: set[str],
+    component_states: tuple[ComponentState, ...],
 ) -> FunctionalBlocksDocument | None:
     if document is None:
         return None
+    verified = {
+        component.component_id
+        for component in component_states
+        if component.status == "verified"
+    }
     revised = []
     for block in document.blocks:
         component_ids = {
             component.id for component in block.components if component.deployable
         }
-        steps = [
-            step
-            for step in workflow.steps
-            if component_ids & {target.id for target in step.targets}
-        ]
-        covered = {target.id for step in steps for target in step.targets}
-        deployed = component_ids and component_ids <= covered and all(
-            step.id in completed for step in steps
-        )
         revised.append(
             block.model_copy(update={"state": "deployed"})
-            if block.state != "provided" and deployed
+            if block.state != "provided" and component_ids and component_ids <= verified
             else block
         )
     return document.model_copy(update={"blocks": revised})
+
+
+def _component_states(
+    workflow: DeploymentWorkflow,
+    *,
+    selected: set[str],
+    completed: set[str],
+    failed: set[str],
+    skipped: set[str],
+) -> tuple[ComponentState, ...]:
+    """Separate observed readiness from commands that merely exited successfully."""
+    targets = {
+        target.id: target.name
+        for step in workflow.steps
+        if step.id in selected
+        if not _is_validation(step)
+        for target in step.targets
+    }
+    states = []
+    for component_id, name in targets.items():
+        checks = tuple(
+            step.id
+            for step in workflow.steps
+            if step.id in selected
+            if _is_validation(step)
+            and component_id in {target.id for target in step.targets}
+        )
+        deployment_steps = tuple(
+            step.id
+            for step in workflow.steps
+            if step.id in selected
+            and not _is_validation(step)
+            and component_id in {target.id for target in step.targets}
+        )
+        if not deployment_steps or not all(step_id in completed for step_id in deployment_steps):
+            status, confidence = "not_deployed", "high"
+        elif checks and all(step_id in completed for step_id in checks):
+            status, confidence = "verified", "high"
+        elif checks and any(step_id in failed or step_id in skipped for step_id in checks):
+            status, confidence = "failed", "high"
+        else:
+            status, confidence = "unverified", "reduced"
+        states.append(ComponentState(component_id, name, status, confidence, checks))
+    return tuple(states)
+
+
+def _is_validation(step: DeploymentWorkflowStep) -> bool:
+    return step.kind == WorkflowStepKind.VALIDATION or (
+        step.action_type == DeploymentActionType.VALIDATE
+    )
 
 
 def _plan_context(
@@ -940,6 +851,10 @@ def _write_execution_artifacts(output: Path, report: ExecutionReport) -> None:
             "skipped": [asdict(issue) for issue in report.skipped],
             "attempts": [asdict(attempt) for attempt in report.attempts],
             "recoveries": [_resolution_payload(item) for item in report.recoveries],
+            "state_verification": {
+                "verified": report.verified,
+                "components": [asdict(state) for state in report.component_states],
+            },
             "workflow": (
                 report.workflow.model_dump(mode="json", exclude_none=True)
                 if report.workflow
@@ -975,6 +890,7 @@ def _failure_payload(failure: RecoveryFailure) -> dict[str, Any]:
         "duration_seconds": failure.duration_seconds,
         "output_excerpt": failure.output_excerpt,
         "history": failure.history,
+        "evidence_signatures": failure.evidence_signatures,
         "plan_context": failure.plan_context,
     }
 
@@ -1014,6 +930,7 @@ def _resolution_payload(resolution: RecoveryResolution) -> dict[str, Any]:
         ),
         "model": resolution.model,
         "llm_calls": resolution.llm_calls,
+        "evidence_signature": resolution.evidence_signature,
     }
 
 

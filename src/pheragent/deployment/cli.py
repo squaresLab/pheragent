@@ -17,11 +17,10 @@ from .analysis_llm import (
 )
 from .analyzer import AnalysisConfig, AnalysisResult, run_repository_analysis
 from .artifacts import (
-    analysis_metrics,
+    analysis_run_metrics,
     publish_analysis_artifacts,
     publish_execution_artifacts,
 )
-from .enums import AnalysisTreatment
 from .errors import DeploymentError, DeploymentInputError
 from .execution import ExecutionReport, prepare_execution
 from .output import create_timestamped_run_directory
@@ -35,7 +34,6 @@ from .runtime_context import (
 from .serialization import write_json
 
 _PRODUCT_ANALYSIS_POLICY = "deployment-analysis-v1"
-_PRODUCT_ANALYSIS_METHOD = AnalysisTreatment.HYBRID
 
 
 def add_deployment_parser(subparsers: Any) -> None:
@@ -52,7 +50,7 @@ def add_deployment_parser(subparsers: Any) -> None:
 def _add_runtime_parser(commands: Any) -> None:
     inspect = commands.add_parser(
         "inspect-runtime",
-        help="Save read-only AWS and Kubernetes environment observations.",
+        help="Save read-only host, cloud and Kubernetes environment observations.",
     )
     inspect.add_argument("--output", required=True, type=Path)
     inspect.add_argument("--aws-profile", default=None)
@@ -229,7 +227,8 @@ def _run_runtime_inspection(args: argparse.Namespace) -> int:
     print(f"read-only probes: {succeeded}/{len(snapshot.probes)} succeeded")
     for warning in snapshot.warnings:
         print(f"runtime warning: {warning}", file=sys.stderr)
-    return 0 if snapshot.aws.available or snapshot.kubernetes.available else 1
+    available = snapshot.host.available or snapshot.aws.available or snapshot.kubernetes.available
+    return 0 if available else 1
 
 
 def _run_analyze(args: argparse.Namespace) -> int:
@@ -269,7 +268,7 @@ def _run_analyze(args: argparse.Namespace) -> int:
         for outcome in result.investigation.outcomes:
             _record_llm_call(recorder, outcome, model=_analysis_model(args))
         recorder.complete(
-            metrics=analysis_metrics(result),
+            metrics=analysis_run_metrics(result),
             sources=result.acquisition.manifest.model_dump(mode="json"),
             llm={
                 "usage": result.llm_usage,
@@ -294,7 +293,6 @@ def _analysis_config(args: argparse.Namespace, output_root: Path) -> AnalysisCon
         node_budget=args.node_budget,
         strict=args.strict,
         source_timeout=args.source_timeout,
-        gold_path=None,
         model=_analysis_model(args),
         api_key_env=args.openai_api_key_env,
         base_url_env=args.openai_base_url_env,
@@ -308,7 +306,6 @@ def _analysis_config(args: argparse.Namespace, output_root: Path) -> AnalysisCon
         refresh_llm=args.refresh_llm,
         investigation_max_observations=args.investigation_max_observations,
         investigation_max_evidence_chars=args.investigation_max_evidence_chars,
-        treatment=_PRODUCT_ANALYSIS_METHOD,
         runtime_context=(
             load_runtime_context(args.runtime_context) if args.runtime_context else None
         ),
@@ -321,15 +318,15 @@ def _print_analysis_summary(
     *,
     debug: bool,
 ) -> None:
-    evaluation = result.document.evaluation
+    metrics = analysis_run_metrics(result)
     print(f"run: {run_dir}")
     print(f"functional blocks: {run_dir / 'functional-blocks.yaml'}")
     print(f"deployment workflow: {run_dir / 'deployment-workflow.yaml'}")
     print(f"unresolved work: {run_dir / 'unresolved-work.yaml'}")
     print(f"ready for execution: {str(result.workflow.ready_for_execution).lower()}")
     print(
-        f"components: {evaluation.component_count}; "
-        f"executable routes: {evaluation.executable_route_coverage:.1%}; "
+        f"components: {metrics['component_count']}; "
+        f"executable routes: {metrics['executable_route_coverage']:.1%}; "
         f"unresolved: {len(result.workflow.unresolved)}"
     )
     if not debug:
@@ -338,7 +335,7 @@ def _print_analysis_summary(
         "LLM stages: "
         + "; ".join(f"{stage}={status}" for stage, status in result.llm_stage_statuses.items())
     )
-    print(f"LLM requests this run: {evaluation.llm_requests}")
+    print(f"LLM requests this run: {metrics['llm_requests']}")
     for outcome in result.investigation.outcomes:
         if outcome.value is None and outcome.warning:
             print(f"LLM {outcome.stage}: {outcome.warning}")
@@ -467,6 +464,12 @@ def _run_workflow(args: argparse.Namespace) -> int:
     print(f"execution run: {run_dir}")
     if report.successful:
         print(f"execution complete: {len(report.completed)} operation(s)")
+        verified = sum(state.status == "verified" for state in report.component_states)
+        unverified = sum(state.status == "unverified" for state in report.component_states)
+        print(
+            f"state verification: {verified} verified, {unverified} unverified"
+            + (" (reduced confidence)" if unverified else "")
+        )
         return 0
     print(
         "execution incomplete: "
@@ -521,6 +524,13 @@ def _execution_metrics(report: ExecutionReport) -> dict[str, Any]:
         "completed_steps": len(report.completed),
         "failed_steps": len(report.failed),
         "skipped_steps": len(report.skipped),
+        "state_verified": report.verified,
+        "verified_components": sum(
+            state.status == "verified" for state in report.component_states
+        ),
+        "unverified_components": sum(
+            state.status == "unverified" for state in report.component_states
+        ),
         "execution_attempts": len(report.attempts),
         "failures_captured": len(report.failures_seen),
         "repair_attempts": len(report.recoveries),

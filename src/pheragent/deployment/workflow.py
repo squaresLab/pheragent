@@ -13,6 +13,7 @@ from .analysis_models import (
     ComponentDeployment,
     ComponentDisposition,
     DeploymentAction,
+    DeploymentActionType,
     DeploymentContext,
     DeploymentSignalBundle,
     DeploymentWorkflow,
@@ -328,6 +329,7 @@ def build_deployment_workflow(
                 targets=targets,
                 action_id=action.id if action else None,
                 action_name=action.name if action else None,
+                action_type=action.action_type if action else None,
                 executor=(deployment.executor if deployment else AnalysisExecutor.UNKNOWN),
                 source_ref=source_ref,
                 operation_source_ref=(deployment.operation_source_ref if deployment else None),
@@ -339,6 +341,57 @@ def build_deployment_workflow(
                 blockers=blockers,
             )
         )
+
+    validation_gates: dict[str, list[str]] = {}
+    for action in signals.deployment_actions:
+        if action.action_type != DeploymentActionType.VALIDATE:
+            continue
+        owner = operation_by_node.get(action.owner_component_id, action.owner_component_id)
+        if owner in step_id_by_node:
+            validation_gates.setdefault(step_id_by_node[owner], []).append(
+                step_id_by_node[operation_by_node.get(action.id, action.id)]
+            )
+    seen_validations = {
+        (target.id, step.command, step.working_directory, step.source_ref.path)
+        for step in steps
+        if step.action_type == DeploymentActionType.VALIDATE
+        for target in step.targets
+    }
+    for component in executable_components:
+        owner = step_id_by_node.get(relation_node.get(component.id, component.id))
+        if owner is None:
+            continue
+        for validation in component.validation_candidates:
+            key = (
+                component.id,
+                validation.command,
+                validation.working_directory,
+                validation.source_ref.path,
+            )
+            if (
+                validation.command is None
+                or redact_secrets(validation.command) != validation.command
+                or key in seen_validations
+            ):
+                continue
+            step_id = f"S{len(steps) + 1:03d}"
+            steps.append(
+                DeploymentWorkflowStep(
+                    id=step_id,
+                    kind=WorkflowStepKind.VALIDATION,
+                    targets=[WorkflowTarget(id=component.id, name=component.name)],
+                    executor=AnalysisExecutor.SHELL,
+                    source_ref=validation.source_ref,
+                    working_directory=validation.working_directory,
+                    command=validation.command,
+                    after=[owner],
+                    status=WorkflowStepStatus.READY,
+                )
+            )
+            seen_validations.add(key)
+            validation_gates.setdefault(owner, []).append(step_id)
+    if validation_gates:
+        steps = _apply_validation_gates(steps, validation_gates)
 
     root_paths = {
         (root.source_ref.repo_id, root.source_ref.path) for root in signals.deployment_roots
@@ -449,6 +502,24 @@ def build_deployment_workflow(
         disagreements=disagreements,
         unresolved=unresolved,
     )
+
+
+def _apply_validation_gates(
+    steps: list[DeploymentWorkflowStep],
+    gates: dict[str, list[str]],
+) -> list[DeploymentWorkflowStep]:
+    validation_ids = {step_id for step_ids in gates.values() for step_id in step_ids}
+    revised = []
+    for step in steps:
+        if step.id in validation_ids:
+            revised.append(step)
+            continue
+        dependencies = set(step.after)
+        for owner in dependencies & gates.keys():
+            dependencies.remove(owner)
+            dependencies.update(gates[owner])
+        revised.append(step.model_copy(update={"after": sorted(dependencies)}))
+    return revised
 
 
 def _partition_disagreements(

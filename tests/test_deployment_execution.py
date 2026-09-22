@@ -140,15 +140,6 @@ def _write_functional_blocks(tmp_path: Path) -> None:
                 ],
             },
         ],
-        "evaluation": {
-            "component_count": 3,
-            "deployable_component_count": 3,
-            "deployability_coverage": 1.0,
-            "grounded_component_rate": 1.0,
-            "forbidden_component_count": 0,
-            "relation_count": 2,
-            "source_derived_relation_count": 2,
-        },
     }
     (tmp_path / "functional-blocks.yaml").write_text(
         yaml.safe_dump(payload, sort_keys=False),
@@ -295,6 +286,42 @@ def test_execution_checkpoints_each_completed_step(tmp_path: Path) -> None:
     )
 
 
+def test_execution_records_verified_and_unverified_component_state(tmp_path: Path) -> None:
+    payload = _workflow_payload()
+    steps = payload["steps"]
+    assert isinstance(steps, list)
+    validation = next(step for step in steps if step["id"] == "S003")
+    validation.update(
+        kind="action",
+        targets=[{"id": "C002_application", "name": "Application"}],
+        action_id="A001_validate-application",
+        action_name="Validate Application",
+        action_type="validate",
+    )
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "deploy.sh").write_text("#!/bin/bash\n", encoding="utf-8")
+    workflow = tmp_path / "deployment-workflow.yaml"
+    workflow.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
+    output = tmp_path / "execution"
+    prepared = prepare_execution(workflow, {"fixture": source})
+
+    report = prepared.execute(
+        approval_token=prepared.approval_token,
+        timeout=10,
+        output_directory=output,
+        command_runner=lambda *_args: 0,
+    )
+
+    states = {state.component_id: state for state in report.component_states}
+    assert states["C001_database"].status == "unverified"
+    assert states["C001_database"].confidence == "reduced"
+    assert states["C002_application"].status == "verified"
+    assert report.verified is False
+    stored = json.loads((output / "execution.json").read_text(encoding="utf-8"))
+    assert stored["state_verification"]["verified"] is False
+
+
 def test_execution_repairs_failure_while_independent_work_continues(tmp_path: Path) -> None:
     payload = _workflow_payload()
     steps = payload["steps"]
@@ -435,7 +462,9 @@ def test_approved_patch_is_shared_with_retry_and_later_steps(tmp_path: Path) -> 
         artifacts / "updated-source" / "fixture" / "deploy.sh"
     ).read_text(encoding="utf-8")
     assert "human approved" in (artifacts / "changes.md").read_text(encoding="utf-8")
-    assert yaml.safe_load((artifacts / "unresolved-work.yaml").read_text())["complete"] is True
+    unresolved = yaml.safe_load((artifacts / "unresolved-work.yaml").read_text())
+    assert unresolved["complete"] is False
+    assert unresolved["unverified_components"]
 
 
 def test_execution_keeps_exhausted_failure_and_skips_only_its_descendants(
@@ -553,7 +582,7 @@ def test_execution_inserts_discovered_prerequisite_and_revises_artifacts(
     assert revised["S004"].command == "./prerequisite.sh"
     assert report.functional_blocks is not None
     states = {block.id: block.state for block in report.functional_blocks.blocks}
-    assert states == {"B0": "provided", "B1": "deployed", "B2": "deployed"}
+    assert states == {"B0": "provided", "B1": "discovered", "B2": "discovered"}
     assert any(
         component.name == "Storage Provisioner"
         for block in report.functional_blocks.blocks
@@ -570,10 +599,61 @@ def test_execution_inserts_discovered_prerequisite_and_revises_artifacts(
     )
     assert {block["id"]: block["state"] for block in stored_blocks["blocks"]} == {
         "B0": "provided",
-        "B1": "deployed",
-        "B2": "deployed",
+        "B1": "discovered",
+        "B2": "discovered",
     }
     assert "insert_before" in (tmp_path / "artifacts" / "changes.md").read_text()
+
+
+def test_failed_inserted_prerequisite_prevents_dependent_retry(tmp_path: Path) -> None:
+    workflow, source = _write_workflow(tmp_path)
+    (source / "prerequisite.sh").write_text("#!/bin/bash\nexit 1\n", encoding="utf-8")
+    prepared = prepare_execution(workflow, {"fixture": source})
+    calls: list[str] = []
+
+    def resolve(failure):
+        if failure.step_id != "S001":
+            return RecoveryResolution(
+                failure_id=failure.id,
+                step_id=failure.step_id,
+                status=RecoveryStatus.EXHAUSTED,
+                reason="prerequisite did not become ready",
+            )
+        return RecoveryResolution(
+            failure_id=failure.id,
+            step_id=failure.step_id,
+            status=RecoveryStatus.RESOLVED,
+            reason="Run the source-grounded prerequisite.",
+            plan_update=WorkflowPlanUpdate(
+                kind=PlanUpdateKind.INSERT_BEFORE,
+                reason="Prepare storage before the database.",
+                executor="shell",
+                source_ref={"repo_id": "fixture", "path": "prerequisite.sh"},
+                command="./prerequisite.sh",
+            ),
+            validation=PatchValidation(True, ("workflow.command_exists",)),
+        )
+
+    def runner(command: str, _cwd: Path, _timeout: float) -> CommandOutcome:
+        calls.append(command)
+        return (
+            CommandOutcome.failed(1, "not ready")
+            if command in {"printf database", "./prerequisite.sh"}
+            else CommandOutcome.succeeded()
+        )
+
+    with ThreadedRecoveryQueue(resolve, workers=1) as recovery_queue:
+        report = prepared.execute(
+            approval_token=prepared.approval_token,
+            timeout=10,
+            command_runner=runner,
+            recovery_queue=recovery_queue,
+            max_repair_attempts=1,
+        )
+
+    assert calls == ["printf database", "./prerequisite.sh"]
+    assert [issue.step_id for issue in report.failed] == ["S004"]
+    assert {issue.step_id for issue in report.skipped} == {"S001", "S002", "S003"}
 
 
 def test_execution_revisits_upstream_step_then_resumes(tmp_path: Path) -> None:

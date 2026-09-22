@@ -50,9 +50,9 @@ uv run pheragent deployment analyze \
   --output .pheragent/deployment/mosip
 ```
 
-The product uses the versioned `deployment-analysis-v1` policy. Experimental methods and
-human-reviewed invariants belong to the separate `pheragent research` entry point, so operators do
-not select research treatments when producing a deployment plan. Its default analysis model is
+The product uses the versioned `deployment-analysis-v1` policy. Experimental methods belong to the
+separate `pheragent research` entry point, so operators do not select research treatments when
+producing a deployment plan. Its default analysis model is
 `gpt-5.6-terra`; `--model` and `PHERAGENT_MODEL` remain explicit overrides.
 
 Each invocation creates an immutable UTC directory under
@@ -134,12 +134,12 @@ environment before approving execution.
 
 ## Deployment Research
 
-Research uses the same analyzer core through a separate CLI. A study selects pinned cases,
-experimental treatments, repetitions, budgets, and optional human-reviewed invariants:
+Research uses the same analyzer core through a separate CLI. A study selects pinned sources,
+contexts, treatments, repetitions, and budgets:
 
 ```bash
 uv run pheragent research run \
-  --study research/studies/graph-retrieval-pilot.yaml
+  --study path/to/study.yaml
 ```
 
 This defaults to cost preflight and reports the planned run and LLM-request ceilings. Add
@@ -147,12 +147,11 @@ This defaults to cost preflight and reports the planned run and LLM-request ceil
 
 - `a0`: deterministic baseline
 - `a1`: bounded hybrid analysis
-- `a2`: graph-guided bounded hybrid analysis
 
 Rebuild derived result tables without modifying sealed runs with:
 
 ```bash
-uv run pheragent research summarize .pheragent/research/graph-retrieval-pilot
+uv run pheragent research summarize .pheragent/research/<study-id>
 ```
 
 ## Configuration

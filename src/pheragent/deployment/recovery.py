@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import queue
 import re
 import shutil
@@ -22,15 +24,43 @@ from .analysis_llm import (
     aggregate_usage,
     strict_response_format,
 )
-from .analysis_models import AnalysisExecutor, AnalysisSourceRef
 from .models import ContractModel
 from .probes import ProbeRequest, ProbeResult, ProbeRunner, default_probes
+from .reconciliation import PlanUpdateKind, WorkflowPlanUpdate
 from .redaction import redact_secrets
+from .retrieval import DeploymentRetrievalEngine, RetrievalQuery, normalize_terms
 
 _PROMPT_VERSION = "deployment-recovery-v1"
 _MAX_PATCH_CHARACTERS = 40_000
 _MAX_CHANGED_FILES = 3
 _MAX_CHANGED_LINES = 200
+_MAX_SEARCH_FILES = 5_000
+_MAX_SEARCH_FILE_BYTES = 512_000
+_SEARCH_SUFFIXES = {
+    ".bash",
+    ".conf",
+    ".hcl",
+    ".json",
+    ".md",
+    ".properties",
+    ".sh",
+    ".tf",
+    ".toml",
+    ".txt",
+    ".yaml",
+    ".yml",
+}
+_SEARCH_STOP_WORDS = {
+    "error",
+    "failed",
+    "failure",
+    "github",
+    "https",
+    "install",
+    "installation",
+    "pheragent",
+    "status",
+}
 _STOP = object()
 
 
@@ -48,38 +78,6 @@ class FailureKind(StrEnum):
     UPSTREAM_DEPENDENCY = "upstream_dependency"
     ENVIRONMENT_CONSTRAINT = "environment_constraint"
     UNKNOWN = "unknown"
-
-
-class PlanUpdateKind(StrEnum):
-    INSERT_BEFORE = "insert_before"
-    REVISIT = "revisit"
-
-
-class WorkflowPlanUpdate(ContractModel):
-    """One bounded edit the executor can validate and apply to its live plan."""
-
-    kind: PlanUpdateKind
-    reason: str = Field(min_length=1, max_length=600)
-    prerequisite_step_id: str | None = Field(default=None, pattern=r"^S[0-9]+$")
-    component_name: str | None = Field(default=None, min_length=1, max_length=120)
-    block_id: str | None = Field(default=None, pattern=r"^B[0-9]+$")
-    executor: AnalysisExecutor | None = None
-    source_ref: AnalysisSourceRef | None = None
-    working_directory: str | None = None
-    command: str | None = Field(default=None, min_length=1, max_length=2_000)
-    required_inputs: list[str] = Field(default_factory=list, max_length=12)
-
-    @model_validator(mode="after")
-    def validate_shape(self) -> WorkflowPlanUpdate:
-        if self.kind == PlanUpdateKind.REVISIT:
-            if not self.prerequisite_step_id:
-                raise ValueError("a revisit update requires prerequisite_step_id")
-            return self
-        if not all((self.executor, self.source_ref, self.command)):
-            raise ValueError("an insert_before update requires executor, source_ref, and command")
-        if self.component_name and not self.block_id:
-            raise ValueError("a newly discovered component requires block_id")
-        return self
 
 
 @dataclass(frozen=True, slots=True)
@@ -101,6 +99,8 @@ class RecoveryFailure:
     output_excerpt: str
     history: tuple[str, ...] = ()
     plan_context: dict[str, Any] = field(default_factory=dict)
+    source_roots: Mapping[str, Path] = field(default_factory=dict)
+    evidence_signatures: tuple[str, ...] = ()
 
     def prompt_payload(self) -> dict[str, Any]:
         return {
@@ -119,6 +119,7 @@ class RecoveryFailure:
             "output_excerpt": self.output_excerpt,
             "history": self.history,
             "plan_context": self.plan_context,
+            "available_sources": sorted(self.source_roots or {self.repo_id: self.source_root}),
         }
 
 
@@ -144,6 +145,7 @@ class RecoveryResolution:
     validation: PatchValidation | None = None
     model: str | None = None
     llm_calls: tuple[dict[str, Any], ...] = ()
+    evidence_signature: str | None = None
 
 
 RecoveryResolver = Callable[[RecoveryFailure], RecoveryResolution]
@@ -426,18 +428,58 @@ class RecoveryAgent:
             self._probe_runner.run(request, root=failure.source_root)
             for request in default_probes(failure.executor, failure.output_excerpt)
         )
-        outcomes = [self._decide(failure, probes, final=False)]
+        source_evidence = _source_evidence(failure)
+        retrieved_evidence = _retrieve_source_evidence(failure, probes)
+        evidence_signature = _evidence_signature(
+            failure,
+            probes,
+            source_evidence,
+            retrieved_evidence,
+        )
+        if evidence_signature in failure.evidence_signatures:
+            return RecoveryResolution(
+                failure_id=failure.id,
+                step_id=failure.step_id,
+                status=RecoveryStatus.EXHAUSTED,
+                reason="recovery stopped because no new evidence was found",
+                evidence_signature=evidence_signature,
+                model=self.model,
+            )
+        outcomes = [
+            self._decide(
+                failure,
+                probes,
+                source_evidence,
+                retrieved_evidence,
+                final=False,
+            )
+        ]
         decision = outcomes[-1].value
         if decision and decision.additional_probes:
             probes += tuple(
                 self._probe_runner.run(request, root=failure.source_root)
                 for request in decision.additional_probes
             )
-            outcomes.append(self._decide(failure, probes, final=True))
+            outcomes.append(
+                self._decide(
+                    failure,
+                    probes,
+                    source_evidence,
+                    retrieved_evidence,
+                    final=True,
+                )
+            )
             decision = outcomes[-1].value
         if decision is None:
             warning = outcomes[-1].warning or "recovery model returned no valid decision"
-            return self._resolution(failure, RecoveryStatus.EXHAUSTED, warning, probes, outcomes)
+            return self._resolution(
+                failure,
+                RecoveryStatus.EXHAUSTED,
+                warning,
+                probes,
+                outcomes,
+                evidence_signature=evidence_signature,
+            )
         if decision.status != RecoveryDecisionStatus.PROPOSED_FIX:
             reason = decision.human_message or decision.root_cause
             status = (
@@ -453,6 +495,7 @@ class RecoveryAgent:
                 outcomes,
                 failure_kind=decision.failure_kind,
                 approval_items=_approval_items(decision, failure),
+                evidence_signature=evidence_signature,
             )
         validation = (
             validate_patch(failure.source_root, decision.patch, self._sandbox_root)
@@ -471,6 +514,7 @@ class RecoveryAgent:
                 plan_update=decision.plan_update,
                 approval_items=_approval_items(decision, failure),
                 validation=validation,
+                evidence_signature=evidence_signature,
             )
         unsafe_reason = (
             _unsafe_patch_reason(decision.patch)
@@ -489,6 +533,7 @@ class RecoveryAgent:
                 plan_update=decision.plan_update,
                 approval_items=_approval_items(decision, failure),
                 validation=validation,
+                evidence_signature=evidence_signature,
             )
         return self._resolution(
             failure,
@@ -501,17 +546,21 @@ class RecoveryAgent:
             plan_update=decision.plan_update,
             approval_items=_approval_items(decision, failure),
             validation=validation,
+            evidence_signature=evidence_signature,
         )
 
     def _decide(
         self,
         failure: RecoveryFailure,
         probes: tuple[ProbeResult, ...],
+        source_evidence: list[dict[str, str]],
+        retrieved_evidence: list[dict[str, object]],
         *,
         final: bool,
     ):
         payload = failure.prompt_payload()
-        payload["source_evidence"] = _source_evidence(failure)
+        payload["source_evidence"] = source_evidence
+        payload["retrieved_source_evidence"] = retrieved_evidence
         payload["probe_results"] = [_probe_payload(result) for result in probes]
         payload["final_decision_required"] = final
         return self._classifier.classify(
@@ -541,6 +590,7 @@ class RecoveryAgent:
         plan_update: WorkflowPlanUpdate | None = None,
         approval_items: tuple[str, ...] = (),
         validation: PatchValidation | None = None,
+        evidence_signature: str | None = None,
     ) -> RecoveryResolution:
         return RecoveryResolution(
             failure_id=failure.id,
@@ -556,6 +606,7 @@ class RecoveryAgent:
             validation=validation,
             model=self.model,
             llm_calls=tuple(_llm_call(outcome) for outcome in outcomes),
+            evidence_signature=evidence_signature,
         )
 
 
@@ -600,15 +651,17 @@ def _validate_plan_update(
 
     assert update.source_ref is not None
     assert update.command is not None
-    if update.source_ref.repo_id != failure.repo_id:
-        return PatchValidation(False, (), "a plan update must use the failed step's source")
-    source = (failure.source_root / update.source_ref.path).resolve()
-    if not source.is_relative_to(failure.source_root) or not source.is_file():
+    roots = failure.source_roots or {failure.repo_id: failure.source_root}
+    source_root = roots.get(update.source_ref.repo_id)
+    if source_root is None:
+        return PatchValidation(False, (), "plan update names an unavailable source")
+    source = (source_root / update.source_ref.path).resolve()
+    if not source.is_relative_to(source_root) or not source.is_file():
         return PatchValidation(False, (), "plan update source does not exist")
     workdir = (
-        failure.source_root / (update.working_directory or Path(update.source_ref.path).parent)
+        source_root / (update.working_directory or Path(update.source_ref.path).parent)
     ).resolve()
-    if not workdir.is_relative_to(failure.source_root) or not workdir.is_dir():
+    if not workdir.is_relative_to(source_root) or not workdir.is_dir():
         return PatchValidation(False, (), "plan update working directory does not exist")
     executable = update.command.strip().split(maxsplit=1)[0]
     if executable.startswith("./") and (workdir / executable[2:]).is_file():
@@ -754,6 +807,133 @@ def _source_evidence(failure: RecoveryFailure) -> list[dict[str, str]]:
         content = redact_secrets(path.read_text(encoding="utf-8", errors="replace"))
         evidence.append({"path": raw_path, "content": _compact(content, 4_000)})
     return evidence
+
+
+def _retrieve_source_evidence(
+    failure: RecoveryFailure,
+    probes: tuple[ProbeResult, ...],
+) -> list[dict[str, object]]:
+    """Find a few related source passages without rerunning repository analysis."""
+    terms = _failure_terms(failure, probes)
+    if not terms:
+        return []
+    roots = failure.source_roots or {failure.repo_id: failure.source_root}
+    ranked: list[tuple[int, str, Path]] = []
+    for source_id, root in sorted(roots.items()):
+        for scanned, path in enumerate(_source_files(root, terms), start=1):
+            if scanned > _MAX_SEARCH_FILES:
+                break
+            try:
+                if path.stat().st_size > _MAX_SEARCH_FILE_BYTES:
+                    continue
+                content = path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            relative = path.relative_to(root).as_posix()
+            path_text = relative.casefold()
+            body = content.casefold()
+            score = 5 * sum(term in path_text for term in terms) + sum(
+                term in body for term in terms
+            )
+            if score:
+                ranked.append((score, source_id, path))
+    documents = []
+    for _score, source_id, path in sorted(ranked, reverse=True)[:40]:
+        try:
+            content = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        documents.extend(
+            DeploymentRetrievalEngine.passages(
+                source_id=source_id,
+                source_kind="repository",
+                path=path.relative_to(roots[source_id]).as_posix(),
+                text=content,
+            )
+        )
+    if not documents:
+        return []
+    hits = DeploymentRetrievalEngine(documents).search(
+        RetrievalQuery(terms=terms, source_kind="repository"),
+        limit=5,
+    )
+    return [
+        {
+            "repo_id": hit.document.source_id,
+            "path": hit.document.path,
+            "start_line": hit.document.start_line,
+            "end_line": hit.document.end_line,
+            "content": _compact(redact_secrets(hit.document.text), 1_200),
+        }
+        for hit in hits
+    ]
+
+
+def _failure_terms(
+    failure: RecoveryFailure,
+    probes: tuple[ProbeResult, ...],
+) -> tuple[str, ...]:
+    components = " ".join(
+        str(name)
+        for step in failure.plan_context.get("steps", [])
+        if isinstance(step, dict)
+        for name in step.get("components", [])
+    )
+    values = " ".join(
+        (
+            failure.output_excerpt,
+            failure.command,
+            failure.source_path,
+            " ".join(failure.component_ids),
+            components,
+            " ".join(result.output or result.error for result in probes),
+        )
+    )
+    terms = {
+        term
+        for term in normalize_terms(values)
+        if len(term) > 2 and term not in _SEARCH_STOP_WORDS
+        and not re.fullmatch(r"[a-f0-9]{12,}", term)
+    }
+    return tuple(sorted(terms, key=lambda term: (-len(term), term))[:16])
+
+
+def _source_files(root: Path, terms: tuple[str, ...]) -> list[Path]:
+    listed = _command(["git", "ls-files"], root)
+    paths = (
+        [root / line for line in listed.stdout.splitlines()]
+        if listed.returncode == 0
+        else list(root.rglob("*"))
+    )
+    eligible = [
+        path
+        for path in paths
+        if path.is_file()
+        and (path.suffix.casefold() in _SEARCH_SUFFIXES or path.name in {"Dockerfile", "Makefile"})
+    ]
+    return sorted(
+        eligible,
+        key=lambda path: (
+            not any(term in path.relative_to(root).as_posix().casefold() for term in terms),
+            path.as_posix(),
+        ),
+    )
+
+
+def _evidence_signature(
+    failure: RecoveryFailure,
+    probes: tuple[ProbeResult, ...],
+    source_evidence: list[dict[str, str]],
+    retrieved_evidence: list[dict[str, object]],
+) -> str:
+    payload = {
+        "failure": failure.output_excerpt,
+        "latest_history": failure.history[-1] if failure.history else None,
+        "source": source_evidence,
+        "retrieved": retrieved_evidence,
+        "probes": [_probe_payload(result) for result in probes],
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
 
 
 def _probe_payload(result: ProbeResult) -> dict[str, Any]:

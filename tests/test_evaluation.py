@@ -579,15 +579,6 @@ def _write_run(run_directory: Path) -> Path:
             },
         ],
         "levels": [["B0"], ["B1"]],
-        "evaluation": {
-            "component_count": 1,
-            "deployable_component_count": 1,
-            "deployability_coverage": 1.0,
-            "grounded_component_rate": 1.0,
-            "forbidden_component_count": 0,
-            "relation_count": 1,
-            "source_derived_relation_count": 1,
-        },
     }
     workflow = {
         "version": "0.1",

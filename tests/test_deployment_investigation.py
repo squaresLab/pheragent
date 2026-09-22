@@ -21,7 +21,7 @@ from pheragent.deployment.investigation_models import (
     InvestigationPlan,
     InvestigationSynthesis,
 )
-from pheragent.deployment.runtime_context import RuntimeContextSnapshot
+from pheragent.deployment.runtime_context import RuntimeContextSnapshot, RuntimeProbe
 
 
 def _write_context(path: Path) -> Path:
@@ -36,6 +36,44 @@ def _write_context(path: Path) -> Path:
         encoding="utf-8",
     )
     return path
+
+
+def _write_storage_context(path: Path) -> Path:
+    path.write_text(
+        yaml.safe_dump(
+            {
+                "system": "storage-fixture",
+                "deployment": {"profile": "test"},
+                "provided_blocks": [
+                    {
+                        "id": "B0",
+                        "type": "runtime_environment",
+                        "subtype": "platform_services",
+                        "provides": ["persistent-storage", "ingress"],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+def _storage_runtime(*storage_classes: dict[str, object]) -> RuntimeContextSnapshot:
+    return RuntimeContextSnapshot(
+        captured_at="2026-09-22T10:00:00+00:00",
+        aws={"available": False},
+        kubernetes={"available": True, "storage_classes": list(storage_classes)},
+        probes=[
+            RuntimeProbe(
+                provider="kubernetes",
+                name="storage_classes",
+                command=["kubectl", "get", "storageclass"],
+                succeeded=True,
+                duration_seconds=0,
+            )
+        ],
+    )
 
 
 def _write_orchestrated_repository(root: Path, *, dynamic: bool = False) -> Path:
@@ -147,6 +185,21 @@ def _empty_synthesis(request: dict[str, object]) -> dict[str, object]:
         "facts": [],
         "disagreements": [],
         "unresolved": [],
+    }
+
+
+def _implied_provider(name: str, capability: str, evidence_id: str) -> dict[str, object]:
+    return {
+        "canonical_name": name,
+        "aliases": [],
+        "disposition": "deployment_component",
+        "classification": "runtime_environment.platform_services",
+        "capabilities": [capability],
+        "evidence_ids": [evidence_id],
+        "entrypoint_evidence_id": evidence_id,
+        "executor": "shell",
+        "required_for_initial_deployment": True,
+        "confidence": 0.9,
     }
 
 
@@ -606,8 +659,53 @@ def test_grounded_operation_can_be_bound_to_its_owning_component(
         if item.kind == "component" and item.targets[0].id == action.owner_component_id
     )
     assert step.kind == "action"
+    assert step.action_type == "configure"
     assert step.targets[0].name == "MinIO"
     assert owner_step.id in step.after
+
+
+def test_source_grounded_validation_gates_dependent_components(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    repository = _write_orchestrated_repository(tmp_path)
+    installer = repository / "deployment/app/install.sh"
+    installer.write_text(
+        installer.read_text() + "kubectl rollout status deployment/app\n",
+        encoding="utf-8",
+    )
+    _mock_responses(monkeypatch, _empty_synthesis)
+
+    result = run_repository_analysis(
+        AnalysisConfig(
+            repositories=[str(repository)],
+            documentation=[],
+            context_path=_write_context(tmp_path / "context.yaml"),
+            cache_dir=tmp_path / "cache",
+            api_key_env="TEST_OPENAI_KEY",
+            llm_cache_dir=tmp_path / "llm-cache",
+        )
+    )
+
+    app = next(
+        step
+        for step in result.workflow.steps
+        if step.kind == "component" and step.targets[0].name == "App"
+    )
+    validation = next(
+        step
+        for step in result.workflow.steps
+        if step.kind == "validation" and step.targets[0].name == "App"
+    )
+    worker = next(
+        step
+        for step in result.workflow.steps
+        if step.kind == "component" and step.targets[0].name == "Worker"
+    )
+    assert validation.after == [app.id]
+    assert validation.command == "kubectl rollout status deployment/app"
+    assert validation.id in worker.after
+    assert app.id not in worker.after
 
 
 def test_ungrounded_semantic_action_is_retained_but_blocked(
@@ -957,6 +1055,10 @@ def test_context_provided_block_is_a_hard_execution_boundary(
     monkeypatch,
 ) -> None:
     repository = _write_orchestrated_repository(tmp_path)
+    (repository / "deployment/app/install.sh").write_text(
+        "#!/bin/bash\n# Requires an ingress controller.\nhelm upgrade --install app charts/app\n",
+        encoding="utf-8",
+    )
     context = tmp_path / "context.yaml"
     context.write_text(
         yaml.safe_dump(
@@ -981,19 +1083,13 @@ def test_context_provided_block_is_a_hard_execution_boundary(
         response = _empty_synthesis(request)
         for group in response["classification_groups"]:
             group["classification"] = "runtime_environment.container_platform"
+        evidence_id = next(
+            item["id"]
+            for item in request["evidence"]
+            if "ingress controller" in (item["excerpt"] or "").casefold()
+        )
         response["implied_entities"] = [
-            {
-                "canonical_name": "Ingress controller",
-                "aliases": [],
-                "disposition": "deployment_component",
-                "classification": "runtime_environment.platform_services",
-                "capabilities": ["ingress"],
-                "evidence_ids": [request["evidence"][0]["id"]],
-                "entrypoint_evidence_id": request["evidence"][0]["id"],
-                "executor": "shell",
-                "required_for_initial_deployment": True,
-                "confidence": 0.9,
-            }
+            _implied_provider("Ingress controller", "ingress", evidence_id)
         ]
         return response
 
@@ -1025,6 +1121,153 @@ def test_context_provided_block_is_a_hard_execution_boundary(
     )
     assert ingress.disposition == "deployment_component"
     assert any(step.targets[0].name == "Ingress controller" for step in result.workflow.steps)
+
+
+def test_proven_runtime_gap_is_retrieved_and_not_hidden_by_provided_block(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    repository = _write_orchestrated_repository(tmp_path)
+    context = _write_storage_context(tmp_path / "context.yaml")
+
+    def synthesis(request):
+        response = _empty_synthesis(request)
+        for group in response["classification_groups"]:
+            group["classification"] = "runtime_environment.platform_services"
+        response["implied_entities"] = [
+            _implied_provider(
+                "Longhorn",
+                "persistent-storage",
+                request["evidence"][0]["id"],
+            )
+        ]
+        return response
+
+    requests = _mock_responses(monkeypatch, synthesis)
+
+    result = run_repository_analysis(
+        AnalysisConfig(
+            repositories=[str(repository)],
+            documentation=[],
+            context_path=context,
+            cache_dir=tmp_path / "cache",
+            api_key_env="TEST_OPENAI_KEY",
+            llm_cache_dir=tmp_path / "llm-cache",
+            runtime_context=_storage_runtime(),
+        )
+    )
+
+    assert result.context.provided_blocks[0].provides == ["ingress"]
+    assert any(
+        query.reason_code == "RUNTIME_CAPABILITY_MISSING"
+        and "persistent storage" in query.terms
+        for query in result.retrieval_queries
+    )
+    assert all(
+        component.disposition == "deployment_component"
+        for component in result.signals.candidate_components
+    )
+    assert all(component.name != "Longhorn" for component in result.signals.candidate_components)
+    assert any("does not identify" in item.reason for item in result.signals.unresolved)
+    assert all(
+        request["runtime_context"]["provided_capability_checks"][0]["status"] == "missing"
+        for request in requests
+    )
+
+
+def test_satisfied_runtime_capability_does_not_schedule_an_installer(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    repository = _write_orchestrated_repository(tmp_path)
+    (repository / "deployment/app/install.sh").write_text(
+        "#!/bin/bash\n# Longhorn provides persistent storage.\n"
+        "helm upgrade --install app charts/app\n",
+        encoding="utf-8",
+    )
+
+    def synthesis(request):
+        response = _empty_synthesis(request)
+        evidence_id = next(
+            item["id"]
+            for item in request["evidence"]
+            if "longhorn" in (item["excerpt"] or "").casefold()
+        )
+        response["implied_entities"] = [
+            _implied_provider("Longhorn", "persistent-storage", evidence_id)
+        ]
+        return response
+
+    _mock_responses(monkeypatch, synthesis)
+    result = run_repository_analysis(
+        AnalysisConfig(
+            repositories=[str(repository)],
+            documentation=[],
+            context_path=_write_storage_context(tmp_path / "context.yaml"),
+            cache_dir=tmp_path / "cache",
+            api_key_env="TEST_OPENAI_KEY",
+            llm_cache_dir=tmp_path / "llm-cache",
+            runtime_context=_storage_runtime(
+                {"kind": "StorageClass", "name": "default", "is_default": True}
+            ),
+        )
+    )
+
+    assert result.context.provided_blocks[0].provides == ["persistent-storage", "ingress"]
+    assert not any(
+        query.reason_code == "RUNTIME_CAPABILITY_MISSING"
+        for query in result.retrieval_queries
+    )
+    assert all(component.name != "Longhorn" for component in result.signals.candidate_components)
+
+
+def test_grounded_missing_provider_is_scheduled_before_consumers(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    repository = _write_orchestrated_repository(tmp_path)
+    (repository / "deployment/storage").mkdir()
+    (repository / "deployment/storage/install.sh").write_text(
+        "#!/bin/bash\nhelm upgrade --install storage charts/storage\n",
+        encoding="utf-8",
+    )
+
+    def synthesis(request):
+        response = _empty_synthesis(request)
+        for group in response["classification_groups"]:
+            group["classification"] = "shared_services.data_services"
+        evidence_id = next(
+            item["id"]
+            for item in request["evidence"]
+            if item["path"] == "deployment/storage/install.sh"
+        )
+        response["implied_entities"] = [
+            _implied_provider("Storage", "persistent-storage", evidence_id)
+        ]
+        return response
+
+    _mock_responses(monkeypatch, synthesis)
+    result = run_repository_analysis(
+        AnalysisConfig(
+            repositories=[str(repository)],
+            documentation=[],
+            context_path=_write_storage_context(tmp_path / "context.yaml"),
+            cache_dir=tmp_path / "cache",
+            api_key_env="TEST_OPENAI_KEY",
+            llm_cache_dir=tmp_path / "llm-cache",
+            runtime_context=_storage_runtime(),
+        )
+    )
+
+    provider = next(
+        (step for step in result.workflow.steps if "storage" in step.targets[0].name.casefold()),
+        None,
+    )
+    assert provider is not None, [step.model_dump() for step in result.workflow.steps]
+    consumers = [step for step in result.workflow.steps if step.id != provider.id]
+    assert provider.status == "ready"
+    assert consumers
+    assert all(provider.id in step.after for step in consumers)
 
 
 def test_llm_can_add_a_documented_external_requirement_missing_from_repo_candidates(

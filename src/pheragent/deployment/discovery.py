@@ -43,6 +43,7 @@ from .investigation_models import (
     EvidenceKind,
     EvidenceObservation,
     FactPredicate,
+    ImpliedEntity,
     InvestigationSynthesis,
     SourcePurpose,
 )
@@ -76,6 +77,16 @@ _DEPLOYMENT_TOOL = re.compile(
     r"docker\s+compose\s+up|kustomize\s+build)\b",
     re.IGNORECASE,
 )
+_IMPLIED_ENTITY_STOP_WORDS = {
+    "component",
+    "deployment",
+    "install",
+    "platform",
+    "provider",
+    "required",
+    "service",
+    "setup",
+}
 _VALIDATION_COMMAND = re.compile(
     r"\b(?:kubectl\s+(?:wait|rollout\s+status)|helm\s+test|docker\s+compose\s+ps|"
     r"ansible\s+.*--check|curl\s+[^\n]*(?:health|ready)|(?:check|verify|status)[-_a-z0-9]*\.sh)\b",
@@ -541,13 +552,16 @@ def _parse_shell(artifact: _ParsedArtifact, text: str) -> None:
                     working_directory=current_dir.as_posix(),
                 )
             )
-        if _VALIDATION_COMMAND.search(stripped) and not re.match(
+        validation = _VALIDATION_COMMAND.search(stripped)
+        if validation and not re.match(
             r"^[A-Za-z_][A-Za-z0-9_]*=", stripped
         ):
             artifact.validations.append(
                 ValidationSignal(
                     subject=path.parent.name,
                     check=stripped[:500],
+                    command=stripped if validation.start() == 0 else None,
+                    working_directory=current_dir.as_posix(),
                     source_ref=AnalysisSourceRef(
                         repo_id=artifact.source_id,
                         path=artifact.path,
@@ -1858,6 +1872,7 @@ def apply_investigation_synthesis(
         name.casefold() for component in classified for name in (component.name, *component.aliases)
     }
     external_requirements = list(signals.external_requirements)
+    unresolved = [*signals.unresolved, *synthesis.unresolved]
     for entity in synthesis.implied_entities:
         if entity.canonical_name.casefold() in existing_names:
             continue
@@ -1872,6 +1887,14 @@ def apply_investigation_synthesis(
             if entity.entrypoint_evidence_id
             else None
         )
+        if not _evidence_supports_implied_entity(entity, entrypoint_evidence or evidence):
+            unresolved.append(
+                AnalysisQuestion(
+                    question=f"What source evidence supports {entity.canonical_name}?",
+                    reason="The cited evidence does not identify the implied deployment entity.",
+                )
+            )
+            continue
         disposition = entity.disposition
         deployment = None
         source_evidence = entrypoint_evidence or evidence
@@ -1879,9 +1902,16 @@ def apply_investigation_synthesis(
             if entrypoint_evidence is None or entity.executor == AnalysisExecutor.UNKNOWN:
                 disposition = ComponentDisposition.UNCERTAIN
             else:
+                path = PurePosixPath(entrypoint_evidence.path)
+                conventional_installer = (
+                    entity.executor == AnalysisExecutor.SHELL
+                    and is_installer_path(entrypoint_evidence.path)
+                )
                 deployment = ComponentDeployment(
                     executor=entity.executor,
                     entrypoint=entrypoint_evidence.path,
+                    command=f"./{path.name}" if conventional_installer else None,
+                    working_directory=str(path.parent) if conventional_installer else None,
                 )
         candidate = CandidateComponent(
             id=f"C000_{slugify(entity.canonical_name)}",
@@ -1999,9 +2029,24 @@ def apply_investigation_synthesis(
             "relations": _deduplicate_relations(relations),
             "deployment_stages": stages,
             "external_requirements": external_requirements,
-            "unresolved": [*signals.unresolved, *synthesis.unresolved],
+            "unresolved": unresolved,
         }
     )
+
+
+def _evidence_supports_implied_entity(
+    entity: ImpliedEntity,
+    evidence: EvidenceObservation,
+) -> bool:
+    names = [entity.canonical_name, *entity.aliases, *entity.capabilities]
+    terms = {
+        term
+        for name in names
+        for term in re.findall(r"[a-z0-9]+", name.casefold())
+        if len(term) > 1 and term not in _IMPLIED_ENTITY_STOP_WORDS
+    }
+    text = " ".join((evidence.path, evidence.summary, evidence.excerpt or ""))
+    return bool(terms & set(re.findall(r"[a-z0-9]+", text.casefold())))
 
 
 def _component_lookup(components: list[CandidateComponent]) -> dict[str, str]:

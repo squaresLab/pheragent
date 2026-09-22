@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import json
+import os
+import platform
+import shutil
 from collections.abc import Callable
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -19,6 +23,17 @@ from .serialization import load_yaml
 _MAX_ITEMS = 500
 _MAX_PROMPT_ITEMS = 25
 _MAX_ERROR_CHARACTERS = 500
+_HOST_COMMANDS = (
+    "ansible-playbook",
+    "aws",
+    "az",
+    "docker",
+    "gcloud",
+    "git",
+    "helm",
+    "kubectl",
+    "terraform",
+)
 
 
 class RuntimeProbe(ContractModel):
@@ -50,6 +65,19 @@ class AwsRuntimeContext(ContractModel):
     principal_arn: str | None = None
     instance_count: int = Field(default=0, ge=0)
     instances: list[AwsInstance] = Field(default_factory=list)
+
+
+class HostRuntimeContext(ContractModel):
+    available: bool = False
+    system: str = "unknown"
+    release: str | None = None
+    distribution: str | None = None
+    architecture: str | None = None
+    hostname: str | None = None
+    cpu_count: int | None = Field(default=None, ge=0)
+    memory_available_bytes: int | None = Field(default=None, ge=0)
+    disk_free_bytes: int | None = Field(default=None, ge=0)
+    commands: list[str] = Field(default_factory=list)
 
 
 class KubernetesResource(ContractModel):
@@ -85,6 +113,7 @@ class RuntimeContextSnapshot(ContractModel):
     captured_at: str
     aws: AwsRuntimeContext
     kubernetes: KubernetesRuntimeContext
+    host: HostRuntimeContext = Field(default_factory=HostRuntimeContext)
     probes: list[RuntimeProbe] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
 
@@ -108,12 +137,14 @@ def inspect_runtime_context(
     """Capture bounded environment facts using a fixed read-only command set."""
     probes: list[RuntimeProbe] = []
     warnings: list[str] = []
+    host = _inspect_host(probes)
     aws = _inspect_aws(config, runner, probes, warnings)
     kubernetes = _inspect_kubernetes(config, runner, probes, warnings)
     return RuntimeContextSnapshot(
         captured_at=datetime.now(UTC).isoformat(timespec="seconds"),
         aws=aws,
         kubernetes=kubernetes,
+        host=host,
         probes=probes,
         warnings=warnings,
     )
@@ -131,6 +162,7 @@ def compact_runtime_context(snapshot: RuntimeContextSnapshot | None) -> dict[str
     kubernetes = snapshot.kubernetes
     return {
         "captured_at": snapshot.captured_at,
+        "host": snapshot.host.model_dump(mode="json", exclude_none=True),
         "aws": {
             "available": aws.available,
             "region": aws.region,
@@ -171,6 +203,44 @@ def compact_runtime_context(snapshot: RuntimeContextSnapshot | None) -> dict[str
             "health or deployment intent."
         ),
     }
+
+
+def _inspect_host(probes: list[RuntimeProbe]) -> HostRuntimeContext:
+    """Read bounded local-host facts without assuming a cloud provider."""
+    system = platform.system() or "unknown"
+    distribution = None
+    if system == "Linux":
+        with suppress(OSError):
+            distribution = platform.freedesktop_os_release().get("PRETTY_NAME")
+    try:
+        memory = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_AVPHYS_PAGES")
+    except (OSError, ValueError):
+        memory = None
+    try:
+        disk = shutil.disk_usage("/").free
+    except OSError:
+        disk = None
+    probes.append(
+        RuntimeProbe(
+            provider="host",
+            name="system",
+            command=[],
+            succeeded=system != "unknown",
+            duration_seconds=0,
+        )
+    )
+    return HostRuntimeContext(
+        available=system != "unknown",
+        system=system,
+        release=platform.release() or None,
+        distribution=distribution,
+        architecture=platform.machine() or None,
+        hostname=platform.node() or None,
+        cpu_count=os.cpu_count(),
+        memory_available_bytes=memory,
+        disk_free_bytes=disk,
+        commands=[name for name in _HOST_COMMANDS if shutil.which(name)],
+    )
 
 
 def _inspect_aws(

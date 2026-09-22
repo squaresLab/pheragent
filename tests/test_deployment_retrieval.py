@@ -260,10 +260,6 @@ def test_functional_block_dependencies_follow_component_relations() -> None:
     document = build_functional_blocks(
         DeploymentContext(system="relation-fixture"),
         signals,
-        {},
-        None,
-        llm_usage={},
-        llm_stage_statuses={},
     )
     block_by_component = {
         component.id: block

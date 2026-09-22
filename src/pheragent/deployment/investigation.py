@@ -126,6 +126,7 @@ def synthesize_investigation_with_llm(
     context: DeploymentContext,
     evidence_ids: set[str],
     classifier: CachedStructuredClassifier,
+    incomplete_provided_blocks: set[str] | None = None,
     stage: str = "investigation_synthesis",
 ) -> ClassificationOutcome[InvestigationSynthesis]:
     if not evidence_ids:
@@ -163,6 +164,7 @@ def synthesize_investigation_with_llm(
                 components=components,
                 context=context,
                 evidence_ids=evidence_ids,
+                incomplete_provided_blocks=incomplete_provided_blocks,
             )[0],
             component_ids=component_ids,
             evidence_ids=evidence_ids,
@@ -250,8 +252,8 @@ def build_synthesis_input(
             ),
             "claim_sources": "context, repository, or documentation; never relabel context as repo",
             "provided_block_boundary": (
-                "provided blocks are already healthy; do not return implied entities for them or "
-                "schedule components entirely covered by their block types"
+                "treat provided capabilities as an execution boundary unless a successful runtime "
+                "probe disproves them; retrieve and schedule any proven gap"
             ),
             "facts": (
                 "return at most 8 novel cross-group dependencies or requirements; never repeat "
@@ -469,6 +471,7 @@ def reconcile_investigation_synthesis(
     components: list[CandidateComponent],
     context: DeploymentContext,
     evidence_ids: set[str],
+    incomplete_provided_blocks: set[str] | None = None,
 ) -> tuple[InvestigationSynthesis, list[str]]:
     """Conservatively merge model judgments with source-grounded candidates.
 
@@ -480,8 +483,11 @@ def reconcile_investigation_synthesis(
     warnings: list[str] = []
     unresolved = list(synthesis.unresolved)
     preserved_locked: list[str] = []
+    incomplete_provided_blocks = incomplete_provided_blocks or set()
     provided_classes = {
-        _normalized_deployment_class(block.type, block.subtype) for block in context.provided_blocks
+        _normalized_deployment_class(block.type, block.subtype)
+        for block in context.provided_blocks
+        if block.id not in incomplete_provided_blocks
     }
 
     synthesis, invalid_evidence_count, ungrounded_claim_count = _quarantine_unknown_evidence(

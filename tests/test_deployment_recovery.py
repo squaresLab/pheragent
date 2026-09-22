@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -392,3 +393,144 @@ def test_recovery_agent_requires_approval_for_source_grounded_plan_update(
     assert resolution.plan_update == decision.plan_update
     assert resolution.validation is not None
     assert resolution.validation.succeeded
+
+
+def test_recovery_retrieves_and_validates_a_prerequisite_from_another_source(
+    tmp_path: Path,
+) -> None:
+    application = tmp_path / "application"
+    infrastructure = tmp_path / "infrastructure"
+    application.mkdir()
+    (application / "deploy.sh").write_text("#!/bin/bash\nexit 1\n", encoding="utf-8")
+    (infrastructure / "storage").mkdir(parents=True)
+    (infrastructure / "storage/install.sh").write_text(
+        "#!/bin/bash\n# Install the required storage provisioner.\nprintf ready\n",
+        encoding="utf-8",
+    )
+    decision = RecoveryDecision(
+        status=RecoveryDecisionStatus.PROPOSED_FIX,
+        failure_kind=FailureKind.MISSING_WORKFLOW_STEP,
+        root_cause="Storage provisioning must run first.",
+        plan_update=WorkflowPlanUpdate(
+            kind=PlanUpdateKind.INSERT_BEFORE,
+            reason="Install the repository's storage provisioner.",
+            executor="shell",
+            source_ref={"repo_id": "infra", "path": "storage/install.sh"},
+            working_directory="storage",
+            command="./install.sh",
+        ),
+        risk=RecoveryRisk.LOW,
+        requires_human_approval=False,
+    )
+    payloads = []
+
+    class Classifier:
+        def classify(self, **kwargs: object) -> ClassificationOutcome[RecoveryDecision]:
+            payloads.append(kwargs["payload"])
+            return ClassificationOutcome(decision, "deployment_recovery", "llm", {}, 80)
+
+    failure = RecoveryFailure(
+        id="S001-attempt-1",
+        step_id="S001",
+        block_id="B2",
+        component_ids=("C001_database",),
+        executor="shell",
+        command="./deploy.sh",
+        repo_id="app",
+        source_path="deploy.sh",
+        source_root=application,
+        source_roots={"app": application, "infra": infrastructure},
+        working_directory=application,
+        attempt=1,
+        exit_code=1,
+        timed_out=False,
+        duration_seconds=1,
+        output_excerpt="deployment blocked",
+    )
+    agent = RecoveryAgent(
+        classifier=Classifier(),
+        probe_runner=ProbeRunner(
+            command_runner=lambda *_args: (0, "storage provisioner is unavailable")
+        ),
+        sandbox_root=tmp_path / "sandboxes",
+        model="test-model",
+    )
+
+    resolution = agent.resolve(failure)
+
+    retrieved = payloads[0]["retrieved_source_evidence"]
+    assert any(item["repo_id"] == "infra" for item in retrieved)
+    assert any(item["path"] == "storage/install.sh" for item in retrieved)
+    assert resolution.validation is not None
+    assert resolution.validation.succeeded
+
+
+def test_recovery_stops_when_a_retry_has_no_new_evidence(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "install.sh").write_text("#!/bin/bash\nprintf ready\n", encoding="utf-8")
+    decision = RecoveryDecision(
+        status=RecoveryDecisionStatus.PROPOSED_FIX,
+        failure_kind=FailureKind.MISSING_WORKFLOW_STEP,
+        root_cause="Try an ungrounded command.",
+        plan_update=WorkflowPlanUpdate(
+            kind=PlanUpdateKind.INSERT_BEFORE,
+            reason="Run a missing preparation step.",
+            executor="shell",
+            source_ref={"repo_id": "fixture", "path": "install.sh"},
+            command="not-present --prepare",
+        ),
+        risk=RecoveryRisk.LOW,
+        requires_human_approval=False,
+    )
+    calls = 0
+
+    class Classifier:
+        def classify(self, **_kwargs: object) -> ClassificationOutcome[RecoveryDecision]:
+            nonlocal calls
+            calls += 1
+            return ClassificationOutcome(decision, "deployment_recovery", "llm", {}, 80)
+
+    failure = RecoveryFailure(
+        id="S001-attempt-1",
+        step_id="S001",
+        block_id="B2",
+        component_ids=("C001_database",),
+        executor="shell",
+        command="./install.sh",
+        repo_id="fixture",
+        source_path="install.sh",
+        source_root=source,
+        working_directory=source,
+        attempt=1,
+        exit_code=1,
+        timed_out=False,
+        duration_seconds=1,
+        output_excerpt="preparation is missing",
+    )
+    agent = RecoveryAgent(
+        classifier=Classifier(),
+        probe_runner=ProbeRunner(command_runner=lambda *_args: (0, "ok")),
+        sandbox_root=tmp_path / "sandboxes",
+        model="test-model",
+    )
+
+    first = agent.resolve(failure)
+    second_failure = replace(
+        failure,
+        history=(first.reason,),
+        evidence_signatures=(first.evidence_signature,),
+    )
+    second = agent.resolve(second_failure)
+    third = agent.resolve(
+        replace(
+            second_failure,
+            history=(*second_failure.history, second.reason),
+            evidence_signatures=(*second_failure.evidence_signatures, second.evidence_signature),
+        )
+    )
+
+    assert first.status == second.status == RecoveryStatus.RETRYABLE
+    assert third.status == RecoveryStatus.EXHAUSTED
+    assert "no new evidence" in third.reason
+    assert calls == 2

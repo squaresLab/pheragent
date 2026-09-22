@@ -123,6 +123,7 @@ class WorkflowStepStatus(StrEnum):
 class WorkflowStepKind(StrEnum):
     COMPONENT = "component"
     ACTION = "action"
+    VALIDATION = "validation"
 
 
 class DeploymentSelection(ContractModel):
@@ -250,6 +251,8 @@ class ValidationSignal(ContractModel):
     check: str = Field(min_length=1)
     readiness: str | None = None
     source_ref: AnalysisSourceRef
+    command: str | None = None
+    working_directory: str | None = None
 
 
 class ComponentDeployment(ContractModel):
@@ -363,6 +366,7 @@ class DeploymentWorkflowStep(ContractModel):
     targets: list[WorkflowTarget] = Field(min_length=1)
     action_id: str | None = None
     action_name: str | None = None
+    action_type: DeploymentActionType | None = None
     executor: AnalysisExecutor
     source_ref: AnalysisSourceRef
     operation_source_ref: AnalysisSourceRef | None = None
@@ -468,56 +472,6 @@ class FunctionalBlock(ContractModel):
     components: list[FunctionalComponent] = Field(default_factory=list)
 
 
-class AnalysisEvaluation(ContractModel):
-    candidate_component_count: int = Field(default=0, ge=0)
-    component_count: int = Field(ge=0)
-    implementation_detail_count: int = Field(default=0, ge=0)
-    uncertain_component_count: int = Field(default=0, ge=0)
-    deployable_component_count: int = Field(ge=0)
-    deployability_coverage: float = Field(ge=0.0, le=1.0)
-    grounded_component_rate: float = Field(ge=0.0, le=1.0)
-    forbidden_component_count: int = Field(ge=0)
-    relation_count: int = Field(ge=0)
-    source_derived_relation_count: int = Field(ge=0)
-    artifact_line_count: int = Field(default=0, ge=0)
-    llm_input_tokens: int = Field(default=0, ge=0)
-    llm_output_tokens: int = Field(default=0, ge=0)
-    llm_requests: int = Field(default=0, ge=0)
-    llm_status: str = "not_requested"
-    llm_stages: dict[str, str] = Field(default_factory=dict)
-    component_precision: float | None = Field(default=None, ge=0.0, le=1.0)
-    component_recall: float | None = Field(default=None, ge=0.0, le=1.0)
-    classification_accuracy: float | None = Field(default=None, ge=0.0, le=1.0)
-    edge_precision: float | None = Field(default=None, ge=0.0, le=1.0)
-    edge_recall: float | None = Field(default=None, ge=0.0, le=1.0)
-    entrypoint_accuracy: float | None = Field(default=None, ge=0.0, le=1.0)
-    grouping_f1: float | None = Field(default=None, ge=0.0, le=1.0)
-    hallucination_rate: float = Field(default=0.0, ge=0.0, le=1.0)
-    discovery_closure: float = Field(default=0.0, ge=0.0, le=1.0)
-    executable_route_coverage: float = Field(default=0.0, ge=0.0, le=1.0)
-    orphan_component_count: int = Field(default=0, ge=0)
-    independently_grounded: bool = False
-
-
-class GoldClassification(ContractModel):
-    block_type: AnalysisBlockType
-    subtype: str = Field(min_length=1)
-
-
-class GoldEdge(ContractModel):
-    source: str = Field(min_length=1)
-    target: str = Field(min_length=1)
-
-
-class GoldDefinition(ContractModel):
-    expected_components: list[str] = Field(default_factory=list)
-    expected_classifications: dict[str, GoldClassification] = Field(default_factory=dict)
-    expected_major_edges: list[GoldEdge] = Field(default_factory=list)
-    expected_entrypoints: dict[str, str] = Field(default_factory=dict)
-    expected_groups: list[list[str]] = Field(default_factory=list)
-    forbidden_components: list[str] = Field(default_factory=list)
-
-
 class FunctionalBlocksDocument(ContractModel):
     version: str = Field(default="0.1", pattern=r"^0\.1$")
     system: str = Field(min_length=1)
@@ -525,4 +479,3 @@ class FunctionalBlocksDocument(ContractModel):
     blocks: list[FunctionalBlock] = Field(default_factory=list)
     levels: list[list[str]] = Field(default_factory=list)
     unresolved: list[AnalysisQuestion] = Field(default_factory=list)
-    evaluation: AnalysisEvaluation

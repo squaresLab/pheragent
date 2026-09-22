@@ -9,7 +9,7 @@ def test_run_recorder_seals_outputs_and_redacts_secrets(tmp_path: Path) -> None:
     recorder = RunRecorder.start(
         run_dir,
         run_kind="research",
-        analysis_method="a2",
+        analysis_method="a1",
         inputs={"context": "context.yaml", "password": "password=unsafe"},
     )
     (run_dir / "artifact.yaml").write_text("version: 1\n", encoding="utf-8")

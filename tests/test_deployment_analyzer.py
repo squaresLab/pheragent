@@ -29,7 +29,7 @@ def _minimal_context(path: Path) -> Path:
     return path
 
 
-def _write_fixture(root: Path) -> tuple[Path, Path, Path]:
+def _write_fixture(root: Path) -> tuple[Path, Path]:
     repository = root / "repository"
     (repository / "deployment/external/all").mkdir(parents=True)
     (repository / "deployment/mosip/all").mkdir(parents=True)
@@ -101,45 +101,11 @@ kubectl rollout status deployment/idrepo
         ),
         encoding="utf-8",
     )
-    gold = root / "gold.yaml"
-    gold.write_text(
-        yaml.safe_dump(
-            {
-                "expected_components": [
-                    "PostgreSQL",
-                    "Keycloak",
-                    "ActiveMQ",
-                    "Kafka",
-                    "Kernel",
-                    "Idrepo",
-                ],
-                "expected_classifications": {
-                    "PostgreSQL": {
-                        "block_type": "shared_services",
-                        "subtype": "data_services",
-                    },
-                    "Kafka": {
-                        "block_type": "shared_services",
-                        "subtype": "messaging_integration",
-                    },
-                },
-                "expected_major_edges": [
-                    {"source": "base_infrastructure", "target": "runtime_environment"},
-                    {"source": "runtime_environment", "target": "shared_services"},
-                    {"source": "shared_services", "target": "application"},
-                ],
-                "expected_groups": [["ActiveMQ", "Kafka"], ["Kernel", "Idrepo"]],
-                "forbidden_components": ["install.sh", "Command", "Step"],
-            },
-            sort_keys=False,
-        ),
-        encoding="utf-8",
-    )
-    return repository, context, gold
+    return repository, context
 
 
 def test_analyzer_discovers_grounded_components_and_order(tmp_path: Path) -> None:
-    repository, context, gold = _write_fixture(tmp_path)
+    repository, context = _write_fixture(tmp_path)
 
     result = run_repository_analysis(
         AnalysisConfig(
@@ -147,7 +113,6 @@ def test_analyzer_discovers_grounded_components_and_order(tmp_path: Path) -> Non
             documentation=[],
             context_path=context,
             cache_dir=tmp_path / "cache",
-            gold_path=gold,
             llm_enabled=False,
         )
     )
@@ -178,58 +143,7 @@ def test_analyzer_discovers_grounded_components_and_order(tmp_path: Path) -> Non
         and relation.relation == "ordered_before"
         for relation in result.signals.relations
     )
-    assert result.document.evaluation.component_recall == 1.0
-    assert result.document.evaluation.grouping_f1 == 1.0
-    assert result.document.evaluation.forbidden_component_count == 0
-    assert result.document.evaluation.deployability_coverage == 1.0
     assert any(block.type == AnalysisBlockType.SHARED_SERVICES for block in result.document.blocks)
-
-
-def test_human_gold_never_changes_discovery_or_synthesis(tmp_path: Path) -> None:
-    repository, context, reviewed_gold = _write_fixture(tmp_path)
-    incorrect_gold = tmp_path / "incorrect-gold.yaml"
-    incorrect_gold.write_text(
-        yaml.safe_dump(
-            {
-                "expected_components": ["Imaginary Component"],
-                "forbidden_components": [
-                    "PostgreSQL",
-                    "Keycloak",
-                    "ActiveMQ",
-                    "Kafka",
-                    "Kernel",
-                    "Idrepo",
-                ],
-                "expected_classifications": {
-                    "PostgreSQL": {
-                        "block_type": "operations",
-                        "subtype": "observability",
-                    }
-                },
-            }
-        ),
-        encoding="utf-8",
-    )
-
-    def analyze(gold_path: Path):
-        return run_repository_analysis(
-            AnalysisConfig(
-                repositories=[str(repository)],
-                documentation=[],
-                context_path=context,
-                cache_dir=tmp_path / "cache",
-                gold_path=gold_path,
-                llm_enabled=False,
-            )
-        )
-
-    reviewed = analyze(reviewed_gold)
-    incorrect = analyze(incorrect_gold)
-
-    assert reviewed.signals == incorrect.signals
-    assert reviewed.document.blocks == incorrect.document.blocks
-    assert reviewed.document.levels == incorrect.document.levels
-    assert reviewed.document.evaluation != incorrect.document.evaluation
 
 
 def test_timestamped_run_directories_do_not_overwrite(tmp_path: Path) -> None:
@@ -248,7 +162,7 @@ def test_analysis_pipeline_makes_two_bounded_llm_calls(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
-    repository, context, _gold = _write_fixture(tmp_path)
+    repository, context = _write_fixture(tmp_path)
     requests: list[str] = []
     response_formats: list[dict] = []
 
@@ -357,8 +271,8 @@ def test_analysis_pipeline_makes_two_bounded_llm_calls(
         "investigation_plan": "llm",
         "investigation_synthesis": "llm",
     }
-    assert first.document.evaluation.llm_requests == 2
-    assert first.document.evaluation.llm_input_tokens == 200
+    assert first.llm_usage["requests"] == 2
+    assert first.llm_usage["input_tokens"] == 200
     assert len(first.investigation.plan_input["source_outlines"]) <= 30
     assert all(
         "entrypoint" not in component
@@ -368,7 +282,7 @@ def test_analysis_pipeline_makes_two_bounded_llm_calls(
         "investigation_plan": "cache",
         "investigation_synthesis": "cache",
     }
-    assert second.document.evaluation.llm_requests == 0
+    assert second.llm_usage.get("requests", 0) == 0
     assert first.workflow.ready_for_execution is True
     workflow_steps = {step.targets[0].name: step for step in first.workflow.steps}
     assert workflow_steps["PostgreSQL"].command == "./install.sh"
@@ -455,7 +369,7 @@ def test_analyze_cli_writes_execution_readiness_outputs_in_timestamped_run(
     monkeypatch,
     capsys,
 ) -> None:
-    repository, context, _gold = _write_fixture(tmp_path)
+    repository, context = _write_fixture(tmp_path)
     output = tmp_path / "output"
     monkeypatch.chdir(tmp_path)
 

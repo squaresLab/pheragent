@@ -86,6 +86,8 @@ def test_runtime_inspection_uses_fixed_read_only_probes(tmp_path: Path) -> None:
     )
 
     assert snapshot.aws.instances[0].name == "worker-1"
+    assert snapshot.host.available
+    assert snapshot.host.cpu_count
     assert snapshot.kubernetes.server_version == "v1.36.3"
     assert snapshot.kubernetes.workloads[0].ready == 1
     assert snapshot.kubernetes.storage_classes[0].is_default is True
@@ -103,12 +105,12 @@ def test_runtime_inspection_uses_fixed_read_only_probes(tmp_path: Path) -> None:
     assert load_runtime_context(path) == snapshot
     prompt_context = compact_runtime_context(snapshot)
     assert prompt_context is not None
+    assert prompt_context["host"]["system"]
     assert prompt_context["kubernetes"]["services"] == []
     assert prompt_context["kubernetes"]["custom_resource_definitions"] == []
     assert prompt_context["kubernetes"]["storage_classes"][0]["is_default"] is True
     assert prompt_context["kubernetes"]["csi_drivers"][0]["name"] == "driver.longhorn.io"
     assert prompt_context["probe_results"][0]["succeeded"] is True
-
 
 def test_runtime_inspection_records_partial_failures() -> None:
     def fail(command: list[str], *, timeout: float) -> CommandResult:
@@ -118,5 +120,6 @@ def test_runtime_inspection_records_partial_failures() -> None:
 
     assert not snapshot.aws.available
     assert not snapshot.kubernetes.available
-    assert len(snapshot.probes) == 13
-    assert all(probe.error == "token=[REDACTED]" for probe in snapshot.probes)
+    assert len(snapshot.probes) == 14
+    assert snapshot.probes[0].provider == "host"
+    assert all(probe.error == "token=[REDACTED]" for probe in snapshot.probes[1:])

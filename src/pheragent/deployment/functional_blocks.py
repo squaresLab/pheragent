@@ -3,8 +3,6 @@ from __future__ import annotations
 import re
 from collections import defaultdict
 
-import yaml
-
 from .analysis_models import (
     AnalysisBlockType,
     AnalysisRelationType,
@@ -16,23 +14,15 @@ from .analysis_models import (
     FunctionalBlocksDocument,
     FunctionalComponent,
     FunctionalDeployRef,
-    GoldDefinition,
 )
-from .evaluation import evaluate_functional_blocks
 from .graph import add_dependency_if_acyclic, topological_levels
-from .source_manager import AcquiredSource
 
 
 def build_functional_blocks(
     context: DeploymentContext,
     signals: DeploymentSignalBundle,
-    sources: dict[str, AcquiredSource],
-    gold: GoldDefinition | None,
-    *,
-    llm_usage: dict[str, int],
-    llm_stage_statuses: dict[str, str],
 ) -> FunctionalBlocksDocument:
-    """Build and score the compact functional-block artifact from discovery signals."""
+    """Build the compact functional-block artifact from discovery signals."""
     blocks = _provided_blocks(context)
     next_id = _next_block_number(blocks)
     for name, block_type, subtype, components in _component_groups(signals):
@@ -40,34 +30,12 @@ def build_functional_blocks(
         next_id += 1
     _attach_dependencies(blocks, signals)
     levels = _block_levels(blocks)
-    evaluation = evaluate_functional_blocks(blocks, signals, sources, gold).model_copy(
-        update={
-            "llm_input_tokens": int(llm_usage.get("input_tokens", 0)),
-            "llm_output_tokens": int(llm_usage.get("output_tokens", 0)),
-            "llm_requests": int(llm_usage.get("requests", 0)),
-            "llm_status": "; ".join(
-                f"{stage}={status}" for stage, status in llm_stage_statuses.items()
-            ),
-            "llm_stages": llm_stage_statuses,
-        }
-    )
-    document = FunctionalBlocksDocument(
+    return FunctionalBlocksDocument(
         system=context.system,
         deployment=context.deployment,
         blocks=blocks,
         levels=levels,
         unresolved=signals.unresolved,
-        evaluation=evaluation,
-    )
-    line_count = len(
-        yaml.safe_dump(
-            document.model_dump(mode="json", exclude_none=True),
-            sort_keys=False,
-            allow_unicode=True,
-        ).splitlines()
-    )
-    return document.model_copy(
-        update={"evaluation": evaluation.model_copy(update={"artifact_line_count": line_count})}
     )
 
 

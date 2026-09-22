@@ -26,8 +26,11 @@ def publish_analysis_artifacts(
         write_yaml(staging / "unresolved-work.yaml", _unresolved_work(result))
         if result.runtime_context is not None:
             write_json(staging / ".heragent" / "runtime-context.json", result.runtime_context)
-        if result.knowledge_graph is not None:
-            write_json(staging / ".heragent" / "knowledge-graph.json", result.knowledge_graph)
+        if result.runtime_reconciliation is not None:
+            write_json(
+                staging / ".heragent" / "runtime-reconciliation.json",
+                result.runtime_reconciliation,
+            )
         if debug:
             _write_debug_artifacts(staging / ".heragent" / "debug", result)
         return transaction.commit()
@@ -77,7 +80,15 @@ def publish_execution_artifacts(
 def _execution_unresolved(report: ExecutionReport) -> dict[str, Any]:
     classified = {resolution.step_id: resolution for resolution in report.recoveries}
     return {
-        "complete": report.successful,
+        "complete": report.verified,
+        "unverified_components": [
+            {
+                "component": state.component_id,
+                "reason": "no successful source-grounded validation was observed",
+            }
+            for state in report.component_states
+            if state.status == "unverified"
+        ],
         "failed": [
             {
                 "step": issue.step_id,
@@ -143,39 +154,55 @@ def _changes_wiki(
     return "\n".join(lines) + "\n"
 
 
-def analysis_metrics(result: AnalysisResult) -> dict[str, Any]:
-    """Return comparison metrics derived from one completed analysis result."""
-    metrics = result.document.evaluation.model_dump(mode="json")
-    metrics.update(
-        {
-            "evidence_observations": len(result.investigation.observations),
-            "evidence_characters": result.evidence_characters,
-            "retrieval_queries": len(result.retrieval_queries),
-            "investigation_synthesis_rounds": result.investigation.synthesis_rounds,
-            "investigation_stop_reason": result.investigation.stop_reason,
-            "initial_unresolved": result.investigation.initial_unresolved,
-            "final_unresolved": (
-                len(result.investigation.synthesis.unresolved)
-                if result.investigation.synthesis is not None
-                else 0
-            ),
-            "runtime_probes": (
-                len(result.runtime_context.probes) if result.runtime_context else 0
-            ),
-            "runtime_probe_failures": (
-                sum(not probe.succeeded for probe in result.runtime_context.probes)
-                if result.runtime_context
-                else 0
-            ),
-            "graph_queries": len(result.graph_queries),
-            "graph_nodes": len(result.knowledge_graph.nodes) if result.knowledge_graph else 0,
-            "graph_edges": len(result.knowledge_graph.edges) if result.knowledge_graph else 0,
-            "graph_gaps_before_retrieval": (
-                len(result.knowledge_graph.gaps) if result.knowledge_graph else 0
-            ),
-        }
-    )
-    return metrics
+def analysis_run_metrics(result: AnalysisResult) -> dict[str, Any]:
+    """Return neutral run telemetry; quality scoring belongs to pheragent.evaluation."""
+    components = [component for block in result.document.blocks for component in block.components]
+    deployable = {component.id for component in components if component.deployable}
+    routed = {
+        target.id
+        for step in result.workflow.steps
+        if step.command and not step.blockers
+        for target in step.targets
+    }
+    return {
+        "candidate_component_count": len(result.signals.candidate_components),
+        "component_count": len(components),
+        "deployable_component_count": len(deployable),
+        "executable_route_coverage": len(deployable & routed) / len(deployable)
+        if deployable
+        else 1.0,
+        "relation_count": len(result.signals.relations),
+        "evidence_observations": len(result.investigation.observations),
+        "evidence_characters": result.evidence_characters,
+        "retrieval_queries": len(result.retrieval_queries),
+        "investigation_synthesis_rounds": result.investigation.synthesis_rounds,
+        "investigation_stop_reason": result.investigation.stop_reason,
+        "initial_unresolved": result.investigation.initial_unresolved,
+        "final_unresolved": (
+            len(result.investigation.synthesis.unresolved)
+            if result.investigation.synthesis is not None
+            else 0
+        ),
+        "llm_input_tokens": int(result.llm_usage.get("input_tokens", 0)),
+        "llm_output_tokens": int(result.llm_usage.get("output_tokens", 0)),
+        "llm_requests": int(result.llm_usage.get("requests", 0)),
+        "runtime_probes": len(result.runtime_context.probes) if result.runtime_context else 0,
+        "runtime_probe_failures": (
+            sum(not probe.succeeded for probe in result.runtime_context.probes)
+            if result.runtime_context
+            else 0
+        ),
+        "runtime_missing_capabilities": (
+            sum(check.status == "missing" for check in result.runtime_reconciliation.checks)
+            if result.runtime_reconciliation
+            else 0
+        ),
+        "runtime_unknown_capabilities": (
+            sum(check.status == "unknown" for check in result.runtime_reconciliation.checks)
+            if result.runtime_reconciliation
+            else 0
+        ),
+    }
 
 
 def _write_debug_artifacts(debug: Path, result: AnalysisResult) -> None:
