@@ -210,6 +210,12 @@ def test_structured_json_parser_does_not_salvage_a_nested_object() -> None:
         _parse_structured_json_object(truncated)
 
 
+def test_structured_json_parser_accepts_an_identical_duplicate() -> None:
+    response = '{"action":"search"}'
+
+    assert _parse_structured_json_object(response + response) == {"action": "search"}
+
+
 def test_synthesis_contract_keeps_only_compact_execution_decisions() -> None:
     schema = strict_response_format(
         InvestigationSynthesis,

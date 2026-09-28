@@ -30,32 +30,32 @@ sources:
       - "**/*.tar"
       - "**/*.gz"
 
-  - id: mosip-docs
-    kind: git
-    location: https://github.com/mosip/documentation.git
-    purpose: documentation
-    revision: 1.2.0
-    root_path: .
-    include_patterns:
-      - README*
-      - .gitbook.yaml
-      - docs/setup/**
-      - docs/roadmap-and-releases/releases/**
-    exclude_patterns:
-      - "**/.git/**"
-      - "**/node_modules/**"
-      - "**/vendor/**"
-      - "**/dist/**"
-      - "**/build/**"
-      - "**/target/**"
-      - "**/*.lock"
-      - "**/*.png"
-      - "**/*.jpg"
-      - "**/*.jpeg"
-      - "**/*.gif"
-      - "**/*.pdf"
-      - "**/*.doc"
-      - "**/*.docx"
-      - "**/*.zip"
-      - "**/*.tar"
-      - "**/*.gz"
+  # - id: mosip-docs
+  #   kind: git
+  #   location: https://github.com/mosip/documentation.git
+  #   purpose: documentation
+  #   revision: 1.2.0
+  #   root_path: .
+  #   include_patterns:
+  #     - README*
+  #     - .gitbook.yaml
+  #     - docs/setup/**
+  #     - docs/roadmap-and-releases/releases/**
+  #   exclude_patterns:
+  #     - "**/.git/**"
+  #     - "**/node_modules/**"
+  #     - "**/vendor/**"
+  #     - "**/dist/**"
+  #     - "**/build/**"
+  #     - "**/target/**"
+  #     - "**/*.lock"
+  #     - "**/*.png"
+  #     - "**/*.jpg"
+  #     - "**/*.jpeg"
+  #     - "**/*.gif"
+  #     - "**/*.pdf"
+  #     - "**/*.doc"
+  #     - "**/*.docx"
+  #     - "**/*.zip"
+  #     - "**/*.tar"
+  #     - "**/*.gz"

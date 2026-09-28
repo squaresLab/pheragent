@@ -392,17 +392,11 @@ def test_analyze_cli_writes_execution_readiness_outputs_in_timestamped_run(
     run_directories = list((output / "runs").iterdir())
     assert len(run_directories) == 1
     assert run_directories[0].name.endswith("-fixture")
-    assert sorted(path.name for path in run_directories[0].iterdir()) == [
-        ".heragent",
-        "deployment-workflow.yaml",
-        "functional-blocks.yaml",
-        "unresolved-work.yaml",
-    ]
-    assert sorted(path.name for path in (run_directories[0] / ".heragent").iterdir()) == [
-        "events.jsonl",
-        "metrics.json",
-        "run-manifest.json",
-    ]
+    assert (run_directories[0] / "deployment-tree.yaml").is_file()
+    assert (run_directories[0] / "deployment-workflow.yaml").is_file()
+    assert (run_directories[0] / "functional-blocks.yaml").is_file()
+    assert (run_directories[0] / "unresolved-work.yaml").is_file()
+    assert (run_directories[0] / ".heragent" / "sources.yaml").is_file()
     assert (output / ".source-cache").is_dir()
     workflow = yaml.safe_load(
         (run_directories[0] / "deployment-workflow.yaml").read_text(encoding="utf-8")
@@ -413,7 +407,7 @@ def test_analyze_cli_writes_execution_readiness_outputs_in_timestamped_run(
         )
     )
     assert workflow["ready_for_execution"] is False
-    assert manifest["analysis_method"] == "deployment-analysis-v1"
+    assert manifest["analysis_method"] == "recursive-oracle-v1"
     assert f"run: {run_directories[0]}" in capsys.readouterr().out
 
 

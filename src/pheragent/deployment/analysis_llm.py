@@ -34,7 +34,7 @@ class AnalysisLLMConfig:
     base_url_env: str = "OPENAI_BASE_URL"
     base_url: str | None = None
     timeout: float = 120.0
-    max_output_tokens: int = 5000
+    max_output_tokens: int | None = 5000
     max_requests: int = 2
     cache_dir: Path | None = None
     retry_failed: bool = False
@@ -94,10 +94,12 @@ class CachedStructuredClassifier:
     ) -> ClassificationOutcome[T]:
         serialized = json.dumps(payload, sort_keys=True, separators=(",", ":"))
         estimate = max(1, len(serialized) // 4)
-        effective_output_tokens = min(
-            self._config.max_output_tokens,
-            output_token_limit or self._config.max_output_tokens,
-        )
+        limits = [
+            limit
+            for limit in (self._config.max_output_tokens, output_token_limit)
+            if limit is not None
+        ]
+        effective_output_tokens = min(limits) if limits else None
         if not self._config.enabled:
             return ClassificationOutcome(
                 None,
@@ -249,9 +251,10 @@ class CachedStructuredClassifier:
                     }
                 ],
                 "text": {"format": response_format},
-                "max_output_tokens": effective_output_tokens,
                 "stream": True,
             }
+            if effective_output_tokens is not None:
+                request["max_output_tokens"] = effective_output_tokens
             if self._config.reasoning_effort:
                 request["reasoning"] = {"effort": self._config.reasoning_effort}
             stream = client.responses.create(**request)
@@ -350,13 +353,20 @@ def _make_schema_strict(node: Any) -> None:
     if not isinstance(node, dict):
         return
 
-    node.pop("default", None)
-    node.pop("title", None)
     properties = node.get("properties")
     if isinstance(properties, dict):
+        node.pop("default", None)
+        node.pop("title", None)
         node["additionalProperties"] = False
         node["required"] = list(properties)
-    for value in node.values():
+        for value in properties.values():
+            _make_schema_strict(value)
+    else:
+        node.pop("default", None)
+        node.pop("title", None)
+    for key, value in node.items():
+        if key == "properties":
+            continue
         _make_schema_strict(value)
 
 
@@ -374,7 +384,7 @@ def _cache_key(
     model: str,
     payload: dict[str, Any],
     response_format: dict[str, Any],
-    max_output_tokens: int,
+    max_output_tokens: int | None,
     reasoning_effort: str | None,
 ) -> str:
     return hashlib.sha256(
@@ -398,6 +408,15 @@ def _parse_structured_json_object(content: str) -> dict[str, Any]:
     try:
         value = json.loads(content)
     except json.JSONDecodeError as exc:
+        decoder = json.JSONDecoder()
+        try:
+            first, end = decoder.raw_decode(content)
+            second = json.loads(content[end:])
+        except (json.JSONDecodeError, TypeError, ValueError):
+            pass
+        else:
+            if isinstance(first, dict) and second == first:
+                return first
         raise ValueError(
             f"structured response was not complete JSON: {exc.msg} at character {exc.pos}"
         ) from None

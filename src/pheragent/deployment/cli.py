@@ -12,28 +12,28 @@ from pydantic import ValidationError
 from .analysis_llm import (
     DEFAULT_ANALYSIS_MODEL,
     AnalysisLLMConfig,
-    ClassificationOutcome,
     LLMRequestBudget,
 )
-from .analyzer import AnalysisConfig, AnalysisResult, run_repository_analysis
+from .analysis_models import DeploymentContext
+from .analyzer import AnalysisConfig, _sources_config
 from .artifacts import (
-    analysis_run_metrics,
-    publish_analysis_artifacts,
     publish_execution_artifacts,
 )
 from .errors import DeploymentError, DeploymentInputError
 from .execution import ExecutionReport, prepare_execution
 from .output import create_timestamped_run_directory
 from .recovery import RecoveryAgent, RecoveryResolution, RunWorkspace, ThreadedRecoveryQueue
+from .recursive_compiler import compile_recursive_plan
+from .recursive_plan import run_recursive_planning
 from .run_records import RunRecorder
 from .runtime_context import (
     RuntimeInspectionConfig,
     inspect_runtime_context,
     load_runtime_context,
 )
-from .serialization import write_json
+from .serialization import load_sources_config, load_yaml, write_json, write_yaml
 
-_PRODUCT_ANALYSIS_POLICY = "deployment-analysis-v1"
+_PRODUCT_ANALYSIS_POLICY = "recursive-oracle-v1"
 
 
 def add_deployment_parser(subparsers: Any) -> None:
@@ -66,6 +66,11 @@ def _add_analyze_parser(commands: Any) -> None:
     )
     analyze.add_argument("--repo", action="append", default=[])
     analyze.add_argument("--docs", action="append", default=[])
+    analyze.add_argument(
+        "--sources",
+        type=Path,
+        help="Pinned source configuration; cannot be combined with --repo or --docs.",
+    )
     analyze.add_argument("--context", required=True, type=Path)
     analyze.add_argument(
         "--runtime-context",
@@ -80,6 +85,7 @@ def _add_analyze_parser(commands: Any) -> None:
         help="Label for the timestamped run folder; defaults to the context system name.",
     )
     analyze.add_argument("--node-budget", type=_positive_int, default=200)
+    analyze.add_argument("--max-depth", type=_positive_int, default=5)
     analyze.add_argument("--source-timeout", type=float, default=900.0)
     analyze.add_argument("--strict", action="store_true")
     analyze.add_argument("--model", default=None)
@@ -97,8 +103,8 @@ def _add_analyze_parser(commands: Any) -> None:
     analyze.add_argument(
         "--llm-max-requests",
         type=_positive_int,
-        default=2,
-        help="Analysis request cap; the bounded investigation never exceeds five calls.",
+        default=20,
+        help="Maximum recursive planning requests.",
     )
     analyze.add_argument(
         "--investigation-max-observations",
@@ -126,6 +132,11 @@ def _add_analyze_parser(commands: Any) -> None:
         "--debug",
         action="store_true",
         help="Write detailed repository and signal artifacts beneath debug/.",
+    )
+    analyze.add_argument(
+        "--resume-tree",
+        type=Path,
+        help="Resume a recursive tree after approving requested external sources.",
     )
 
 
@@ -242,14 +253,15 @@ def _run_analyze(args: argparse.Namespace) -> int:
         inputs={
             "repositories": args.repo,
             "documentation": args.docs,
+            "sources": args.sources,
             "context": args.context,
             "runtime_context": args.runtime_context,
             "model": args.model,
             "budgets": {
                 "node": args.node_budget,
+                "depth": args.max_depth,
                 "llm_requests": args.llm_max_requests,
                 "llm_output_tokens": args.llm_max_tokens,
-                "evidence_observations": args.investigation_max_observations,
                 "evidence_characters": args.investigation_max_evidence_chars,
             },
         },
@@ -260,27 +272,83 @@ def _run_analyze(args: argparse.Namespace) -> int:
         print(f"analyze: {message}", file=sys.stderr, flush=True)
 
     try:
-        result = run_repository_analysis(
-            _analysis_config(args, output_root),
+        context = DeploymentContext.model_validate(load_yaml(args.context.expanduser().resolve()))
+        if args.sources:
+            if args.repo or args.docs:
+                raise ValueError("--sources cannot be combined with --repo or --docs")
+            sources_path = args.sources.expanduser().resolve()
+            if load_sources_config(sources_path).system != context.system:
+                raise ValueError(
+                    "source configuration and deployment context name different systems"
+                )
+        else:
+            sources_path = run_dir / ".heragent" / "sources.yaml"
+            write_yaml(sources_path, _sources_config(args.repo, args.docs, context.system))
+        result = run_recursive_planning(
+            sources_path,
+            args.context,
+            output_root,
+            run_name=run_name,
+            model=_analysis_model(args),
+            reasoning_effort=args.llm_reasoning_effort,
+            max_depth=args.max_depth,
+            max_nodes=args.node_budget,
+            max_requests=args.llm_max_requests,
+            evidence_characters=args.investigation_max_evidence_chars,
+            max_output_tokens=args.llm_max_tokens,
+            timeout=args.llm_timeout,
+            runtime_context_path=args.runtime_context,
+            resume_tree=args.resume_tree,
+            run_dir=run_dir,
+            strict=args.strict,
+            source_timeout=args.source_timeout,
+            api_key_env=args.openai_api_key_env,
+            base_url_env=args.openai_base_url_env,
+            base_url=args.openai_base_url,
             progress=progress,
         )
-        publish_analysis_artifacts(run_dir, result, debug=args.debug)
-        for outcome in result.investigation.outcomes:
-            _record_llm_call(recorder, outcome, model=_analysis_model(args))
-        recorder.complete(
-            metrics=analysis_run_metrics(result),
-            sources=result.acquisition.manifest.model_dump(mode="json"),
-            llm={
-                "usage": result.llm_usage,
-                "stages": result.llm_stage_statuses,
+        document, workflow = compile_recursive_plan(result.plan, context)
+        write_yaml(run_dir / "functional-blocks.yaml", document)
+        write_yaml(run_dir / "deployment-workflow.yaml", workflow)
+        write_yaml(
+            run_dir / "unresolved-work.yaml",
+            {
+                "system": context.system,
+                "ready_for_execution": workflow.ready_for_execution,
+                "blocked_steps": [
+                    {"id": step.id, "reasons": step.blockers}
+                    for step in workflow.steps
+                    if step.blockers
+                ],
+                "questions": workflow.unresolved,
             },
+        )
+        metrics = {
+            **result.usage,
+            "component_count": sum(len(block.components) for block in document.blocks),
+            "workflow_steps": len(workflow.steps),
+            "workflow_ready": workflow.ready_for_execution,
+        }
+        recorder.complete(
+            metrics=metrics,
+            sources=load_yaml(run_dir / "source-manifest.json"),
+            llm={"usage": result.usage, "stages": {"recursive_plan": "completed"}},
         )
     except Exception as exc:
         recorder.fail(exc)
         progress(f"failed; run directory retained at {run_dir}")
         raise
 
-    _print_analysis_summary(run_dir, result, debug=args.debug)
+    print(f"run: {run_dir}")
+    print(f"deployment tree: {run_dir / 'deployment-tree.yaml'}")
+    print(f"functional blocks: {run_dir / 'functional-blocks.yaml'}")
+    print(f"deployment workflow: {run_dir / 'deployment-workflow.yaml'}")
+    print(f"unresolved work: {run_dir / 'unresolved-work.yaml'}")
+    print(f"ready for execution: {str(workflow.ready_for_execution).lower()}")
+    print(
+        f"components: {metrics['component_count']}; workflow steps: {metrics['workflow_steps']}; "
+        f"unresolved: {len(workflow.unresolved)}"
+    )
     return 0
 
 
@@ -310,41 +378,6 @@ def _analysis_config(args: argparse.Namespace, output_root: Path) -> AnalysisCon
             load_runtime_context(args.runtime_context) if args.runtime_context else None
         ),
     )
-
-
-def _print_analysis_summary(
-    run_dir: Path,
-    result: AnalysisResult,
-    *,
-    debug: bool,
-) -> None:
-    metrics = analysis_run_metrics(result)
-    print(f"run: {run_dir}")
-    print(f"functional blocks: {run_dir / 'functional-blocks.yaml'}")
-    print(f"deployment workflow: {run_dir / 'deployment-workflow.yaml'}")
-    print(f"unresolved work: {run_dir / 'unresolved-work.yaml'}")
-    print(f"ready for execution: {str(result.workflow.ready_for_execution).lower()}")
-    print(
-        f"components: {metrics['component_count']}; "
-        f"executable routes: {metrics['executable_route_coverage']:.1%}; "
-        f"unresolved: {len(result.workflow.unresolved)}"
-    )
-    if not debug:
-        return
-    print(
-        "LLM stages: "
-        + "; ".join(f"{stage}={status}" for stage, status in result.llm_stage_statuses.items())
-    )
-    print(f"LLM requests this run: {metrics['llm_requests']}")
-    for outcome in result.investigation.outcomes:
-        if outcome.value is None and outcome.warning:
-            print(f"LLM {outcome.stage}: {outcome.warning}")
-    print(
-        f"investigation: {result.investigation.synthesis_rounds} synthesis round(s); "
-        f"stopped={result.investigation.stop_reason}"
-    )
-    for failure_path in result.llm_failure_history_paths:
-        print(f"LLM failure history: {failure_path}")
 
 
 def _context_system_name(context_path: Path) -> str:
@@ -555,25 +588,6 @@ def _recovery_usage(report: ExecutionReport) -> dict[str, int]:
         for key, value in recovery.usage.items():
             usage[key] = usage.get(key, 0) + int(value)
     return usage
-
-
-def _record_llm_call(
-    recorder: RunRecorder,
-    outcome: ClassificationOutcome[Any],
-    *,
-    model: str,
-) -> None:
-    recorder.record_event(
-        "llm",
-        outcome.stage,
-        {
-            "model": model,
-            "status": outcome.status,
-            "usage": outcome.usage,
-            "input_tokens_estimate": outcome.input_tokens_estimate,
-            "duration_seconds": outcome.duration_seconds,
-        },
-    )
 
 
 def _parse_source_roots(values: list[str]) -> dict[str, Path]:
