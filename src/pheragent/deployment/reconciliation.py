@@ -341,7 +341,7 @@ def _probe(
         return CapabilityStatus.UNKNOWN, []
     return (
         CapabilityStatus.SATISFIED if present else CapabilityStatus.MISSING,
-        [f"runtime:{provider}/{name}"],
+        [f"runtime:probe:{provider}:{name}"],
     )
 
 
@@ -357,7 +357,7 @@ def _ingress(snapshot: RuntimeContextSnapshot) -> CapabilityEvidence:
         return CapabilityStatus.UNKNOWN, []
     return (
         CapabilityStatus.SATISFIED if present else CapabilityStatus.MISSING,
-        [f"runtime:kubernetes/{name}" for name in probes],
+        [f"runtime:probe:kubernetes:{name}" for name in probes],
     )
 
 
@@ -372,7 +372,7 @@ def _csi_provisioning(snapshot: RuntimeContextSnapshot) -> CapabilityEvidence:
     )
     return (
         CapabilityStatus.SATISFIED if present else CapabilityStatus.MISSING,
-        [f"runtime:kubernetes/{name}" for name in probes],
+        [f"runtime:probe:kubernetes:{name}" for name in probes],
     )
 
 

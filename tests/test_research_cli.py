@@ -211,7 +211,14 @@ def _recursive_fixture(tmp_path: Path) -> tuple[Path, Path]:
             {
                 "system": "fixture",
                 "deployment": {"profile": "local"},
-                "provided_blocks": [],
+                "provided_blocks": [
+                    {
+                        "id": "B0",
+                        "type": "runtime_environment",
+                        "subtype": "platform_services",
+                        "provides": ["persistent-storage"],
+                    }
+                ],
             }
         ),
         encoding="utf-8",
@@ -378,8 +385,10 @@ def test_recursive_oracle_finds_and_grounds_unlinked_command(
     report = (run_dir / "analysis-trace.md").read_text(encoding="utf-8")
     assert trace[0]["oracle_results"][0]["source"].startswith("fixture:")
     assert trace[1]["subquestions"][0]["title"] == "Install PostgreSQL"
+    assert trace[0]["input_sources"]["question"] == "deployment-tree.yaml#H1.1"
     assert "Oracle query: Fixture PostgreSQL deployment procedure" in report
     assert "Substep: Install PostgreSQL" in report
+    assert "Input `question`: deployment-tree.yaml#H1.1" in report
     output = capsys.readouterr()
     assert "planning complete: true" in output.out
     assert "oracle query: Fixture PostgreSQL deployment procedure" in output.err
@@ -411,7 +420,15 @@ def test_recursive_oracle_uses_ancestry_and_verified_runtime_state(
                     }
                 ],
             },
-            "probes": [],
+            "probes": [
+                {
+                    "provider": "kubernetes",
+                    "name": "storage_classes",
+                    "command": [],
+                    "succeeded": True,
+                    "duration_seconds": 0,
+                }
+            ],
             "warnings": [],
         },
     )
@@ -452,8 +469,22 @@ def test_recursive_oracle_uses_ancestry_and_verified_runtime_state(
     assert plan["deployment_ready"] is True
     assert usage["satisfied_leaves"] == 1
     assert payloads[-1]["tree_context"]["ancestors"][0]["id"] == "H1"
+    assert "deployment_context" not in payloads[-1]
+    assert payloads[-1]["deployment_intent"] == {
+        "system": "fixture",
+        "deployment": {"profile": "local"},
+        "exclusions": [],
+    }
     runtime_releases = payloads[-1]["runtime_context"]["kubernetes"]["helm_releases"]
     assert runtime_releases[0]["evidence_id"] == runtime_id
+    assert "workloads" not in payloads[-1]["runtime_context"]["kubernetes"]
+    checks = payloads[-1]["runtime_context"]["provided_capability_checks"]
+    assert checks[0]["status"] == "missing"
+    run_dir = next((tmp_path / "recursive" / "runs").iterdir())
+    effective_context = yaml.safe_load(
+        (run_dir / "effective-deployment-context.yaml").read_text(encoding="utf-8")
+    )
+    assert effective_context["provided_blocks"][0].get("provides", []) == []
 
 
 def test_recursive_plan_resumes_only_human_approved_external_source(tmp_path: Path) -> None:

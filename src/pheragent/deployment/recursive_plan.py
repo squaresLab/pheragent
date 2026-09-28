@@ -23,6 +23,11 @@ from pheragent.deployment.analysis_models import AnalysisSourceRef, DeploymentCo
 from pheragent.deployment.inventory import RepositoryInventoryBuilder
 from pheragent.deployment.models import ContractModel
 from pheragent.deployment.output import create_timestamped_run_directory
+from pheragent.deployment.reconciliation import (
+    RuntimeReconciliation,
+    apply_runtime_reconciliation,
+    reconcile_provided_capabilities,
+)
 from pheragent.deployment.runtime_context import (
     RuntimeContextSnapshot,
     compact_runtime_context,
@@ -80,6 +85,9 @@ Recursively resolve the plan:
 - Use the compact ancestry and sibling order to preserve parent intent. Runtime evidence may
   support any decision, but runtime state does not define deployment intent. A satisfied decision
   requires runtime evidence that proves the intended outcome is already healthy.
+- Treat provided capability checks as authoritative observations: skip satisfied capabilities,
+  investigate missing capabilities, and do not guess about unknown capabilities. Solve only the
+  current question; do not investigate unrelated components, versions, or configuration.
 - If names disagree, search each name and prefer the executable artifact after the harness verifies
   its command and directory. Broaden searches from direct paths, to aliases and nearby paths, to
   repository-wide deployment terms.
@@ -195,6 +203,7 @@ class RecursivePlan(ContractModel):
 class RecursivePlanResult:
     run_dir: Path
     plan: RecursivePlan
+    context: DeploymentContext
     usage: dict[str, int]
 
 
@@ -286,9 +295,19 @@ def run_recursive_planning(
     notify("building evidence oracle")
     oracle = EvidenceOracle.build(acquisition, inventory.entries)
     runtime_snapshot = load_runtime_context(runtime_context_path) if runtime_context_path else None
+    runtime_reconciliation = (
+        reconcile_provided_capabilities(context, runtime_snapshot) if runtime_snapshot else None
+    )
     if runtime_snapshot:
         write_json(run_dir / "runtime-context.json", runtime_snapshot)
-    runtime_context, runtime_evidence_ids = _runtime_prompt(runtime_snapshot)
+    if runtime_reconciliation:
+        write_yaml(run_dir / "runtime-reconciliation.yaml", runtime_reconciliation)
+        context = apply_runtime_reconciliation(context, runtime_reconciliation)
+    write_yaml(run_dir / "effective-deployment-context.yaml", context)
+    runtime_context, runtime_evidence_ids = _runtime_prompt(
+        runtime_snapshot,
+        runtime_reconciliation,
+    )
     budget = LLMRequestBudget(limit=max_requests)
     classifier = CachedStructuredClassifier(
         AnalysisLLMConfig(
@@ -438,7 +457,7 @@ def run_recursive_planning(
     }
     write_json(run_dir / "usage.json", metrics)
     _write_analysis_trace(run_dir / "analysis-trace.md", plan, trace, metrics)
-    return RecursivePlanResult(run_dir=run_dir, plan=plan, usage=usage)
+    return RecursivePlanResult(run_dir=run_dir, plan=plan, context=context, usage=usage)
 
 
 def _merge_usage(*items: dict[str, int]) -> dict[str, int]:
@@ -465,11 +484,16 @@ def _resolve_question(
     seen: set[str] = set()
     for round_number in range(_MAX_RETRIEVALS + 1):
         evidence_aliases = {f"E{index}": item.id for index, item in enumerate(evidence, start=1)}
+        deployment_intent = {
+            "system": context.system,
+            "deployment": context.deployment.model_dump(mode="json", exclude_none=True),
+            "exclusions": context.exclusions,
+        }
         outcome = _request_action(
             classifier,
             stage=f"recursive_oracle_{node.id.replace('.', '_')}_r{round_number}",
             payload={
-                "deployment_context": context.model_dump(mode="json", exclude_none=True),
+                "deployment_intent": deployment_intent,
                 "question": {"id": node.id, "title": node.title, "text": node.goal},
                 "tree_context": tree_context,
                 "runtime_context": runtime_context,
@@ -488,12 +512,35 @@ def _resolve_question(
         outcomes.append(outcome)
         event: dict[str, object] = {
             "node": node.id,
+            "question": {"title": node.title, "goal": node.goal},
             "round": round_number,
             "status": outcome.status,
             "evidence": [item.id for item in evidence],
             "usage": outcome.usage,
             "duration_seconds": outcome.duration_seconds,
             "input_tokens_estimate": outcome.input_tokens_estimate,
+            "input_sources": {
+                "deployment_intent": "effective-deployment-context.yaml",
+                "question": f"deployment-tree.yaml#{node.id}",
+                "tree_context": "deployment-tree.yaml ancestors and ordered siblings",
+                "runtime_context": (
+                    "runtime-context.json + runtime-reconciliation.yaml"
+                    if runtime_context
+                    else None
+                ),
+                "source_evidence": [
+                    f"{item.repo_id}:{item.path}:{item.start_line}-{item.end_line}"
+                    for item in evidence
+                ],
+            },
+            "input_summary": {
+                "deployment_intent": deployment_intent,
+                "runtime_capabilities": (
+                    runtime_context.get("provided_capability_checks", [])
+                    if runtime_context
+                    else []
+                ),
+            },
         }
         trace.append(event)
         if outcome.value is None:
@@ -643,6 +690,7 @@ def _write_analysis_trace(
             [
                 f"### {event['node']} · round {event['round']}",
                 "",
+                f"- Question: {event.get('question', {}).get('goal', '')}",
                 f"- Result: {event.get('action', event['status'])}",
                 f"- Duration: {event.get('duration_seconds', 0)} seconds",
                 f"- Tokens: {event.get('usage', {}).get('total_tokens', 0)}",
@@ -650,6 +698,20 @@ def _write_analysis_trace(
         )
         if reason := event.get("reason"):
             lines.append(f"- Reason: {reason}")
+        for name, origin in event.get("input_sources", {}).items():
+            if origin:
+                lines.append(f"- Input `{name}`: {origin}")
+        runtime_capabilities = event.get("input_summary", {}).get(
+            "runtime_capabilities", []
+        )
+        if runtime_capabilities:
+            lines.append(
+                "- Runtime checks: "
+                + ", ".join(
+                    f"{check['capability']}={check['status']}"
+                    for check in runtime_capabilities
+                )
+            )
         for query in event.get("queries", []):
             prefix = f" under `{query['path_prefix']}`" if query.get("path_prefix") else ""
             lines.append(f"- Oracle query: {query['text']}{prefix}")
@@ -684,7 +746,7 @@ def _request_action(
 ) -> ClassificationOutcome[StepAction]:
     return classifier.classify(
         stage=stage,
-        prompt_version="recursive-oracle-v4",
+        prompt_version="recursive-oracle-v6",
         instructions=_REASONING_PROMPT,
         payload=payload,
         response_format=strict_response_format(StepAction, name="step_action"),
@@ -915,6 +977,7 @@ def _tree_context(roots: list[PlanNode], current: PlanNode) -> dict[str, object]
 
 def _runtime_prompt(
     snapshot: RuntimeContextSnapshot | None,
+    reconciliation: RuntimeReconciliation | None = None,
 ) -> tuple[dict[str, object] | None, frozenset[str]]:
     compact = compact_runtime_context(snapshot)
     if compact is None:
@@ -931,26 +994,13 @@ def _runtime_prompt(
     aws = compact.get("aws")
     if isinstance(aws, dict) and aws.get("available"):
         add("runtime:aws", aws)
-        for item in aws.get("instances", []):
-            if isinstance(item, dict) and item.get("id"):
-                add(f"runtime:aws-instance:{item['id']}", item)
     kubernetes = compact.get("kubernetes")
     if isinstance(kubernetes, dict) and kubernetes.get("available"):
         add("runtime:kubernetes-api", kubernetes)
-        kubernetes["namespaces"] = [
-            {"name": name, "evidence_id": f"runtime:kubernetes:namespace:{name}"}
-            for name in kubernetes.get("namespaces", [])
-        ]
-        evidence_ids.update(item["evidence_id"] for item in kubernetes["namespaces"])
         for collection in (
-            "nodes",
-            "workloads",
-            "services",
-            "config_maps",
             "storage_classes",
             "csi_drivers",
             "ingress_classes",
-            "custom_resource_definitions",
             "helm_releases",
         ):
             for item in kubernetes.get(collection, []):
@@ -961,7 +1011,38 @@ def _runtime_prompt(
     for probe in compact.get("probe_results", []):
         if isinstance(probe, dict) and probe.get("succeeded"):
             add(f"runtime:probe:{probe.get('provider')}:{probe.get('name')}", probe)
-    return compact, frozenset(evidence_ids)
+    kubernetes_summary = compact.get("kubernetes", {})
+    return {
+        "captured_at": compact.get("captured_at"),
+        "host": compact.get("host"),
+        "aws": {
+            key: value
+            for key, value in compact.get("aws", {}).items()
+            if key in {"available", "region", "evidence_id"}
+        },
+        "kubernetes": {
+            key: value
+            for key, value in kubernetes_summary.items()
+            if key
+            in {
+                "available",
+                "context",
+                "server_version",
+                "counts",
+                "evidence_id",
+                "storage_classes",
+                "csi_drivers",
+                "ingress_classes",
+                "helm_releases",
+            }
+        },
+        "provided_capability_checks": (
+            [check.model_dump(mode="json") for check in reconciliation.checks]
+            if reconciliation
+            else []
+        ),
+        "interpretation": compact.get("interpretation"),
+    }, frozenset(evidence_ids)
 
 
 def _fingerprint(node: PlanNode) -> tuple[str, str]:

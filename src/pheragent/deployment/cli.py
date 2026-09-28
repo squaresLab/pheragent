@@ -313,7 +313,7 @@ def _run_analyze(args: argparse.Namespace) -> int:
             base_url=args.openai_base_url,
             progress=progress,
         )
-        document, workflow = compile_recursive_plan(result.plan, context)
+        document, workflow = compile_recursive_plan(result.plan, result.context)
         write_yaml(run_dir / "functional-blocks.yaml", document)
         write_yaml(run_dir / "deployment-workflow.yaml", workflow)
         write_yaml(
