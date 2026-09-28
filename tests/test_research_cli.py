@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 import yaml
 
 from pheragent.cli import main
@@ -16,6 +17,7 @@ from pheragent.deployment.recursive_plan import (
     PlanNode,
     RecursivePlan,
     RequiredInput,
+    SearchQuery,
     StepAction,
     StepState,
     _load_plan,
@@ -580,6 +582,34 @@ def test_step_action_keeps_secret_values_out_of_contract() -> None:
 
     _validate_action(action, has_evidence=True)
     assert "value" not in RequiredInput.model_fields
+
+
+def test_search_action_accepts_verified_runtime_evidence() -> None:
+    runtime_id = "runtime:kubernetes:storage_classes"
+    action = StepAction(
+        action=ActionKind.SEARCH,
+        reason="Runtime storage is absent, so find the documented provider.",
+        queries=[SearchQuery(text="persistent storage installation")],
+        runtime_evidence_ids=[runtime_id],
+    )
+
+    _validate_action(
+        action,
+        has_evidence=False,
+        runtime_evidence_ids=frozenset({runtime_id}),
+    )
+
+
+def test_action_rejects_unknown_runtime_evidence() -> None:
+    action = StepAction(
+        action=ActionKind.SEARCH,
+        reason="Find the documented storage provider.",
+        queries=[SearchQuery(text="persistent storage installation")],
+        runtime_evidence_ids=["runtime:invented"],
+    )
+
+    with pytest.raises(ValueError, match="unknown runtime evidence"):
+        _validate_action(action, has_evidence=False)
 
 
 def test_recursive_plan_schema_preserves_action_fields() -> None:

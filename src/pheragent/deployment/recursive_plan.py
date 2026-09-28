@@ -77,8 +77,9 @@ Recursively resolve the plan:
   external_source, satisfied, or unresolved. Attach human input to the narrowest step that needs
   it.
 - An exact aggregate installer may be executable when it fully answers the current question.
-- Use the compact ancestry and sibling order to preserve parent intent. Use runtime evidence only
-  to decide whether an intended outcome is already satisfied; runtime state does not define intent.
+- Use the compact ancestry and sibling order to preserve parent intent. Runtime evidence may
+  support any decision, but runtime state does not define deployment intent. A satisfied decision
+  requires runtime evidence that proves the intended outcome is already healthy.
 - If names disagree, search each name and prefer the executable artifact after the harness verifies
   its command and directory. Broaden searches from direct paths, to aliases and nearby paths, to
   repository-wide deployment terms.
@@ -683,7 +684,7 @@ def _request_action(
 ) -> ClassificationOutcome[StepAction]:
     return classifier.classify(
         stage=stage,
-        prompt_version="recursive-oracle-v3",
+        prompt_version="recursive-oracle-v4",
         instructions=_REASONING_PROMPT,
         payload=payload,
         response_format=strict_response_format(StepAction, name="step_action"),
@@ -702,6 +703,9 @@ def _validate_action(
     *,
     runtime_evidence_ids: frozenset[str] = frozenset(),
 ) -> None:
+    unknown_runtime_evidence = set(action.runtime_evidence_ids) - runtime_evidence_ids
+    if unknown_runtime_evidence:
+        raise ValueError("action cites unknown runtime evidence")
     if not has_evidence and action.action != ActionKind.SEARCH:
         raise ValueError("a question without evidence must search first")
     if action.action == ActionKind.SEARCH and not action.queries:
@@ -716,12 +720,10 @@ def _validate_action(
         raise ValueError("human input action requires named inputs")
     if action.action == ActionKind.EXTERNAL_SOURCE and action.external_source is None:
         raise ValueError("external source action requires a source request")
-    if action.action == ActionKind.SATISFIED:
-        if not action.runtime_evidence_ids or not action.success_check:
-            raise ValueError("satisfied action requires runtime evidence and a success check")
-        unknown = set(action.runtime_evidence_ids) - runtime_evidence_ids
-        if unknown:
-            raise ValueError("satisfied action cites unknown runtime evidence")
+    if action.action == ActionKind.SATISFIED and (
+        not action.runtime_evidence_ids or not action.success_check
+    ):
+        raise ValueError("satisfied action requires runtime evidence and a success check")
     if action.action not in {ActionKind.SEARCH, ActionKind.UNRESOLVED} and not action.evidence_ids:
         raise ValueError(f"{action.action.value} action requires evidence")
     if action.action != ActionKind.SEARCH and action.queries:
@@ -734,8 +736,6 @@ def _validate_action(
         raise ValueError("only executable or satisfied actions may contain a success check")
     if action.action != ActionKind.HUMAN_INPUT and action.required_inputs:
         raise ValueError("only human input actions may contain required inputs")
-    if action.action != ActionKind.SATISFIED and action.runtime_evidence_ids:
-        raise ValueError("only satisfied actions may contain runtime evidence")
     if action.action != ActionKind.EXTERNAL_SOURCE and action.external_source is not None:
         raise ValueError("only external source actions may contain a source request")
 
