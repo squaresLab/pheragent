@@ -7,9 +7,9 @@ from typing import Any
 
 from pydantic import ValidationError
 
+from pheragent.deployment.one_shot import run_one_shot
 from pheragent.deployment.recursive_plan import run_recursive_planning
 
-from .one_shot import run_one_shot
 from .runner import (
     ResearchTreatment,
     describe_study,
@@ -74,6 +74,7 @@ def add_research_parser(subparsers: Any) -> None:
     recursive.add_argument("--max-depth", type=_positive_int, default=5)
     recursive.add_argument("--max-nodes", type=_positive_int, default=60)
     recursive.add_argument("--max-requests", type=_positive_int, default=20)
+    recursive.add_argument("--action-budget", type=_positive_int, default=None)
     recursive.add_argument("--evidence-characters", type=_positive_int, default=24_000)
     recursive.add_argument("--max-output-tokens", type=_positive_int, default=5_000)
     recursive.add_argument("--timeout", type=float, default=300.0)
@@ -108,7 +109,7 @@ def run_research_command(args: argparse.Namespace) -> int:
             usage = result.usage
             print(f"run: {result.run_dir}")
             print(f"corpus: {result.run_dir / 'corpus.txt'}")
-            print(f"functional blocks: {result.run_dir / 'functional-blocks.yaml'}")
+            print(f"deployment outline: {result.run_dir / 'deployment-outline.yaml'}")
             print(
                 "LLM usage: "
                 f"input={usage.get('input_tokens', 0)}; "
@@ -128,6 +129,7 @@ def run_research_command(args: argparse.Namespace) -> int:
                 max_depth=args.max_depth,
                 max_nodes=args.max_nodes,
                 max_requests=args.max_requests,
+                max_actions=args.action_budget,
                 evidence_characters=args.evidence_characters,
                 max_output_tokens=args.max_output_tokens,
                 timeout=args.timeout,

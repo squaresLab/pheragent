@@ -372,6 +372,64 @@ def test_analyze_cli_writes_execution_readiness_outputs_in_timestamped_run(
     repository, context = _write_fixture(tmp_path)
     output = tmp_path / "output"
     monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("TEST_OPENAI_KEY", "test-key")
+
+    class Responses:
+        def create(self, **payload):
+            request = json.loads(payload["input"][0]["content"][0]["text"])
+            if "source_corpus" in request:
+                response = {
+                    "system": "fixture",
+                    "stages": [
+                        {
+                            "title": "Deploy fixture",
+                            "goal": "Make the fixture system ready.",
+                            "children": [],
+                        }
+                    ],
+                }
+            elif not request["evidence"]:
+                response = {
+                    "action": "search",
+                    "reason": "Find the documented deployment procedure.",
+                    "queries": [{"text": "fixture deployment", "path_prefix": None}],
+                    "subquestions": [],
+                    "command": None,
+                    "working_directory": None,
+                    "success_check": None,
+                    "evidence_ids": [],
+                    "runtime_evidence_ids": [],
+                    "required_inputs": [],
+                    "external_source": None,
+                }
+            else:
+                response = {
+                    "action": "unresolved",
+                    "reason": "The fixture response intentionally stops planning.",
+                    "queries": [],
+                    "subquestions": [],
+                    "command": None,
+                    "working_directory": None,
+                    "success_check": None,
+                    "evidence_ids": [],
+                    "runtime_evidence_ids": [],
+                    "required_inputs": [],
+                    "external_source": None,
+                }
+            return [
+                {"type": "response.output_text.delta", "delta": json.dumps(response)},
+                {
+                    "type": "response.completed",
+                    "response": {
+                        "usage": {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15}
+                    },
+                },
+            ]
+
+    monkeypatch.setattr(
+        "pheragent.deployment.analysis_llm._openai_client",
+        lambda **_kwargs: SimpleNamespace(responses=Responses()),
+    )
 
     exit_code = main(
         [
@@ -384,7 +442,7 @@ def test_analyze_cli_writes_execution_readiness_outputs_in_timestamped_run(
             "--output",
             str(output),
             "--openai-api-key-env",
-            "TEST_MISSING_OPENAI_KEY",
+            "TEST_OPENAI_KEY",
         ]
     )
 
@@ -407,7 +465,7 @@ def test_analyze_cli_writes_execution_readiness_outputs_in_timestamped_run(
         )
     )
     assert workflow["ready_for_execution"] is False
-    assert manifest["analysis_method"] == "recursive-oracle-v1"
+    assert manifest["analysis_method"] == "rolling-reconciliation-v1"
     assert f"run: {run_directories[0]}" in capsys.readouterr().out
 
 

@@ -37,6 +37,7 @@ from pheragent.deployment.serialization import (
 from pheragent.deployment.source_manager import SourceManager
 
 from .evidence_oracle import Evidence, EvidenceOracle
+from .one_shot import DeploymentOutline, OutlineStep, run_one_shot
 
 ProgressCallback = Callable[[str], None]
 _MAX_RETRIEVALS = 3
@@ -215,11 +216,13 @@ def run_recursive_planning(
     max_depth: int = 5,
     max_nodes: int = 60,
     max_requests: int = 20,
+    max_actions: int | None = None,
     evidence_characters: int = 24_000,
     max_output_tokens: int = 5_000,
     timeout: float = 300.0,
     runtime_context_path: Path | None = None,
     resume_tree: Path | None = None,
+    outline: DeploymentOutline | None = None,
     run_dir: Path | None = None,
     strict: bool = True,
     source_timeout: float = 900.0,
@@ -241,6 +244,27 @@ def run_recursive_planning(
     sources_config = load_sources_config(sources_file)
     if sources_config.system != context.system:
         raise ValueError("source configuration and deployment context name different systems")
+    bootstrap_usage: dict[str, int] = {}
+    if resume_tree is None and outline is None:
+        notify("creating two-level deployment outline")
+        bootstrap = run_one_shot(
+            sources_file,
+            context_path,
+            output,
+            run_name=run_name,
+            model=model,
+            reasoning_effort=reasoning_effort,
+            timeout=timeout,
+            run_dir=run_dir,
+            strict=strict,
+            source_timeout=source_timeout,
+            api_key_env=api_key_env,
+            base_url_env=base_url_env,
+            base_url=base_url,
+            progress=notify,
+        )
+        outline = bootstrap.outline
+        bootstrap_usage = bootstrap.usage
     acquisition = SourceManager(
         cache_dir=output / ".source-cache",
         config_dir=sources_file.parent,
@@ -274,6 +298,7 @@ def run_recursive_planning(
     plan = _load_plan(
         context,
         resume_tree,
+        outline=outline,
         approved_locations={source.location for source in sources_config.sources},
     )
     all_nodes = list(_walk(plan.roots))
@@ -282,8 +307,14 @@ def run_recursive_planning(
     outcomes: list[ClassificationOutcome[StepAction]] = []
     trace: list[dict[str, object]] = []
     node_count = len(all_nodes)
+    actions_found = 0
 
-    while frontier and budget.remaining and node_count < max_nodes:
+    while (
+        frontier
+        and budget.remaining
+        and node_count < max_nodes
+        and (max_actions is None or actions_found < max_actions)
+    ):
         node = frontier.popleft()
         if node.depth >= max_depth:
             _block(node, f"maximum expansion depth {max_depth} reached")
@@ -321,16 +352,21 @@ def run_recursive_planning(
                 seen.add(fingerprint)
         node.children = children
         node_count += len(children)
+        if node.state == StepState.EXECUTABLE:
+            actions_found += 1
         for child in reversed(children):
             if child.state == StepState.PENDING:
                 frontier.appendleft(child)
 
-    limit_issue = (
-        "LLM request budget exhausted" if not budget.remaining else "planning node limit reached"
-    )
-    for node in frontier:
-        node.state = StepState.BUDGET_EXHAUSTED
-        node.issue = limit_issue
+    if frontier and (not budget.remaining or node_count >= max_nodes):
+        limit_issue = (
+            "LLM request budget exhausted"
+            if not budget.remaining
+            else "planning node limit reached"
+        )
+        for node in frontier:
+            node.state = StepState.BUDGET_EXHAUSTED
+            node.issue = limit_issue
     nodes = list(_walk(plan.roots))
     plan.planning_complete = not any(
         node.state in {StepState.PENDING, StepState.UNRESOLVED, StepState.BUDGET_EXHAUSTED}
@@ -340,7 +376,7 @@ def run_recursive_planning(
     plan.deployment_ready = bool(leaves) and all(
         node.state in {StepState.EXECUTABLE, StepState.SATISFIED} for node in leaves
     )
-    usage = aggregate_usage(*outcomes)
+    usage = _merge_usage(bootstrap_usage, aggregate_usage(*outcomes))
     grounded_commands = sum(node.state == StepState.EXECUTABLE for node in nodes)
     searches = sum(len(item.get("queries", [])) for item in trace)
     write_yaml(run_dir / "deployment-tree.yaml", plan)
@@ -381,6 +417,11 @@ def run_recursive_planning(
         },
     )
     return RecursivePlanResult(run_dir=run_dir, plan=plan, usage=usage)
+
+
+def _merge_usage(*items: dict[str, int]) -> dict[str, int]:
+    keys = {key for item in items for key in item}
+    return {key: sum(item.get(key, 0) for item in items) for key in keys}
 
 
 def _resolve_question(
@@ -660,9 +701,12 @@ def _load_plan(
     context: DeploymentContext,
     resume_tree: Path | None,
     *,
+    outline: DeploymentOutline | None = None,
     approved_locations: set[str],
 ) -> RecursivePlan:
     if resume_tree is None:
+        if outline is None:
+            raise ValueError("a deployment outline is required for a new plan")
         return RecursivePlan(
             system=context.system,
             deployment=context.deployment.model_dump(mode="json"),
@@ -672,6 +716,11 @@ def _load_plan(
                     title=f"Deploy {context.system}",
                     goal=f"How do I deploy {context.system} for the selected deployment profile?",
                     depth=0,
+                    state=StepState.EXPANDED,
+                    children=[
+                        _outline_node(stage, f"H1.{index}", 1)
+                        for index, stage in enumerate(outline.stages, start=1)
+                    ],
                 )
             ],
         )
@@ -683,6 +732,13 @@ def _load_plan(
     if selected != expected:
         raise ValueError("resumed tree and deployment context select different deployments")
     for node in _walk(plan.roots):
+        if node.state == StepState.EXECUTABLE:
+            node.state = StepState.PENDING
+            node.command = None
+            node.working_directory = None
+            node.execution_source_id = None
+            node.operation_source_ref = None
+            node.success_check = None
         if (
             node.state == StepState.EXTERNAL_SOURCE_REQUIRED
             and node.external_source
@@ -694,6 +750,20 @@ def _load_plan(
     plan.planning_complete = False
     plan.deployment_ready = False
     return plan
+
+
+def _outline_node(step: OutlineStep, identifier: str, depth: int) -> PlanNode:
+    return PlanNode(
+        id=identifier,
+        title=step.title,
+        goal=step.goal,
+        depth=depth,
+        state=StepState.EXPANDED if step.children else StepState.PENDING,
+        children=[
+            _outline_node(child, f"{identifier}.{index}", depth + 1)
+            for index, child in enumerate(step.children, start=1)
+        ],
+    )
 
 
 def _tree_context(roots: list[PlanNode], current: PlanNode) -> dict[str, object]:

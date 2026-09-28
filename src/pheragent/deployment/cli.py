@@ -15,7 +15,7 @@ from .analysis_llm import (
     LLMRequestBudget,
 )
 from .analysis_models import DeploymentContext
-from .analyzer import AnalysisConfig, _sources_config
+from .analyzer import _sources_config
 from .artifacts import (
     publish_execution_artifacts,
 )
@@ -29,11 +29,10 @@ from .run_records import RunRecorder
 from .runtime_context import (
     RuntimeInspectionConfig,
     inspect_runtime_context,
-    load_runtime_context,
 )
 from .serialization import load_sources_config, load_yaml, write_json, write_yaml
 
-_PRODUCT_ANALYSIS_POLICY = "recursive-oracle-v1"
+_PRODUCT_ANALYSIS_POLICY = "rolling-reconciliation-v1"
 
 
 def add_deployment_parser(subparsers: Any) -> None:
@@ -86,6 +85,12 @@ def _add_analyze_parser(commands: Any) -> None:
     )
     analyze.add_argument("--node-budget", type=_positive_int, default=200)
     analyze.add_argument("--max-depth", type=_positive_int, default=5)
+    analyze.add_argument(
+        "--action-budget",
+        type=_positive_int,
+        default=1,
+        help="Stop planning after this many new grounded actions; resume after observing them.",
+    )
     analyze.add_argument("--source-timeout", type=float, default=900.0)
     analyze.add_argument("--strict", action="store_true")
     analyze.add_argument("--model", default=None)
@@ -294,6 +299,7 @@ def _run_analyze(args: argparse.Namespace) -> int:
             max_depth=args.max_depth,
             max_nodes=args.node_budget,
             max_requests=args.llm_max_requests,
+            max_actions=args.action_budget,
             evidence_characters=args.investigation_max_evidence_chars,
             max_output_tokens=args.llm_max_tokens,
             timeout=args.llm_timeout,
@@ -332,7 +338,13 @@ def _run_analyze(args: argparse.Namespace) -> int:
         recorder.complete(
             metrics=metrics,
             sources=load_yaml(run_dir / "source-manifest.json"),
-            llm={"usage": result.usage, "stages": {"recursive_plan": "completed"}},
+            llm={
+                "usage": result.usage,
+                "stages": {
+                    "deployment_outline": "resumed" if args.resume_tree else "completed",
+                    "step_resolution": "completed",
+                },
+            },
         )
     except Exception as exc:
         recorder.fail(exc)
@@ -340,6 +352,8 @@ def _run_analyze(args: argparse.Namespace) -> int:
         raise
 
     print(f"run: {run_dir}")
+    if (run_dir / "deployment-outline.yaml").is_file():
+        print(f"deployment outline: {run_dir / 'deployment-outline.yaml'}")
     print(f"deployment tree: {run_dir / 'deployment-tree.yaml'}")
     print(f"functional blocks: {run_dir / 'functional-blocks.yaml'}")
     print(f"deployment workflow: {run_dir / 'deployment-workflow.yaml'}")
@@ -350,34 +364,6 @@ def _run_analyze(args: argparse.Namespace) -> int:
         f"unresolved: {len(workflow.unresolved)}"
     )
     return 0
-
-
-def _analysis_config(args: argparse.Namespace, output_root: Path) -> AnalysisConfig:
-    return AnalysisConfig(
-        repositories=args.repo,
-        documentation=args.docs,
-        context_path=args.context,
-        cache_dir=output_root / ".source-cache",
-        node_budget=args.node_budget,
-        strict=args.strict,
-        source_timeout=args.source_timeout,
-        model=_analysis_model(args),
-        api_key_env=args.openai_api_key_env,
-        base_url_env=args.openai_base_url_env,
-        base_url=args.openai_base_url,
-        llm_timeout=args.llm_timeout,
-        llm_max_output_tokens=args.llm_max_tokens,
-        llm_reasoning_effort=args.llm_reasoning_effort,
-        llm_max_requests=args.llm_max_requests,
-        llm_cache_dir=output_root / ".llm-cache",
-        retry_failed_llm=args.retry_failed_llm,
-        refresh_llm=args.refresh_llm,
-        investigation_max_observations=args.investigation_max_observations,
-        investigation_max_evidence_chars=args.investigation_max_evidence_chars,
-        runtime_context=(
-            load_runtime_context(args.runtime_context) if args.runtime_context else None
-        ),
-    )
 
 
 def _context_system_name(context_path: Path) -> str:

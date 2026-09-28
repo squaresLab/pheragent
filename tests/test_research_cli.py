@@ -103,7 +103,7 @@ def test_research_run_uses_product_analyzer_and_seals_results(
     assert "results:" in capsys.readouterr().out
 
 
-def test_research_one_shot_writes_complete_corpus_and_usage(
+def test_research_one_shot_writes_outline_corpus_and_usage(
     tmp_path: Path,
     monkeypatch,
     capsys,
@@ -116,14 +116,17 @@ def test_research_one_shot_writes_complete_corpus_and_usage(
     class Responses:
         def create(self, **payload):
             assert "max_output_tokens" not in payload
-            assert "fixture/install.sh" in payload["input"][0]["content"][0]["text"]
+            assert "install.sh" in payload["input"][0]["content"][0]["text"]
+            assert "echo deploy" not in payload["input"][0]["content"][0]["text"]
             document = {
-                "version": "0.1",
                 "system": "fixture",
-                "deployment": {"version": None, "profile": None},
-                "blocks": [],
-                "levels": [],
-                "unresolved": [],
+                "stages": [
+                    {
+                        "title": "Deploy fixture",
+                        "goal": "Make the fixture service ready.",
+                        "children": [],
+                    }
+                ],
             }
             return [
                 {"type": "response.output_text.delta", "delta": json.dumps(document)},
@@ -161,10 +164,9 @@ def test_research_one_shot_writes_complete_corpus_and_usage(
     assert exit_code == 0
     run_dir = next((output / "runs").iterdir())
     corpus = (run_dir / "corpus.txt").read_text(encoding="utf-8")
-    assert "PATH: fixture/install.sh" in corpus
-    assert "echo deploy" in corpus
-    assert "<<<END_DEPLOYMENT_FILE>>>" in corpus
-    assert (run_dir / "functional-blocks.yaml").is_file()
+    assert "  install.sh" in corpus
+    assert "echo deploy" not in corpus
+    assert (run_dir / "deployment-outline.yaml").is_file()
     usage = json.loads((run_dir / "usage.json").read_text(encoding="utf-8"))
     assert usage["total_tokens"] == 120
     assert "LLM usage: input=100; output=20" in capsys.readouterr().out
@@ -244,8 +246,33 @@ def _run_recursive(
     class Responses:
         def create(self, **payload):
             text = payload["input"][0]["content"][0]["text"]
+            request = json.loads(text)
+            if "source_corpus" in request:
+                document = {
+                    "system": "fixture",
+                    "stages": [
+                        {
+                            "title": "Deploy fixture",
+                            "goal": "How do I deploy the fixture system?",
+                            "children": [],
+                        }
+                    ],
+                }
+                return [
+                    {"type": "response.output_text.delta", "delta": json.dumps(document)},
+                    {
+                        "type": "response.completed",
+                        "response": {
+                            "usage": {
+                                "input_tokens": 10,
+                                "output_tokens": 5,
+                                "total_tokens": 15,
+                            }
+                        },
+                    },
+                ]
             if payloads is not None:
-                payloads.append(json.loads(text))
+                payloads.append(request)
             document = responses.pop(0)
             if document["action"] == "search":
                 assert '"evidence": []' in text
@@ -336,11 +363,11 @@ def test_recursive_oracle_finds_and_grounds_unlinked_command(
         payloads=payloads,
     )
 
-    leaf = plan["roots"][0]["children"][0]
+    leaf = plan["roots"][0]["children"][0]["children"][0]
     assert leaf["state"] == "executable"
     assert leaf["command"] == "./install.sh"
     assert plan["planning_complete"] is True
-    assert usage["requests"] == 4
+    assert usage["requests"] == 5
     assert usage["oracle_searches"] == 2
     assert usage["grounded_commands"] == 1
     assert payloads[1]["evidence"][0]["id"] == "E1"
@@ -408,7 +435,7 @@ def test_recursive_oracle_uses_ancestry_and_verified_runtime_state(
         payloads=payloads,
     )
 
-    leaf = plan["roots"][0]["children"][0]
+    leaf = plan["roots"][0]["children"][0]["children"][0]
     assert leaf["state"] == "satisfied"
     assert leaf["runtime_evidence_ids"] == [runtime_id]
     assert plan["deployment_ready"] is True
@@ -480,9 +507,52 @@ def test_recursive_oracle_rejects_command_missing_from_evidence(
         ],
     )
 
-    assert plan["roots"][0]["state"] == "unresolved"
-    assert plan["roots"][0]["issue"] == "rejected command: not present in cited evidence"
+    stage = plan["roots"][0]["children"][0]
+    assert stage["state"] == "unresolved"
+    assert stage["issue"] == "rejected command: not present in cited evidence"
     assert usage["rejected_commands"] == 1
+
+
+def test_recursive_oracle_stops_after_one_grounded_action(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    plan, _usage = _run_recursive(
+        tmp_path,
+        monkeypatch,
+        [
+            _action("search", queries=[{"text": "fixture deployment", "path_prefix": None}]),
+            _action(
+                "expand",
+                subquestions=[
+                    {"title": "Install database", "question": "How is the database installed?"},
+                    {"title": "Install API", "question": "How is the API installed?"},
+                ],
+                evidence_ids=["E1"],
+            ),
+            _action(
+                "search",
+                queries=[
+                    {
+                        "text": "PostgreSQL component install command",
+                        "path_prefix": "components/postgres",
+                    }
+                ],
+            ),
+            _action(
+                "executable",
+                command="./install.sh",
+                working_directory="components/postgres",
+                success_check="The installer exits successfully.",
+                evidence_ids=["E2"],
+            ),
+        ],
+        extra_args=["--action-budget", "1"],
+    )
+
+    children = plan["roots"][0]["children"][0]["children"]
+    assert [child["state"] for child in children] == ["executable", "pending"]
+    assert plan["planning_complete"] is False
 
 
 def test_step_action_keeps_secret_values_out_of_contract() -> None:

@@ -5,8 +5,7 @@ from pathlib import Path
 import pytest
 
 from pheragent.cli import _build_parser
-from pheragent.deployment.analysis_llm import DEFAULT_ANALYSIS_MODEL
-from pheragent.deployment.cli import _analysis_config, _terminal_approval
+from pheragent.deployment.cli import _terminal_approval
 from pheragent.deployment.recovery import RecoveryResolution, RecoveryStatus
 
 
@@ -15,7 +14,7 @@ def _isolate_project_dotenv(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> 
     monkeypatch.chdir(tmp_path)
 
 
-def test_deployment_analyze_can_force_fresh_llm_requests(
+def test_deployment_analyze_accepts_reasoning_options(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -38,9 +37,6 @@ def test_deployment_analyze_can_force_fresh_llm_requests(
 
     assert args.refresh_llm is True
     assert args.llm_reasoning_effort == "low"
-    config = _analysis_config(args, tmp_path)
-    assert config.llm_enabled is True
-    assert config.model == DEFAULT_ANALYSIS_MODEL
 
 
 def test_deployment_run_accepts_one_block_scope(tmp_path: Path) -> None:
