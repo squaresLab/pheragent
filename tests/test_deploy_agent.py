@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import json
 from pathlib import Path
 
@@ -9,6 +10,7 @@ import yaml
 from pheragent.deploy_agent import (
     Decision,
     DeploymentTask,
+    _execute,
     _policy,
     _target_command,
     run_deployment_agent,
@@ -179,8 +181,124 @@ def test_kubernetes_actions_use_the_declared_context() -> None:
         "get",
         "pods",
     ]
-    with pytest.raises(ValueError, match="omit --context"):
+    with pytest.raises(ValueError, match="must match the declared target context"):
         _target_command(["kubectl", "--context", "other", "get", "pods"], task)
+
+
+def test_matching_context_storage_check_is_read_only() -> None:
+    task = DeploymentTask.model_validate(
+        {
+            "task": {"objective": "sample"},
+            "sources": {"repositories": ["/tmp/sample"]},
+            "environment": {"type": "kubernetes", "context": "test-cluster"},
+        }
+    )
+    command = ["kubectl", "--context", "test-cluster", "get", "storageclass"]
+    assert _policy(command, task, mutating=False) == "allowed"
+    assert _target_command(command, task) == command
+
+
+def test_read_only_execute_is_observed_without_approval(tmp_path: Path, monkeypatch) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "README.md").write_text("Sample deployment source\n")
+    task_path = tmp_path / "task.yaml"
+    task_path.write_text(
+        yaml.safe_dump(
+            {
+                "task": {"objective": "Inspect storage"},
+                "sources": {"repositories": [str(source)]},
+                "environment": {"type": "kubernetes", "context": "target-cluster"},
+            }
+        )
+    )
+    monkeypatch.setattr("pheragent.deploy_agent._observe", lambda _task: {})
+    observed = []
+
+    def inspect(command, _task, **_kwargs):
+        observed.append(command)
+        return {"exit_code": 0, "stdout": "No resources found", "stderr": ""}
+
+    monkeypatch.setattr("pheragent.deploy_agent._command", inspect)
+    decisions = iter(
+        [
+            _decision(
+                "ACT",
+                "execute",
+                command=["kubectl", "--context", "target-cluster", "get", "storageclass"],
+            ),
+            _decision("BLOCKED", reason="inspection complete"),
+        ]
+    )
+
+    def decide(_state, _observation, _last_result, _sources, _cycle):
+        return next(decisions), {}
+
+    output = tmp_path / "preview"
+    report = run_deployment_agent(task_path, output, decide=decide)
+    assert report["status"] == "BLOCKED"
+    assert observed == [["kubectl", "--context", "target-cluster", "get", "storageclass"]]
+    assert report["mutating_actions"] == 0
+    assert not (output / "actions.jsonl").exists()
+
+
+def test_unfamiliar_mutation_requires_review_and_wrong_context_is_denied() -> None:
+    task = DeploymentTask.model_validate(
+        {
+            "task": {"objective": "sample"},
+            "sources": {"repositories": ["/tmp/sample"]},
+            "environment": {"type": "kubernetes", "context": "target-cluster"},
+            "constraints": {"allowed_namespaces": ["postgres"]},
+        }
+    )
+    assert _policy(
+        ["kubectl", "label", "pod", "db", "tested=yes", "-n", "postgres"], task, mutating=True
+    ).startswith("approval_required")
+    assert _policy(
+        ["kubectl", "--context", "other-cluster", "get", "pods"], task, mutating=False
+    ).startswith("denied")
+
+
+@pytest.mark.parametrize(("answer", "should_run"), [("n\n", False), ("y\n", True)])
+def test_kubernetes_change_waits_for_terminal_approval(
+    tmp_path: Path, monkeypatch, answer: str, should_run: bool
+) -> None:
+    task = DeploymentTask.model_validate(
+        {
+            "task": {"objective": "sample"},
+            "sources": {"repositories": ["/tmp/sample"]},
+            "environment": {"type": "kubernetes", "context": "target-cluster"},
+            "constraints": {"allowed_namespaces": ["postgres"]},
+        }
+    )
+    decision = _decision(
+        "ACT",
+        "execute",
+        command=["kubectl", "label", "pod", "db", "tested=yes", "-n", "postgres"],
+        evidence=["repository-1:README.md"],
+        expected_change="Pod has the label",
+        validation=[{"command": ["kubectl", "get", "pod", "db", "-n", "postgres"]}],
+    )
+
+    class Evidence:
+        def existing_refs(self, _references):
+            return {"repository-1:README.md"}
+
+    class Terminal(io.StringIO):
+        def isatty(self):
+            return True
+
+    commands = []
+
+    def run_command(command, _task, **_kwargs):
+        commands.append(command)
+        return {"exit_code": 0, "stdout": "", "stderr": ""}
+
+    monkeypatch.setattr("pheragent.deploy_agent.sys.stdin", Terminal(answer))
+    monkeypatch.setattr("pheragent.deploy_agent._command", run_command)
+    result = _execute(decision, task, Evidence(), tmp_path, enabled=True, approve=False, timeout=10)
+    assert (result["status"] == "validated") is should_run
+    assert any(command[3] == "label" for command in commands) is should_run
 
 
 def test_missing_key_stops_before_source_acquisition(tmp_path: Path, monkeypatch) -> None:
