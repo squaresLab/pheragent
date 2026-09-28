@@ -78,6 +78,7 @@ class OneShotResult:
     usage: dict[str, int]
     file_count: int
     corpus_characters: int
+    duration_seconds: float
 
 
 def run_one_shot(
@@ -170,7 +171,14 @@ def run_one_shot(
     if outcome.value is None:
         raise RuntimeError(outcome.warning or "one-shot deployment outline failed")
     write_yaml(run_dir / "deployment-outline.yaml", outcome.value)
-    return OneShotResult(run_dir, outcome.value, usage, file_count, len(corpus))
+    return OneShotResult(
+        run_dir,
+        outcome.value,
+        usage,
+        file_count,
+        len(corpus),
+        outcome.duration_seconds,
+    )
 
 
 def build_corpus(

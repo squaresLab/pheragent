@@ -32,6 +32,7 @@ from pheragent.deployment.serialization import (
     load_sources_config,
     load_yaml,
     write_json,
+    write_text,
     write_yaml,
 )
 from pheragent.deployment.source_manager import SourceManager
@@ -245,6 +246,7 @@ def run_recursive_planning(
     if sources_config.system != context.system:
         raise ValueError("source configuration and deployment context name different systems")
     bootstrap_usage: dict[str, int] = {}
+    outline_metrics: dict[str, object] = {}
     if resume_tree is None and outline is None:
         notify("creating two-level deployment outline")
         bootstrap = run_one_shot(
@@ -265,6 +267,12 @@ def run_recursive_planning(
         )
         outline = bootstrap.outline
         bootstrap_usage = bootstrap.usage
+        outline_metrics = {
+            "deployment_documents": bootstrap.file_count,
+            "corpus_characters": bootstrap.corpus_characters,
+            "duration_seconds": bootstrap.duration_seconds,
+            "usage": bootstrap.usage,
+        }
     acquisition = SourceManager(
         cache_dir=output / ".source-cache",
         config_dir=sources_file.parent,
@@ -376,7 +384,8 @@ def run_recursive_planning(
     plan.deployment_ready = bool(leaves) and all(
         node.state in {StepState.EXECUTABLE, StepState.SATISFIED} for node in leaves
     )
-    usage = _merge_usage(bootstrap_usage, aggregate_usage(*outcomes))
+    resolution_usage = aggregate_usage(*outcomes)
+    usage = _merge_usage(bootstrap_usage, resolution_usage)
     grounded_commands = sum(node.state == StepState.EXECUTABLE for node in nodes)
     searches = sum(len(item.get("queries", [])) for item in trace)
     write_yaml(run_dir / "deployment-tree.yaml", plan)
@@ -388,34 +397,46 @@ def run_recursive_planning(
     if source_requests:
         write_yaml(run_dir / "source-requests.yaml", {"sources": source_requests})
     write_json(run_dir / "trace.json", trace)
-    write_json(
-        run_dir / "usage.json",
-        {
-            "model": model,
-            "requests": usage.get("requests", 0),
-            "input_tokens": usage.get("input_tokens", 0),
-            "output_tokens": usage.get("output_tokens", 0),
-            "reasoning_tokens": usage.get("reasoning_tokens", 0),
-            "total_tokens": usage.get("total_tokens", 0),
-            "nodes": node_count,
-            "oracle_searches": searches,
-            "grounded_commands": grounded_commands,
-            "rejected_commands": sum(
-                bool(node.issue and node.issue.startswith("rejected command")) for node in nodes
-            ),
-            "human_required_leaves": sum(
-                node.state == StepState.HUMAN_REQUIRED for node in nodes
-            ),
-            "satisfied_leaves": sum(node.state == StepState.SATISFIED for node in nodes),
-            "external_source_requests": len(source_requests),
-            "unresolved_leaves": sum(node.state == StepState.UNRESOLVED for node in nodes),
-            "tokens_per_grounded_command": (
-                usage.get("total_tokens", 0) / grounded_commands if grounded_commands else None
-            ),
-            "planning_complete": plan.planning_complete,
-            "deployment_ready": plan.deployment_ready,
+    metrics = {
+        "model": model,
+        "requests": usage.get("requests", 0),
+        "input_tokens": usage.get("input_tokens", 0),
+        "output_tokens": usage.get("output_tokens", 0),
+        "reasoning_tokens": usage.get("reasoning_tokens", 0),
+        "total_tokens": usage.get("total_tokens", 0),
+        "nodes": node_count,
+        "oracle_searches": searches,
+        "grounded_commands": grounded_commands,
+        "rejected_commands": sum(
+            bool(node.issue and node.issue.startswith("rejected command")) for node in nodes
+        ),
+        "human_required_leaves": sum(node.state == StepState.HUMAN_REQUIRED for node in nodes),
+        "satisfied_leaves": sum(node.state == StepState.SATISFIED for node in nodes),
+        "external_source_requests": len(source_requests),
+        "unresolved_leaves": sum(node.state == StepState.UNRESOLVED for node in nodes),
+        "tokens_per_grounded_command": (
+            usage.get("total_tokens", 0) / grounded_commands if grounded_commands else None
+        ),
+        "planning_complete": plan.planning_complete,
+        "deployment_ready": plan.deployment_ready,
+        "runtime_context_supplied": runtime_snapshot is not None,
+        "limits": {
+            "max_depth": max_depth,
+            "max_nodes": max_nodes,
+            "max_requests": max_requests,
+            "max_actions": max_actions,
+            "evidence_characters": evidence_characters,
         },
-    )
+        "stages": {
+            "outline": outline_metrics,
+            "step_resolution": {
+                "duration_seconds": round(sum(outcome.duration_seconds for outcome in outcomes), 6),
+                "usage": resolution_usage,
+            },
+        },
+    }
+    write_json(run_dir / "usage.json", metrics)
+    _write_analysis_trace(run_dir / "analysis-trace.md", plan, trace, metrics)
     return RecursivePlanResult(run_dir=run_dir, plan=plan, usage=usage)
 
 
@@ -470,9 +491,12 @@ def _resolve_question(
             "status": outcome.status,
             "evidence": [item.id for item in evidence],
             "usage": outcome.usage,
+            "duration_seconds": outcome.duration_seconds,
+            "input_tokens_estimate": outcome.input_tokens_estimate,
         }
         trace.append(event)
         if outcome.value is None:
+            event["warning"] = outcome.warning
             return QuestionResolution(
                 None,
                 tuple(evidence),
@@ -489,8 +513,16 @@ def _resolve_question(
             }
         )
         event["action"] = action.action.value
+        event["reason"] = action.reason
         event["queries"] = [query.model_dump(mode="json") for query in action.queries]
+        event["subquestions"] = [
+            question.model_dump(mode="json") for question in action.subquestions
+        ]
         event["runtime_evidence"] = action.runtime_evidence_ids
+        if action.command:
+            event["command"] = action.command
+            event["working_directory"] = action.working_directory
+            event["success_check"] = action.success_check
         if action.action != ActionKind.SEARCH:
             return QuestionResolution(action, tuple(evidence), tuple(outcomes), tuple(trace))
         if round_number == _MAX_RETRIEVALS:
@@ -501,8 +533,10 @@ def _resolve_question(
                 tuple(trace),
                 "oracle retrieval limit reached",
             )
+        notify(f"{node.id}: oracle query: " + "; ".join(query.text for query in action.queries))
         retrieved = _search(oracle, action.queries, seen, evidence, evidence_characters)
         event["retrieved"] = [item.id for item in retrieved]
+        event["oracle_results"] = [_trace_evidence(item) for item in retrieved]
         retrieval_history.append(
             {
                 "queries": [query.model_dump(mode="json") for query in action.queries],
@@ -522,7 +556,10 @@ def _resolve_question(
             )
         evidence.extend(retrieved)
         seen.update(item.id for item in retrieved)
-        notify(f"answering {node.id} with {len(retrieved)} new evidence passage(s)")
+        notify(
+            f"{node.id}: oracle returned {len(retrieved)} passage(s): "
+            + ", ".join(f"{item.repo_id}:{item.path}" for item in retrieved)
+        )
     raise AssertionError("bounded retrieval loop did not terminate")
 
 
@@ -546,6 +583,94 @@ def _search(
             result.append(item.model_copy(update={"content": item.content[:remaining]}))
             remaining -= len(result[-1].content)
     return result
+
+
+def _trace_evidence(item: Evidence) -> dict[str, object]:
+    return {
+        "id": item.id,
+        "source": f"{item.repo_id}:{item.path}:{item.start_line}-{item.end_line}",
+        "kind": item.kind,
+        "score": item.score,
+        "excerpt": " ".join(item.content.split())[:600],
+    }
+
+
+def _write_analysis_trace(
+    path: Path,
+    plan: RecursivePlan,
+    trace: list[dict[str, object]],
+    metrics: dict[str, object],
+) -> None:
+    limits = metrics.get("limits", {})
+    stages = metrics.get("stages", {})
+    outline = stages.get("outline", {}) if isinstance(stages, dict) else {}
+    resolution = stages.get("step_resolution", {}) if isinstance(stages, dict) else {}
+    lines = [
+        "# Analysis trace",
+        "",
+        "This report records structured decisions and redacted evidence, "
+        "not hidden model reasoning.",
+        "",
+        "## Run summary",
+        "",
+        f"- Model: {metrics['model']}",
+        f"- LLM requests: {metrics['requests']}",
+        f"- Total tokens: {metrics['total_tokens']}",
+        f"- Oracle searches: {metrics['oracle_searches']}",
+        f"- Grounded commands: {metrics['grounded_commands']}",
+        "- Runtime context supplied: " + ("yes" if metrics["runtime_context_supplied"] else "no"),
+        "- Limits: "
+        + ", ".join(f"{key}={value}" for key, value in limits.items()),
+        "- Outline input: "
+        f"{outline.get('deployment_documents', 0)} documents, "
+        f"{outline.get('corpus_characters', 0)} characters",
+        f"- Outline duration: {outline.get('duration_seconds', 0)} seconds",
+        f"- Step-resolution duration: {resolution.get('duration_seconds', 0)} seconds",
+        "",
+        "## High-level deployment tracker",
+        "",
+    ]
+    for root in plan.roots:
+        for node in root.children or [root]:
+            lines.append(f"- {node.id}: {node.title} [{node.state.value}]")
+            lines.extend(
+                f"  - {child.id}: {child.title} [{child.state.value}]" for child in node.children
+            )
+    lines.extend(["", "## LLM and oracle calls", ""])
+    for event in trace:
+        lines.extend(
+            [
+                f"### {event['node']} · round {event['round']}",
+                "",
+                f"- Result: {event.get('action', event['status'])}",
+                f"- Duration: {event.get('duration_seconds', 0)} seconds",
+                f"- Tokens: {event.get('usage', {}).get('total_tokens', 0)}",
+            ]
+        )
+        if reason := event.get("reason"):
+            lines.append(f"- Reason: {reason}")
+        for query in event.get("queries", []):
+            prefix = f" under `{query['path_prefix']}`" if query.get("path_prefix") else ""
+            lines.append(f"- Oracle query: {query['text']}{prefix}")
+        for result in event.get("oracle_results", []):
+            lines.extend(
+                [
+                    f"- Oracle result: `{result['source']}` (score {result['score']:.3f})",
+                    f"  - {result['excerpt']}",
+                ]
+            )
+        for question in event.get("subquestions", []):
+            lines.append(f"- Substep: {question['title']} — {question['question']}")
+        if command := event.get("command"):
+            lines.append(f"- Command: `{command}` in `{event['working_directory']}`")
+        if warning := event.get("warning"):
+            lines.append(f"- Warning: {warning}")
+        lines.append("")
+    lines.extend(["## Current leaves", ""])
+    for node in (node for node in _walk(plan.roots) if not node.children):
+        detail = node.command or node.issue or node.success_check or "No detail recorded."
+        lines.append(f"- {node.id}: {node.title} [{node.state.value}] — {detail}")
+    write_text(path, "\n".join(lines) + "\n")
 
 
 def _request_action(

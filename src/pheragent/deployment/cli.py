@@ -355,6 +355,7 @@ def _run_analyze(args: argparse.Namespace) -> int:
     if (run_dir / "deployment-outline.yaml").is_file():
         print(f"deployment outline: {run_dir / 'deployment-outline.yaml'}")
     print(f"deployment tree: {run_dir / 'deployment-tree.yaml'}")
+    print(f"analysis trace: {run_dir / 'analysis-trace.md'}")
     print(f"functional blocks: {run_dir / 'functional-blocks.yaml'}")
     print(f"deployment workflow: {run_dir / 'deployment-workflow.yaml'}")
     print(f"unresolved work: {run_dir / 'unresolved-work.yaml'}")

@@ -140,6 +140,7 @@ def run_research_command(args: argparse.Namespace) -> int:
             usage = result.usage
             print(f"run: {result.run_dir}")
             print(f"deployment tree: {result.run_dir / 'deployment-tree.yaml'}")
+            print(f"analysis trace: {result.run_dir / 'analysis-trace.md'}")
             print(f"planning complete: {str(result.plan.planning_complete).lower()}")
             print(f"deployment ready: {str(result.plan.deployment_ready).lower()}")
             print(

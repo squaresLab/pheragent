@@ -371,7 +371,16 @@ def test_recursive_oracle_finds_and_grounds_unlinked_command(
     assert usage["oracle_searches"] == 2
     assert usage["grounded_commands"] == 1
     assert payloads[1]["evidence"][0]["id"] == "E1"
-    assert "planning complete: true" in capsys.readouterr().out
+    run_dir = next((tmp_path / "recursive" / "runs").iterdir())
+    trace = json.loads((run_dir / "trace.json").read_text(encoding="utf-8"))
+    report = (run_dir / "analysis-trace.md").read_text(encoding="utf-8")
+    assert trace[0]["oracle_results"][0]["source"].startswith("fixture:")
+    assert trace[1]["subquestions"][0]["title"] == "Install PostgreSQL"
+    assert "Oracle query: Fixture PostgreSQL deployment procedure" in report
+    assert "Substep: Install PostgreSQL" in report
+    output = capsys.readouterr()
+    assert "planning complete: true" in output.out
+    assert "oracle query: Fixture PostgreSQL deployment procedure" in output.err
 
 
 def test_recursive_oracle_uses_ancestry_and_verified_runtime_state(
