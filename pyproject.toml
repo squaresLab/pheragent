@@ -12,6 +12,7 @@ dependencies = [
 
 [project.scripts]
 pheragent = "pheragent.cli:main"
+heragentdeploy = "pheragent.deploy_agent_cli:main"
 
 [dependency-groups]
 dev = [
