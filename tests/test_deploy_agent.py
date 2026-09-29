@@ -8,8 +8,10 @@ import pytest
 import yaml
 
 from pheragent.deploy_agent import (
+    _INSTRUCTIONS,
     Decision,
     DeploymentTask,
+    _brief,
     _execute,
     _policy,
     _target_command,
@@ -151,6 +153,55 @@ def test_failed_action_reaches_next_decision(tmp_path: Path) -> None:
     assert report["status"] == "BLOCKED"
     assert calls[1]["status"] == "failed_validation"
     assert calls[1]["execution"]["exit_code"] == 1
+
+
+def test_route_choice_and_repeated_read_reach_next_decision(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "README.md").write_text("Use ./install.sh for this target.\n")
+    task = tmp_path / "task.yaml"
+    _task(task, source, tmp_path / "run")
+    seen = []
+    decisions = iter(
+        [
+            _decision("ACT", "read_file", source_path="repository-1:README.md"),
+            _decision(
+                "ACT",
+                "read_file",
+                source_path="repository-1:README.md",
+                selected_route="Use ./install.sh for this target",
+                evidence=["repository-1:README.md"],
+            ),
+            _decision("BLOCKED", reason="prerequisite is missing"),
+        ]
+    )
+
+    def decide(state, _observation, last_result, _sources, _cycle):
+        seen.append((state.copy(), last_result.copy()))
+        return next(decisions), {}
+
+    report = run_deployment_agent(task, tmp_path / "run", decide=decide)
+    assert report["status"] == "BLOCKED"
+    assert seen[2][0]["selected_route"] == {
+        "choice": "Use ./install.sh for this target",
+        "evidence": ["repository-1:README.md"],
+    }
+    assert seen[2][1]["text"] == seen[1][1]["text"]
+    assert seen[2][1]["repeated_result_count"] == 1
+
+
+def test_agent_prompt_requires_route_choice_and_deployment_progress() -> None:
+    assert "senior DevOps engineer" in _INSTRUCTIONS
+    assert "step by step" in _INSTRUCTIONS
+    assert "selected_route" in _INSTRUCTIONS
+
+
+def test_brief_retains_a_long_result_start_and_end() -> None:
+    result = "Default route is in this header.\n" + "x" * 7000 + "\nLast error is here."
+    brief = _brief(result)
+    assert "Default route" in brief
+    assert "Last error" in brief
+    assert len(brief) < len(result)
 
 
 def test_policy_denies_direct_and_disguised_destructive_commands() -> None:
