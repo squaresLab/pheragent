@@ -12,6 +12,7 @@ from pheragent.deploy_agent import (
     Decision,
     DeploymentTask,
     _brief,
+    _checks,
     _execute,
     _policy,
     _target_command,
@@ -152,7 +153,7 @@ def test_failed_action_reaches_next_decision(tmp_path: Path) -> None:
 
     report = run_deployment_agent(task, output, execute=True, decide=decide)
     assert report["status"] == "BLOCKED"
-    assert calls[1]["status"] == "failed_validation"
+    assert calls[1]["status"] == "command_failed"
     assert calls[1]["execution"]["exit_code"] == 1
 
 
@@ -402,6 +403,15 @@ def test_kubernetes_change_waits_for_terminal_approval(
 
     def run_command(command, _task, **_kwargs):
         commands.append(command)
+
+        if command[1:3] == ["config", "current-context"]:
+            return {"exit_code": 0, "stdout": "target-cluster\n", "stderr": ""}
+        if "get" in command and not any("label" in earlier for earlier in commands):
+            return {
+                "exit_code": 1,
+                "stdout": "",
+                "stderr": 'Error from server (NotFound): pods "db" not found',
+            }
         return {"exit_code": 0, "stdout": "", "stderr": ""}
 
     monkeypatch.setattr("pheragent.deploy_agent.sys.stdin", Terminal(answer))
@@ -502,14 +512,14 @@ def test_dynamic_goal_counts_only_new_outcomes(tmp_path: Path) -> None:
 
     report = run_deployment_agent(task, output, execute=True, decide=decide)
     assert report["status"] == "SUCCESS"
-    assert report["mutating_actions"] == 4
+    assert report["mutating_actions"] == 3
     assert [item["id"] for item in report["state"]["verified_outcomes"]] == ["storage", "service"]
     actions = [json.loads(line) for line in (output / "actions.jsonl").read_text().splitlines()]
-    assert [item["result"].get("new_outcome") for item in actions] == [
-        None,
-        "storage",
-        None,
-        "service",
+    assert [item["result"]["status"] for item in actions] == [
+        "validated",
+        "validated",
+        "already_satisfied",
+        "validated",
     ]
 
 
@@ -554,6 +564,7 @@ def test_preexisting_state_does_not_count_as_new_outcome(tmp_path: Path, script_
 
     report = run_deployment_agent(task, output, execute=True, decide=decide)
     assert report["status"] == "BLOCKED"
+    assert report["mutating_actions"] == 0
     assert report["state"]["verified_outcomes"] == []
 
 
@@ -589,3 +600,118 @@ def test_agent_asks_human_to_choose_between_supported_routes(tmp_path: Path, mon
     report = run_deployment_agent(task, output, decide=decide)
     assert report["state"]["selected_route"]["choice"] == "Use provider B"
     assert report["mutating_actions"] == 0
+
+
+def test_unknown_preflight_does_not_execute(tmp_path: Path, monkeypatch) -> None:
+    task = DeploymentTask.model_validate(
+        {
+            "task": {"objective": "sample"},
+            "sources": {"repositories": ["/tmp/sample"]},
+            "environment": {"type": "shell", "sandbox": True},
+        }
+    )
+    decision = _decision(
+        "ACT",
+        "execute",
+        command=["touch", str(tmp_path / "ready")],
+        evidence=["repository-1:README.md"],
+        expected_change="ready",
+        validation=[{"command": ["ls", str(tmp_path / "ready")]}],
+    )
+
+    class Evidence:
+        def existing_refs(self, _references):
+            return {"repository-1:README.md"}
+
+    calls = []
+
+    def cannot_read(command, _task, **_kwargs):
+        calls.append(command)
+        return {"exit_code": 1, "stdout": "", "stderr": "Permission denied"}
+
+    monkeypatch.setattr("pheragent.deploy_agent._source_grounded", lambda *_args: True)
+    monkeypatch.setattr("pheragent.deploy_agent._command", cannot_read)
+    result = _execute(decision, task, Evidence(), tmp_path, enabled=True, approve=False, timeout=10)
+    assert result["status"] == "needs_better_check"
+    assert calls == [["ls", str(tmp_path / "ready")]]
+
+
+def test_successful_command_without_verified_change_is_failure(tmp_path: Path, monkeypatch) -> None:
+    task = DeploymentTask.model_validate(
+        {
+            "task": {"objective": "sample"},
+            "sources": {"repositories": ["/tmp/sample"]},
+            "environment": {"type": "shell", "sandbox": True},
+        }
+    )
+    decision = _decision(
+        "ACT",
+        "execute",
+        command=["touch", str(tmp_path / "wrong-file")],
+        evidence=["repository-1:README.md"],
+        expected_change="ready",
+        validation=[{"command": ["ls", str(tmp_path / "ready")]}],
+    )
+
+    class Evidence:
+        def existing_refs(self, _references):
+            return {"repository-1:README.md"}
+
+    def run_command(command, _task, **_kwargs):
+        if command[0] == "ls":
+            return {"exit_code": 1, "stdout": "", "stderr": "No such file or directory"}
+        return {"exit_code": 0, "stdout": "", "stderr": ""}
+
+    monkeypatch.setattr("pheragent.deploy_agent._source_grounded", lambda *_args: True)
+    monkeypatch.setattr("pheragent.deploy_agent._command", run_command)
+    result = _execute(decision, task, Evidence(), tmp_path, enabled=True, approve=False, timeout=0)
+    assert result["status"] == "verification_failed"
+    assert result["execution"]["exit_code"] == 0
+
+
+def test_delayed_readiness_is_verified_before_next_action(tmp_path: Path, monkeypatch) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    script = source / "install.sh"
+    script.write_text("#!/bin/sh\ntouch ready\n")
+    script.chmod(0o755)
+    task = tmp_path / "task.yaml"
+    output = tmp_path / "run"
+    _task(task, source, output)
+    document = yaml.safe_load(task.read_text())
+    document["task"]["stop_after_verified_outcomes"] = 1
+    document.pop("success_checks")
+    task.write_text(yaml.safe_dump(document))
+    reads = 0
+
+    def delayed_checks(task, checks):
+        nonlocal reads
+        reads += 1
+        result = _checks(task, checks)
+        if reads == 2:
+            result[0]["passed"] = False
+        return result
+
+    monkeypatch.setattr("pheragent.deploy_agent.time.sleep", lambda _seconds: None)
+    monkeypatch.setattr("pheragent.deploy_agent._checks", delayed_checks)
+    decision = _decision(
+        "ACT",
+        "execute",
+        command=["./install.sh"],
+        working_directory="repository-1:.",
+        evidence=["repository-1:install.sh"],
+        expected_change="service ready",
+        outcome_id="service",
+        validation=[{"command": ["ls", str(output / "workspace/repository-1/ready")]}],
+    )
+
+    def decide(_state, _observation, _last_result, _sources, _cycle):
+        return decision, {}
+
+    report = run_deployment_agent(task, output, execute=True, decide=decide)
+    actions = [json.loads(line) for line in (output / "actions.jsonl").read_text().splitlines()]
+    assert report["status"] == "SUCCESS"
+    assert report["mutating_actions"] == 1
+    assert [item["result"]["status"] for item in actions] == ["validated"]
+    assert reads >= 3
+    assert [item["id"] for item in report["state"]["verified_outcomes"]] == ["service"]

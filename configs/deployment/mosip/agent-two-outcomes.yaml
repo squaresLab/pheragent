@@ -1,13 +1,11 @@
 task:
   objective: >-
-    Begin deploying MOSIP on the supplied Kubernetes cluster. Read the live state
+    Begin deploying the system described by the supplied sources on the target cluster. Read the live state
     and the supplied deployment repositories to identify what is already available,
     what the supported deployment requires next, and the next missing capability
     that can safely close that gap. Deploy and validate two distinct missing
     capabilities or components; do not count preparatory commands or resources
-    already present. Verify required Kubernetes infrastructure before installing
-    external dependencies. If storage is required but absent, investigate the
-    supported in-cluster storage routes before attempting its consumers. Ask the
+    already present. Infer prerequisites and order from the sources. Ask the
     human to choose only if multiple supported routes remain viable. Do not
     create or change AWS resources, delete data, or switch Kubernetes contexts.
   stop_after_verified_outcomes: 2
