@@ -196,6 +196,64 @@ def test_agent_prompt_requires_route_choice_and_deployment_progress() -> None:
     assert "selected_route" in _INSTRUCTIONS
 
 
+def test_agent_prompt_expands_missing_prerequisites_before_blocking() -> None:
+    assert "missing prerequisite" in _INSTRUCTIONS
+    assert "configured sources" in _INSTRUCTIONS
+    assert "resume the original objective" in " ".join(_INSTRUCTIONS.split())
+    assert "validation" in _INSTRUCTIONS
+
+
+def test_agent_validates_prerequisite_then_resumes_original_goal(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    for name, output_name in (("storage.sh", "storage-ready"), ("install.sh", "ready")):
+        script = source / name
+        script.write_text(f"#!/bin/sh\ntouch {output_name}\n")
+        script.chmod(0o755)
+    task = tmp_path / "task.yaml"
+    output = tmp_path / "run"
+    _task(task, source, output)
+    decisions = iter(
+        [
+            _decision(
+                "ACT",
+                "execute",
+                command=["./storage.sh"],
+                working_directory="repository-1:.",
+                evidence=["repository-1:storage.sh"],
+                expected_change="storage ready",
+                add_gaps=["storage missing"],
+                validation=[
+                    {"command": ["ls", str(output / "workspace/repository-1/storage-ready")]}
+                ],
+            ),
+            _decision(
+                "ACT",
+                "execute",
+                command=["./install.sh"],
+                working_directory="repository-1:.",
+                evidence=["repository-1:install.sh"],
+                expected_change="application ready",
+                resolve_gaps=["storage missing"],
+                validation=[{"command": ["ls", str(output / "workspace/repository-1/ready")]}],
+            ),
+            _decision("DONE"),
+        ]
+    )
+    states = []
+
+    def decide(state, _observation, _last_result, _sources, _cycle):
+        states.append((state["gaps"].copy(), state["milestones"].copy()))
+        return next(decisions), {}
+
+    report = run_deployment_agent(task, output, execute=True, decide=decide)
+    assert report["status"] == "SUCCESS"
+    assert report["mutating_actions"] == 2
+    assert states[1] == (["storage missing"], ["storage ready"])
+    assert report["state"]["gaps"] == []
+    assert report["state"]["milestones"] == ["storage ready", "application ready"]
+
+
 def test_brief_retains_a_long_result_start_and_end() -> None:
     result = "Default route is in this header.\n" + "x" * 7000 + "\nLast error is here."
     brief = _brief(result)
@@ -362,3 +420,139 @@ def test_missing_key_stops_before_source_acquisition(tmp_path: Path, monkeypatch
     with pytest.raises(ValueError, match="OPENAI_API_KEY"):
         run_deployment_agent(task, output)
     assert not output.exists()
+
+
+def test_dynamic_goal_counts_only_new_outcomes(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    for name in ("prepare", "storage", "service"):
+        script = source / f"{name}.sh"
+        script.write_text(f"#!/bin/sh\ntouch {name}-ready\n")
+        script.chmod(0o755)
+    task = tmp_path / "task.yaml"
+    output = tmp_path / "run"
+    _task(task, source, output)
+    document = yaml.safe_load(task.read_text())
+    document["task"]["stop_after_verified_outcomes"] = 2
+    document.pop("success_checks")
+    document["budgets"].update(max_cycles=5, max_mutating_actions=4)
+    task.write_text(yaml.safe_dump(document))
+
+    def action(name: str, outcome_id: str | None = None) -> Decision:
+        return _decision(
+            "ACT",
+            "execute",
+            command=[f"./{name}.sh"],
+            working_directory="repository-1:.",
+            evidence=[f"repository-1:{name}.sh"],
+            expected_change=f"{name} ready",
+            outcome_id=outcome_id,
+            validation=[
+                {
+                    "command": ["ls", str(output / "workspace/repository-1")],
+                    "contains": f"{name}-ready",
+                }
+            ],
+        )
+
+    decisions = iter(
+        [
+            action("prepare"),
+            action("storage", "storage"),
+            action("storage", "storage"),
+            action("service", "service"),
+        ]
+    )
+
+    def decide(_state, _observation, _last_result, _sources, _cycle):
+        return next(decisions), {}
+
+    report = run_deployment_agent(task, output, execute=True, decide=decide)
+    assert report["status"] == "SUCCESS"
+    assert report["mutating_actions"] == 4
+    assert [item["id"] for item in report["state"]["verified_outcomes"]] == ["storage", "service"]
+    actions = [json.loads(line) for line in (output / "actions.jsonl").read_text().splitlines()]
+    assert [item["result"].get("new_outcome") for item in actions] == [
+        None,
+        "storage",
+        None,
+        "service",
+    ]
+
+
+@pytest.mark.parametrize("script_body", ["touch already-ready", "exit 1"])
+def test_preexisting_state_does_not_count_as_new_outcome(tmp_path: Path, script_body: str) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    script = source / "install.sh"
+    script.write_text(f"#!/bin/sh\n{script_body}\n")
+    script.chmod(0o755)
+    (source / "already-ready").touch()
+    task = tmp_path / "task.yaml"
+    output = tmp_path / "run"
+    _task(task, source, output)
+    document = yaml.safe_load(task.read_text())
+    document["task"]["stop_after_verified_outcomes"] = 1
+    document.pop("success_checks")
+    task.write_text(yaml.safe_dump(document))
+    decisions = iter(
+        [
+            _decision(
+                "ACT",
+                "execute",
+                command=["./install.sh"],
+                working_directory="repository-1:.",
+                evidence=["repository-1:install.sh"],
+                expected_change="already ready",
+                outcome_id="existing",
+                validation=[
+                    {
+                        "command": ["ls", str(output / "workspace/repository-1")],
+                        "contains": "already-ready",
+                    }
+                ],
+            ),
+            _decision("BLOCKED", reason="nothing else can be deployed"),
+        ]
+    )
+
+    def decide(_state, _observation, _last_result, _sources, _cycle):
+        return next(decisions), {}
+
+    report = run_deployment_agent(task, output, execute=True, decide=decide)
+    assert report["status"] == "BLOCKED"
+    assert report["state"]["verified_outcomes"] == []
+
+
+def test_agent_asks_human_to_choose_between_supported_routes(tmp_path: Path, monkeypatch) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "README.md").write_text("Two supported installation routes.\n")
+    task = tmp_path / "task.yaml"
+    output = tmp_path / "run"
+    _task(task, source, output)
+
+    class Terminal(io.StringIO):
+        def isatty(self):
+            return True
+
+    monkeypatch.setattr("pheragent.deploy_agent.sys.stdin", Terminal("2\n"))
+    decisions = iter(
+        [
+            _decision(
+                "ASK_HUMAN",
+                reason="Both routes fit",
+                focus="storage route",
+                options=["Use provider A", "Use provider B"],
+                evidence=["repository-1:README.md"],
+            ),
+            _decision("BLOCKED", reason="choice recorded"),
+        ]
+    )
+
+    def decide(_state, _observation, _last_result, _sources, _cycle):
+        return next(decisions), {}
+
+    report = run_deployment_agent(task, output, decide=decide)
+    assert report["state"]["selected_route"]["choice"] == "Use provider B"
+    assert report["mutating_actions"] == 0
