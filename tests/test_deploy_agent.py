@@ -309,6 +309,62 @@ def test_matching_context_storage_check_is_read_only() -> None:
     assert _target_command(command, task) == command
 
 
+@pytest.mark.parametrize(
+    "command",
+    [
+        ["helm", "repo", "list"],
+        ["helm", "search", "repo", "postgresql"],
+        ["helm", "history", "postgres"],
+        ["kubectl", "auth", "can-i", "get", "pods"],
+        ["kubectl", "config", "current-context"],
+        ["kubectl", "explain", "deployments"],
+        ["aws", "sts", "get-caller-identity"],
+        ["aws", "ec2", "describe-instances"],
+        ["aws", "eks", "describe-cluster", "--name", "example"],
+        ["ansible", "--version"],
+        ["ansible-playbook", "--syntax-check", "site.yaml"],
+        ["bash", "-n", "install.sh"],
+        ["stat", "install.sh"],
+    ],
+)
+def test_supported_read_only_probes(command: list[str]) -> None:
+    task = DeploymentTask.model_validate(
+        {
+            "task": {"objective": "sample"},
+            "sources": {"repositories": ["/tmp/sample"]},
+            "environment": {"type": "kubernetes", "context": "target-cluster"},
+        }
+    )
+    assert _policy(command, task, mutating=False) == "allowed"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        ["helm", "repo", "update"],
+        ["kubectl", "config", "use-context", "other-cluster"],
+        ["aws", "ec2", "start-instances", "--instance-ids", "i-example"],
+        ["aws", "ec2", "describe-instances", "--profile", "other-account"],
+        ["aws", "ec2", "describe-instances", "--endpoint-url", "https://example.invalid"],
+        ["ansible-playbook", "--syntax-check", "--flush-cache", "site.yaml"],
+        ["ansible-playbook", "site.yaml"],
+        ["bash", "-n", "-i", "install.sh"],
+        ["bash", "install.sh"],
+    ],
+)
+def test_unsafe_observations_are_not_read_only(command: list[str]) -> None:
+    task = DeploymentTask.model_validate(
+        {
+            "task": {"objective": "sample"},
+            "sources": {"repositories": ["/tmp/sample"]},
+            "environment": {"type": "kubernetes", "context": "target-cluster"},
+        }
+    )
+    assert _policy(command, task, mutating=False).startswith("denied")
+    if command[0] == "aws":
+        assert _policy(command, task, mutating=True).startswith("denied")
+
+
 def test_read_only_execute_is_observed_without_approval(tmp_path: Path, monkeypatch) -> None:
     source = tmp_path / "source"
     source.mkdir()
@@ -351,6 +407,27 @@ def test_read_only_execute_is_observed_without_approval(tmp_path: Path, monkeypa
     assert observed == [["kubectl", "--context", "target-cluster", "get", "storageclass"]]
     assert report["mutating_actions"] == 0
     assert not (output / "actions.jsonl").exists()
+
+
+def test_repeated_denied_observation_stops_early(tmp_path: Path, monkeypatch) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "README.md").write_text("Sample deployment source\n")
+    task = tmp_path / "task.yaml"
+    output = tmp_path / "run"
+    _task(task, source, output)
+    monkeypatch.setattr("pheragent.deploy_agent._observe", lambda _task: {})
+    calls = 0
+
+    def decide(_state, _observation, _last_result, _sources, _cycle):
+        nonlocal calls
+        calls += 1
+        return _decision("ACT", "observe", command=["helm", "repo", "update"]), {}
+
+    report = run_deployment_agent(task, output, decide=decide)
+    assert report["status"] == "BLOCKED"
+    assert calls == 3
+    assert "repeated denied observation" in report["reason"]
 
 
 def test_unfamiliar_mutation_requires_review_and_wrong_context_is_denied() -> None:

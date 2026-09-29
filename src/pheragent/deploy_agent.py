@@ -190,9 +190,25 @@ _READ_KUBECTL = {
     "version",
     "rollout",
     "wait",
+    "explain",
+    "top",
 }
-_READ_HELM = {"list", "status", "show", "get", "version"}
-_DENIED = {"rm", "sudo", "shutdown", "reboot", "mkfs", "dd", "terraform", "aws", "az", "gcloud"}
+_READ_HELM = {"list", "status", "show", "get", "version", "history", "env"}
+_READ_AWS = {
+    ("sts", "get-caller-identity"),
+    ("ec2", "describe-instances"),
+    ("ec2", "describe-instance-status"),
+    ("ec2", "describe-volumes"),
+    ("ec2", "describe-vpcs"),
+    ("ec2", "describe-subnets"),
+    ("ec2", "describe-security-groups"),
+    ("ec2", "describe-route-tables"),
+    ("eks", "list-clusters"),
+    ("eks", "describe-cluster"),
+    ("eks", "list-nodegroups"),
+    ("eks", "describe-nodegroup"),
+}
+_DENIED = {"rm", "sudo", "shutdown", "reboot", "mkfs", "dd", "terraform", "az", "gcloud"}
 
 
 def _now() -> str:
@@ -299,15 +315,35 @@ def _read_only(command: list[str]) -> bool:
         return False
     if command[0] == "kubectl":
         verb = command[1] if len(command) > 1 else ""
+        if verb == "auth":
+            return command[2:3] == ["can-i"]
+        if verb == "config":
+            return command[2:3] in (["current-context"], ["get-contexts"])
         return verb in _READ_KUBECTL and not (verb == "rollout" and "status" not in command)
     if command[0] == "helm":
         verb = command[1] if len(command) > 1 else ""
-        return verb in _READ_HELM
+        return verb in _READ_HELM or command[1:3] in (
+            ["repo", "list"],
+            ["search", "repo"],
+            ["search", "hub"],
+            ["dependency", "list"],
+        )
+    if command[0] == "aws":
+        return command[1:2] == ["--version"] or tuple(command[1:3]) in _READ_AWS
+    if command[0] in {"ansible", "ansible-playbook"}:
+        return command[1:] == ["--version"] or (
+            command[0] == "ansible-playbook"
+            and command[1:2] == ["--syntax-check"]
+            and len(command) == 3
+            and not command[2].startswith("-")
+        )
+    if command[0] in {"bash", "sh"}:
+        return command[1:2] == ["-n"] and len(command) == 3 and not command[2].startswith("-")
     if command[0] == "git":
         return len(command) > 1 and command[1] in {"status", "log", "show", "rev-parse"}
     if command[0] == "docker":
         return len(command) > 1 and command[1] in {"ps", "info", "version"}
-    return command[0] in {"ls", "pwd", "uname", "df", "free", "ps"}
+    return command[0] in {"ls", "pwd", "uname", "df", "free", "ps", "stat"}
 
 
 def _policy(command: list[str], task: DeploymentTask, *, mutating: bool) -> str:
@@ -326,11 +362,19 @@ def _policy(command: list[str], task: DeploymentTask, *, mutating: bool) -> str:
         command = _without_target_context(command, task)
     except ValueError as exc:
         return f"denied: {exc}"
+    if Path(command[0]).name == "aws":
+        if mutating:
+            return "denied: AWS changes are outside this agent's scope"
+        if any(
+            part.split("=", 1)[0] in {"--profile", "--endpoint-url", "--no-verify-ssl", "--debug"}
+            for part in command[1:]
+        ):
+            return "denied: AWS profile, endpoint, and debug overrides are not allowed"
     if mutating and _read_only(command):
         return "denied: execute must propose a mutating command"
     if not mutating and not _read_only(command):
         return "denied: observation and validation must be read-only"
-    if task.environment.type == "kubernetes" and command[0] not in {"kubectl", "helm"}:
+    if mutating and task.environment.type == "kubernetes" and command[0] not in {"kubectl", "helm"}:
         return "approval_required: source script or host command can change the target"
     if command[0] == "kubectl" and any(
         part in {"delete", "replace", "patch", "drain"} for part in command
@@ -1011,10 +1055,19 @@ def run_deployment_agent(
                 "observe",
             }:
                 digest = hashlib.sha256(
-                    json.dumps(last_result, sort_keys=True).encode()
+                    json.dumps(
+                        [decision.command if decision.tool == "observe" else None, last_result],
+                        sort_keys=True,
+                    ).encode()
                 ).hexdigest()
                 last_result["repeated_result_count"] = seen_results.get(digest, 0)
                 seen_results[digest] = last_result["repeated_result_count"] + 1
+                if (
+                    decision.tool == "observe"
+                    and last_result.get("error", "").startswith("denied:")
+                    and last_result["repeated_result_count"] >= 2
+                ):
+                    status, reason = "BLOCKED", "repeated denied observation; revise the command"
             _update_state(state, decision, last_result, sources)
             _append(
                 output / "trajectory.jsonl",
