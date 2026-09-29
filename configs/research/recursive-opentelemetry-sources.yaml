@@ -1,0 +1,20 @@
+system: opentelemetry-demo
+sources:
+  - id: opentelemetry-demo
+    kind: git
+    location: https://github.com/open-telemetry/opentelemetry-demo.git
+    purpose: repository
+    revision: d6fd782ee9ceedaec4a1c1f81017e8617d063240
+    include_patterns:
+      - README.md
+      - compose*.yaml
+      - .env
+      - src/**/Dockerfile
+      - src/**/README.md
+    exclude_patterns:
+      - "**/.git/**"
+      - "**/test/**"
+      - "**/tests/**"
+      - "**/*.lock"
+      - "**/*.png"
+      - "**/*.jpg"

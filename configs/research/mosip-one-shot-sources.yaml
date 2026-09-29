@@ -1,0 +1,66 @@
+system: mosip
+
+# One-shot treatment: complete initial-deployment files, without retrieval or chunking.
+sources:
+  - id: mosip-infra
+    kind: git
+    location: https://github.com/mosip/mosip-infra.git
+    purpose: repository
+    revision: v1.2.1.0
+    root_path: .
+    include_patterns:
+      - README*
+      - deployment/v3/**
+    exclude_patterns:
+      - "**/.git/**"
+      - "**/node_modules/**"
+      - "**/vendor/**"
+      - "**/dist/**"
+      - "**/build/**"
+      - "**/target/**"
+      - "**/upgrade/**"
+      - "**/test/**"
+      - "**/tests/**"
+      - "**/*.json"
+      - "**/*.lock"
+      - "**/*.png"
+      - "**/*.jpg"
+      - "**/*.jpeg"
+      - "**/*.gif"
+      - "**/*.pdf"
+      - "**/*.zip"
+      - "**/*.tar"
+      - "**/*.gz"
+
+  # - id: mosip-docs
+  #   kind: git
+  #   location: https://github.com/mosip/documentation.git
+  #   purpose: documentation
+  #   revision: 1.2.0
+  #   root_path: .
+  #   include_patterns:
+  #     - README*
+  #     - docs/setup/deploymentnew/v3-installation/README.md
+  #     - docs/setup/deploymentnew/v3-installation/1.2.1.0/README.md
+  #     - docs/setup/deploymentnew/v3-installation/1.2.1.0/aws-deployment.md
+  #     - docs/setup/deploymentnew/v3-installation/1.2.1.0/overview-and-architecture.md
+  #     - docs/setup/deploymentnew/v3-installation/1.2.1.0/pre-requisites.md
+  #     - docs/setup/deploymentnew/v3-installation/aws-installation-guidelines-new.md
+  #     - docs/setup/deploymentnew/v3-installation/mosip-external-dependencies.md
+  #     - docs/setup/deploymentnew/v3-installation/mosip-modules-deployment.md
+  #   exclude_patterns:
+  #     - "**/.git/**"
+  #     - "**/node_modules/**"
+  #     - "**/vendor/**"
+  #     - "**/dist/**"
+  #     - "**/build/**"
+  #     - "**/target/**"
+  #     - "**/*.lock"
+  #     - "**/*.png"
+  #     - "**/*.jpg"
+  #     - "**/*.jpeg"
+  #     - "**/*.gif"
+  #     - "**/*.pdf"
+  #     - "**/*.zip"
+  #     - "**/*.tar"
+  #     - "**/*.gz"

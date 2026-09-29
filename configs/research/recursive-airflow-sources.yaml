@@ -1,0 +1,16 @@
+system: apache-airflow
+sources:
+  - id: airflow
+    kind: git
+    location: https://github.com/apache/airflow.git
+    purpose: repository
+    revision: 5ed6f8f3217e71978fbe1f356fbb465fded2a7f4
+    include_patterns:
+      - chart/**
+    exclude_patterns:
+      - "**/.git/**"
+      - "**/tests/**"
+      - "**/*.lock"
+      - "**/*.tgz"
+      - "**/*.png"
+      - "**/*.jpg"

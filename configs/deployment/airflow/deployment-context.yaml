@@ -19,4 +19,4 @@ provided_blocks:
 hints:
   documentation:
     - chart/README.md
-    - docs/helm-chart/index.rst
+    - chart/docs/index.rst

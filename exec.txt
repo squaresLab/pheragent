@@ -1,0 +1,519 @@
+HERAGENT REMOTE EXPERIMENT RUNBOOK
+
+This is a reusable local guide. Do not commit it until the team decides it belongs in the project.
+LOCAL commands run on your laptop. REMOTE commands run on the deployment node.
+
+The local and remote shells do not share variables. Run the settings for the shell you are using.
+
+
+SAFETY RULES
+
+- Execute only a reviewed block.
+- HerAgent continues with independent operations after a failure.
+- Operations that depend on a failed operation are skipped.
+- A block is incomplete if any operation fails or is skipped.
+- The before-state is an inventory for comparison. It is not a Kubernetes backup.
+- Do not run an RKE2 cluster reset from this guide.
+- Confirm a real backup or a reviewed cleanup path before changing persistent data.
+- The deployment node has about 1 GiB RAM and no default swap. A temporary 2 GiB swap file prevents
+  memory-heavy Helm repository operations from being killed by Linux. It is removed after the run.
+
+RKE2 backup and restore documentation:
+https://docs.rke2.io/datastore/backup_restore
+
+
+STEP 0 — SET LOCAL VALUES [LOCAL]
+
+# Run this in each local terminal used for the experiment.
+LOCAL_HERAGENT_ROOT="$HOME/dev/pheragent"
+AWS_PROFILE="heragent-mosip"
+DEPLOYMENT_HOST="35.175.121.131"
+DEPLOYMENT_USER="ubuntu"
+SSH_KEY="$HOME/.ssh/mosip_ec2_ed25519"
+LOCAL_RESULTS_DIR="$HOME/dev/heragent-experiment-results"
+
+SSH_OPTIONS=(
+  -o IdentityAgent=none
+  -o IdentitiesOnly=yes
+  -i "$SSH_KEY"
+)
+
+test -d "$LOCAL_HERAGENT_ROOT"
+test -f "$SSH_KEY"
+
+
+STEP 1 — START THE VMS [LOCAL]
+
+cd "$LOCAL_HERAGENT_ROOT"
+
+aws sso login --profile "$AWS_PROFILE"
+
+./scripts/vms_lifecycle.sh status \
+  --profile "$AWS_PROFILE"
+
+./scripts/vms_lifecycle.sh up \
+  --profile "$AWS_PROFILE"
+
+# The current lifecycle script targets the MOSIP nginx, core, and Rancher machines.
+# It waits for EC2 to report "running". Kubernetes may still need more time.
+
+
+STEP 2 — CONNECT TO THE DEPLOYMENT NODE [LOCAL]
+
+ssh "${SSH_OPTIONS[@]}" "$DEPLOYMENT_USER@$DEPLOYMENT_HOST"
+
+
+STEP 3 — UPDATE HERAGENT [REMOTE]
+
+HERAGENT_ROOT="$HOME/pheragent"
+HERAGENT_BRANCH="research/recursive-oracle"
+TMUX_SESSION="heragent-experiment"
+
+cd "$HERAGENT_ROOT"
+
+# Stop if this shows changes you do not recognize.
+git status --short
+
+git fetch origin
+git switch "$HERAGENT_BRANCH"
+git pull --ff-only origin "$HERAGENT_BRANCH"
+uv sync
+
+# Keep the pane available when a command exits so its final status remains visible.
+if ! tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
+  tmux new-session -d -s "$TMUX_SESSION"
+fi
+tmux set-option -t "$TMUX_SESSION" remain-on-exit on
+tmux attach-session -t "$TMUX_SESSION"
+
+# Run the remaining REMOTE steps inside tmux.
+
+
+STEP 4 — SET EXPERIMENT VALUES [REMOTE, INSIDE TMUX]
+
+HERAGENT_ROOT="$HOME/pheragent"
+cd "$HERAGENT_ROOT"
+
+# Change these values for each system or experiment.
+# Use only lowercase letters, numbers, and hyphens in SYSTEM_NAME and EXPERIMENT_NAME.
+SYSTEM_NAME="mosip"
+EXPERIMENT_NAME="data-services"
+KUBE_CONTEXT="mosip"
+AWS_REGION="us-east-1"
+CONTEXT_PATH="configs/deployment/mosip/deployment-context.yaml"
+MODEL="gpt-5.6-terra"
+COMMAND_TIMEOUT="7200"
+LLM_MAX_REQUESTS="2"
+LLM_MAX_TOKENS="10000"
+LLM_REASONING_EFFORT="high"
+REPAIR_MAX_REQUESTS="8"
+REPAIR_MAX_TOKENS="10000"
+REPAIR_REASONING_EFFORT="high"
+REPAIR_WORKERS="2"
+MAX_REPAIR_ATTEMPTS="2"
+REFRESH_LLM="true"
+WRITE_DEBUG_FILES="true"
+
+# Add or remove URLs as required. HerAgent clones and caches them.
+REPOSITORIES=(
+  "https://github.com/mosip/mosip-infra.git"
+  "https://github.com/mosip/k8s-infra.git"
+)
+
+DOCUMENTATION_SOURCES=(
+  "https://github.com/mosip/documentation.git"
+)
+
+RUN_TIMESTAMP="$(date -u +%Y%m%dt%H%M%Sz)"
+EXPERIMENT_ID="${SYSTEM_NAME}-${EXPERIMENT_NAME}-${RUN_TIMESTAMP}"
+EXPERIMENT_ROOT="$PWD/.pheragent/experiments"
+EXPERIMENT_DIR="$EXPERIMENT_ROOT/$EXPERIMENT_ID"
+ANALYSIS_OUTPUT="$PWD/.pheragent/deployment/$SYSTEM_NAME"
+
+mkdir -p "$EXPERIMENT_DIR"
+
+git rev-parse HEAD \
+  | tee "$EXPERIMENT_DIR/heragent-commit.txt"
+printf '%s\n' "$EXPERIMENT_ID" \
+  | tee "$EXPERIMENT_DIR/experiment-id.txt"
+
+{
+  printf 'system=%s\n' "$SYSTEM_NAME"
+  printf 'experiment=%s\n' "$EXPERIMENT_NAME"
+  printf 'kube_context=%s\n' "$KUBE_CONTEXT"
+  printf 'model=%s\n' "$MODEL"
+  printf 'command_timeout=%s\n' "$COMMAND_TIMEOUT"
+  printf 'analysis_max_requests=%s\n' "$LLM_MAX_REQUESTS"
+  printf 'analysis_max_tokens=%s\n' "$LLM_MAX_TOKENS"
+  printf 'analysis_reasoning_effort=%s\n' "$LLM_REASONING_EFFORT"
+  printf 'repair_max_requests=%s\n' "$REPAIR_MAX_REQUESTS"
+  printf 'repair_max_tokens=%s\n' "$REPAIR_MAX_TOKENS"
+  printf 'repair_reasoning_effort=%s\n' "$REPAIR_REASONING_EFFORT"
+} >"$EXPERIMENT_DIR/settings.txt"
+
+# Enter the key without saving it to a file or shell history.
+read -rsp 'OPENAI_API_KEY: ' OPENAI_API_KEY
+printf '\n'
+export OPENAI_API_KEY
+
+# Helm repository indexes can exceed the free RAM on the deployment node. This dedicated swap file
+# provides temporary overflow without changing /etc/fstab or the Kubernetes worker nodes.
+HERAGENT_SWAP_FILE="/var/tmp/heragent-experiment.swap"
+if ! swapon --show=NAME --noheadings --raw | grep -Fxq "$HERAGENT_SWAP_FILE"; then
+  if [[ -e "$HERAGENT_SWAP_FILE" ]]; then
+    printf 'Refusing to overwrite existing file: %s\n' "$HERAGENT_SWAP_FILE" >&2
+    false
+  fi
+  sudo fallocate -l 2G "$HERAGENT_SWAP_FILE"
+  sudo chmod 600 "$HERAGENT_SWAP_FILE"
+  sudo mkswap "$HERAGENT_SWAP_FILE"
+  sudo swapon "$HERAGENT_SWAP_FILE"
+fi
+free -h
+swapon --show
+
+
+STEP 5 — CHECK KUBERNETES AND CAPTURE THE BEFORE-STATE [REMOTE]
+
+KUBECTL=(kubectl --context "$KUBE_CONTEXT")
+HELM=(helm --kube-context "$KUBE_CONTEXT")
+
+"${KUBECTL[@]}" get nodes -o wide
+"${KUBECTL[@]}" wait \
+  --for=condition=Ready \
+  nodes \
+  --all \
+  --timeout=15m
+
+capture_cluster_state() {
+  local destination="$1"
+  mkdir -p "$destination"
+
+  "${KUBECTL[@]}" version -o yaml \
+    >"$destination/kubernetes-version.yaml" 2>&1 || true
+  "${KUBECTL[@]}" get nodes -o wide \
+    >"$destination/nodes.txt" 2>&1 || true
+  "${KUBECTL[@]}" get namespaces \
+    >"$destination/namespaces.txt" 2>&1 || true
+  "${KUBECTL[@]}" get deployments,statefulsets,daemonsets,jobs,cronjobs -A -o wide \
+    >"$destination/workloads.txt" 2>&1 || true
+  "${KUBECTL[@]}" get pods -A -o wide \
+    >"$destination/pods.txt" 2>&1 || true
+  "${KUBECTL[@]}" get services -A -o wide \
+    >"$destination/services.txt" 2>&1 || true
+  "${KUBECTL[@]}" get configmaps -A \
+    -o custom-columns='NAMESPACE:.metadata.namespace,NAME:.metadata.name' \
+    >"$destination/configmaps.txt" 2>&1 || true
+  "${KUBECTL[@]}" get persistentvolumes \
+    >"$destination/persistent-volumes.txt" 2>&1 || true
+  "${KUBECTL[@]}" get persistentvolumeclaims -A \
+    >"$destination/persistent-volume-claims.txt" 2>&1 || true
+  "${KUBECTL[@]}" get ingressclasses \
+    >"$destination/ingress-classes.txt" 2>&1 || true
+  "${KUBECTL[@]}" get ingresses -A \
+    >"$destination/ingresses.txt" 2>&1 || true
+  "${KUBECTL[@]}" get customresourcedefinitions \
+    -o custom-columns='NAME:.metadata.name' \
+    >"$destination/crds.txt" 2>&1 || true
+  "${HELM[@]}" list --all-namespaces \
+    >"$destination/helm-releases.txt" 2>&1 || true
+  helm repo list \
+    >"$destination/helm-repositories.txt" 2>&1 || true
+}
+
+capture_cluster_state "$EXPERIMENT_DIR/cluster-before"
+
+uv run pheragent deployment inspect-runtime \
+  --output "$EXPERIMENT_DIR/runtime-before.json" \
+  --aws-region "$AWS_REGION" \
+  --kube-context "$KUBE_CONTEXT" \
+  2>&1 | tee "$EXPERIMENT_DIR/runtime-before.log"
+
+# AWS warnings are expected when the AWS CLI is absent on the deployment node.
+# Kubernetes results are still useful because VM state was checked locally.
+
+
+STEP 6 — DISCOVER COMPONENTS AND BUILD THE PLAN [REMOTE]
+
+SOURCE_OPTIONS=()
+for repository_url in "${REPOSITORIES[@]}"; do
+  SOURCE_OPTIONS+=(--repo "$repository_url")
+done
+for documentation_url in "${DOCUMENTATION_SOURCES[@]}"; do
+  SOURCE_OPTIONS+=(--docs "$documentation_url")
+done
+
+LLM_OPTIONS=()
+if [[ "$REFRESH_LLM" == "true" ]]; then
+  LLM_OPTIONS+=(--refresh-llm)
+fi
+if [[ "$WRITE_DEBUG_FILES" == "true" ]]; then
+  LLM_OPTIONS+=(--debug)
+fi
+
+set -o pipefail
+uv run pheragent deployment analyze \
+  "${SOURCE_OPTIONS[@]}" \
+  --context "$CONTEXT_PATH" \
+  --runtime-context "$EXPERIMENT_DIR/runtime-before.json" \
+  --output "$ANALYSIS_OUTPUT" \
+  --run-name "$EXPERIMENT_ID" \
+  --model "$MODEL" \
+  --llm-max-requests "$LLM_MAX_REQUESTS" \
+  --llm-max-tokens "$LLM_MAX_TOKENS" \
+  --llm-reasoning-effort "$LLM_REASONING_EFFORT" \
+  "${LLM_OPTIONS[@]}" \
+  2>&1 | tee "$EXPERIMENT_DIR/analysis.log"
+ANALYSIS_EXIT_CODE="${PIPESTATUS[0]}"
+printf '%s\n' "$ANALYSIS_EXIT_CODE" \
+  | tee "$EXPERIMENT_DIR/analysis-exit-code.txt"
+
+RUN_DIR="$(find "$ANALYSIS_OUTPUT/runs" \
+  -mindepth 1 \
+  -maxdepth 1 \
+  -type d \
+  -name "*-${EXPERIMENT_ID}" \
+  -print | sort | tail -n 1)"
+
+test -n "$RUN_DIR"
+test -f "$RUN_DIR/functional-blocks.yaml"
+test -f "$RUN_DIR/deployment-workflow.yaml"
+test -f "$RUN_DIR/run-manifest.json"
+printf '%s\n' "$RUN_DIR" \
+  | tee "$EXPERIMENT_DIR/analysis-run-path.txt"
+
+
+STEP 7 — REVIEW AND CHOOSE ONE BLOCK [REMOTE]
+
+uv run python - "$RUN_DIR/functional-blocks.yaml" <<'PY'
+import sys
+import yaml
+
+with open(sys.argv[1], encoding="utf-8") as stream:
+    blocks = yaml.safe_load(stream)["blocks"]
+
+provided = {block["id"] for block in blocks if block.get("state") == "provided"}
+for block in blocks:
+    dependencies = block.get("after", [])
+    eligible = block.get("state") != "provided" and set(dependencies) <= provided
+    print(
+        f"{block['id']}: {block['name']} "
+        f"state={block.get('state')} after={dependencies} eligible={eligible}"
+    )
+    for component in block.get("components", []):
+        print(f"  - {component['id']}: {component['name']}")
+PY
+
+# Read the chosen block and its source files before continuing.
+read -rp 'Eligible block ID to test: ' TARGET_BLOCK
+test -n "$TARGET_BLOCK"
+
+# Resolve every pinned Git source used by this run. This avoids hardcoded repository names.
+mapfile -t PINNED_SOURCES < <(
+  uv run python - "$RUN_DIR/run-manifest.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as stream:
+    manifest = json.load(stream)
+
+for source in manifest["sources"]["sources"]:
+    if source["kind"] == "git":
+        print(f"{source['id']}\t{source['resolved_revision']}")
+PY
+)
+
+SOURCE_ROOT_ARGS=()
+for pinned_source in "${PINNED_SOURCES[@]}"; do
+  IFS=$'\t' read -r source_id source_revision <<<"$pinned_source"
+  source_root="$({
+    for candidate in "$ANALYSIS_OUTPUT/.source-cache/git/${source_id}-"*; do
+      [[ -d "$candidate/.git" ]] || continue
+      [[ "$(git -C "$candidate" rev-parse HEAD)" == "$source_revision" ]] || continue
+      printf '%s\n' "$candidate"
+    done
+  } | head -n 1)"
+
+  if [[ -z "$source_root" ]]; then
+    printf 'No cached checkout matches %s at %s\n' "$source_id" "$source_revision" >&2
+    false
+  fi
+
+  SOURCE_ROOT_ARGS+=(--source-root "${source_id}=${source_root}")
+  printf '%s=%s\n' "$source_id" "$source_root" \
+    | tee -a "$EXPERIMENT_DIR/source-roots.txt"
+done
+
+DEPLOYMENT_ARGS=(
+  deployment run
+  "$RUN_DIR/deployment-workflow.yaml"
+  "${SOURCE_ROOT_ARGS[@]}"
+  --allow-unready
+  --block "$TARGET_BLOCK"
+  --command-timeout "${COMMAND_TIMEOUT:?Run STEP 4 before STEP 7}"
+)
+
+
+STEP 8 — DRY-RUN AND REVIEW [REMOTE]
+
+DRY_RUN_LOG="$EXPERIMENT_DIR/deployment-dry-run.txt"
+
+uv run pheragent "${DEPLOYMENT_ARGS[@]}" \
+  2>&1 | tee "$DRY_RUN_LOG"
+
+APPROVAL_TOKEN="$(sed -n 's/^Approval token: //p' "$DRY_RUN_LOG" | tail -n 1)"
+test -n "$APPROVAL_TOKEN"
+test "$APPROVAL_TOKEN" != "unavailable"
+
+# STOP AND REVIEW THE DRY-RUN.
+#
+# Check that:
+#   1. every component belongs to TARGET_BLOCK;
+#   2. each command and working directory are correct;
+#   3. provided blocks are not changed;
+#   4. required input is available;
+#   5. persistent changes have a real backup or reviewed cleanup path.
+
+
+STEP 9 — EXECUTE THE APPROVED BLOCK [REMOTE]
+
+set -o pipefail
+uv run pheragent "${DEPLOYMENT_ARGS[@]}" \
+  --execute \
+  --approve "$APPROVAL_TOKEN" \
+  --repair-model "$MODEL" \
+  --repair-workers "$REPAIR_WORKERS" \
+  --max-repair-attempts "$MAX_REPAIR_ATTEMPTS" \
+  --repair-max-requests "$REPAIR_MAX_REQUESTS" \
+  --repair-max-tokens "$REPAIR_MAX_TOKENS" \
+  --repair-llm-timeout 300 \
+  --repair-reasoning-effort "$REPAIR_REASONING_EFFORT" \
+  2>&1 | tee "$EXPERIMENT_DIR/deployment-execution.log"
+EXECUTION_EXIT_CODE="${PIPESTATUS[0]}"
+printf '%s\n' "$EXECUTION_EXIT_CODE" \
+  | tee "$EXPERIMENT_DIR/deployment-exit-code.txt"
+
+# A non-zero exit code is a valid experiment result.
+# Independent operations continue. Failed descendants are skipped.
+
+
+STEP 10 — CAPTURE THE AFTER-STATE [REMOTE]
+
+capture_cluster_state "$EXPERIMENT_DIR/cluster-after"
+
+uv run pheragent deployment inspect-runtime \
+  --output "$EXPERIMENT_DIR/runtime-after.json" \
+  --aws-region "$AWS_REGION" \
+  --kube-context "$KUBE_CONTEXT" \
+  2>&1 | tee "$EXPERIMENT_DIR/runtime-after.log"
+
+"${KUBECTL[@]}" get events -A \
+  --sort-by=.metadata.creationTimestamp \
+  >"$EXPERIMENT_DIR/kubernetes-events-after.txt" 2>&1 || true
+
+diff -ru \
+  "$EXPERIMENT_DIR/cluster-before" \
+  "$EXPERIMENT_DIR/cluster-after" \
+  >"$EXPERIMENT_DIR/cluster-before-after.diff" || true
+
+cp -a "$RUN_DIR" "$EXPERIMENT_DIR/analysis-run"
+
+# Optional focused failure records:
+#   kubectl --context "$KUBE_CONTEXT" -n NAMESPACE describe pod POD \
+#     | tee "$EXPERIMENT_DIR/failed-pod-describe.txt"
+#   kubectl --context "$KUBE_CONTEXT" -n NAMESPACE logs POD --all-containers --prefix \
+#     | tee "$EXPERIMENT_DIR/failed-pod-logs.txt"
+
+
+STEP 11 — PACKAGE RESULTS [REMOTE]
+
+unset OPENAI_API_KEY
+
+package_results() {
+  tar \
+    -C "$EXPERIMENT_ROOT" \
+    -czf "/tmp/${EXPERIMENT_ID}.tar.gz" \
+    "$EXPERIMENT_ID"
+
+  chmod 600 "/tmp/${EXPERIMENT_ID}.tar.gz"
+  (
+    cd /tmp
+    sha256sum "${EXPERIMENT_ID}.tar.gz" \
+      >"${EXPERIMENT_ID}.tar.gz.sha256"
+  )
+}
+
+package_results
+printf 'Archive ready: /tmp/%s.tar.gz\n' "$EXPERIMENT_ID"
+
+
+STEP 12 — COPY RESULTS HOME [LOCAL, NEW TERMINAL]
+
+# Run STEP 0 first, then paste the experiment ID printed in STEP 4.
+EXPERIMENT_ID="paste-experiment-id-here"
+
+mkdir -p "$LOCAL_RESULTS_DIR"
+
+scp "${SSH_OPTIONS[@]}" \
+  "$DEPLOYMENT_USER@$DEPLOYMENT_HOST:/tmp/${EXPERIMENT_ID}.tar.gz" \
+  "$DEPLOYMENT_USER@$DEPLOYMENT_HOST:/tmp/${EXPERIMENT_ID}.tar.gz.sha256" \
+  "$LOCAL_RESULTS_DIR/"
+
+cd "$LOCAL_RESULTS_DIR"
+sha256sum -c "${EXPERIMENT_ID}.tar.gz.sha256"
+tar -xzf "${EXPERIMENT_ID}.tar.gz"
+
+# Review the files for secrets before uploading them anywhere else.
+
+
+STEP 13 — CLEAN UP OR KEEP THE CHANGES [REMOTE]
+
+# cluster-before cannot be applied back to Kubernetes.
+# There is no general restore command here.
+#
+# To discard the experiment:
+#   1. review cluster-before-after.diff;
+#   2. list every new release, namespace, workload, volume, and data change;
+#   3. run only the reviewed cleanup command for the selected block;
+#   4. capture the state again and compare it with cluster-before.
+#
+# For an RKE2 snapshot restore, stop and work with the infrastructure owner.
+# If the experiment should remain, record that choice instead of cleaning it up.
+
+read -rp 'Cleanup decision and reason: ' CLEANUP_DECISION
+printf '%s\n' "$CLEANUP_DECISION" \
+  >"$EXPERIMENT_DIR/cleanup-decision.txt"
+
+# Run the reviewed cleanup commands here when required.
+
+capture_cluster_state "$EXPERIMENT_DIR/cluster-final"
+
+diff -ru \
+  "$EXPERIMENT_DIR/cluster-before" \
+  "$EXPERIMENT_DIR/cluster-final" \
+  >"$EXPERIMENT_DIR/cluster-before-final.diff" || true
+
+# Repackage and copy again so the local result includes cleanup evidence.
+package_results
+
+# Remove only the temporary swap file created for this experiment. This returns the deployment node
+# to its original memory configuration and leaves /etc/fstab unchanged.
+if swapon --show=NAME --noheadings --raw | grep -Fxq "$HERAGENT_SWAP_FILE"; then
+  sudo swapoff "$HERAGENT_SWAP_FILE"
+fi
+sudo rm -f -- "$HERAGENT_SWAP_FILE"
+free -h
+
+
+STEP 14 — STOP THE VMS [LOCAL]
+
+cd "$LOCAL_HERAGENT_ROOT"
+
+./scripts/vms_lifecycle.sh down \
+  --profile "$AWS_PROFILE"
+
+./scripts/vms_lifecycle.sh status \
+  --profile "$AWS_PROFILE"
+
+# The current script leaves the workstation node running.
+# Stop it separately only when the team has approved that action and results are safely copied.

@@ -79,3 +79,16 @@ def test_classification_detects_deployment_yaml_types() -> None:
         classify_file("main.tf", 'resource "aws_instance" "node" {}\n')
         == InventoryCategory.TERRAFORM
     )
+
+
+def test_inventory_includes_sample_and_example_files(tmp_path: Path) -> None:
+    (tmp_path / "global_configmap.yaml.sample").write_text(
+        "apiVersion: v1\nkind: ConfigMap\n", encoding="utf-8"
+    )
+    (tmp_path / "settings.env.example").write_text("HOST=example\n", encoding="utf-8")
+
+    inventory = RepositoryInventoryBuilder().build((_source(tmp_path),))
+    entries = {entry.path: entry for entry in inventory.entries}
+
+    assert entries["global_configmap.yaml.sample"].category == InventoryCategory.KUBERNETES
+    assert entries["settings.env.example"].category == InventoryCategory.CONFIGURATION
