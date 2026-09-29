@@ -29,6 +29,20 @@ def main(argv: list[str] | None = None) -> int:
         parser.exit(2, f"deployment agent error: {exc}\n")
     print(f"run: {output.resolve()}")
     print(f"result: {report['status']} — {report['reason']}")
+    usage = report["usage"]
+    print(
+        "LLM: "
+        f"{usage.get('requests', 0)} requests; "
+        f"{usage.get('total_tokens', 0)} tokens "
+        f"(input {usage.get('input_tokens', 0)}, output {usage.get('output_tokens', 0)})"
+    )
+    print(f"Actions attempted: {report['mutating_actions']}")
+    print(f"Validated changes: {', '.join(report['state']['milestones']) or 'none'}")
+    print(
+        "New verified outcomes: "
+        f"{', '.join(item['id'] for item in report['state']['verified_outcomes']) or 'none'}"
+    )
+
     return 0 if report["status"] == "SUCCESS" else 1
 
 

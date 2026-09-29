@@ -17,6 +17,7 @@ from pheragent.deploy_agent import (
     _target_command,
     run_deployment_agent,
 )
+from pheragent.deploy_agent_cli import main as deploy_main
 
 
 def _decision(kind: str, tool: str | None = None, **changes: object) -> Decision:
@@ -370,7 +371,7 @@ def test_unfamiliar_mutation_requires_review_and_wrong_context_is_denied() -> No
 
 @pytest.mark.parametrize(("answer", "should_run"), [("n\n", False), ("y\n", True)])
 def test_kubernetes_change_waits_for_terminal_approval(
-    tmp_path: Path, monkeypatch, answer: str, should_run: bool
+    tmp_path: Path, monkeypatch, capsys, answer: str, should_run: bool
 ) -> None:
     task = DeploymentTask.model_validate(
         {
@@ -407,7 +408,39 @@ def test_kubernetes_change_waits_for_terminal_approval(
     monkeypatch.setattr("pheragent.deploy_agent._command", run_command)
     result = _execute(decision, task, Evidence(), tmp_path, enabled=True, approve=False, timeout=10)
     assert (result["status"] == "validated") is should_run
+    prompt = capsys.readouterr().out
+    assert "Change: Pod has the label" in prompt
+    assert "Source: repository-1:README.md" in prompt
+    assert "Check: kubectl get pod db -n postgres" in prompt
     assert any(command[3] == "label" for command in commands) is should_run
+
+
+def test_cli_reports_usage_and_verified_changes(tmp_path: Path, monkeypatch, capsys) -> None:
+    monkeypatch.setattr("pheragent.deploy_agent_cli.load_dotenv", lambda _path: None)
+    monkeypatch.setattr(
+        "pheragent.deploy_agent_cli.run_deployment_agent",
+        lambda *_args, **_kwargs: {
+            "status": "SUCCESS",
+            "reason": "verified",
+            "usage": {
+                "requests": 3,
+                "input_tokens": 100,
+                "output_tokens": 20,
+                "total_tokens": 120,
+            },
+            "mutating_actions": 2,
+            "state": {
+                "milestones": ["storage ready"],
+                "verified_outcomes": [{"id": "storage"}],
+            },
+        },
+    )
+    assert deploy_main(["run", "task.yaml", "--output", str(tmp_path / "run")]) == 0
+    summary = capsys.readouterr().out
+    assert "3 requests; 120 tokens (input 100, output 20)" in summary
+    assert "Actions attempted: 2" in summary
+    assert "Validated changes: storage ready" in summary
+    assert "New verified outcomes: storage" in summary
 
 
 def test_missing_key_stops_before_source_acquisition(tmp_path: Path, monkeypatch) -> None:

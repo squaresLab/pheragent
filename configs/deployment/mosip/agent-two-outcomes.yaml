@@ -32,4 +32,4 @@ budgets:
   max_cycles: 20
   max_mutating_actions: 8
   max_runtime_minutes: 180
-  max_read_actions_per_cycle: 12
+  max_read_actions_per_cycle: 40

@@ -644,7 +644,10 @@ def _execute(
             return {"status": "blocked", "reason": policy, "command": decision.command}
         print(
             f"Approve deployment action on {task.environment.context or task.environment.type}?\n"
-            f"{shlex.join(_target_command(decision.command, task))}\n"
+            f"Change: {decision.expected_change}\n"
+            f"Source: {decision.working_directory or ', '.join(decision.evidence)}\n"
+            f"Command: {shlex.join(_target_command(decision.command, task))}\n"
+            f"Check: {'; '.join(shlex.join(check.command) for check in decision.validation)}\n"
             f"Reason: {decision.reason}\nPolicy: {policy}\n[y/N] ",
             end="",
             flush=True,
