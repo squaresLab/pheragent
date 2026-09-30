@@ -158,6 +158,9 @@ class RepositoryInventoryBuilder:
 
 def classify_file(relative_path: str, sample: str) -> InventoryCategory:
     path = Path(relative_path)
+    is_example = path.suffix.lower() in {".sample", ".example"}
+    if is_example:
+        path = path.with_suffix("")
     name = path.name.lower()
     suffix = path.suffix.lower()
     parts = {part.lower() for part in path.parts}
@@ -195,7 +198,7 @@ def classify_file(relative_path: str, sample: str) -> InventoryCategory:
         if "dsf" in name:
             return InventoryCategory.HELMSMAN
         return InventoryCategory.CONFIGURATION
-    if suffix in _CONFIG_SUFFIXES or name.startswith(".env"):
+    if suffix in _CONFIG_SUFFIXES or name.startswith(".env") or is_example:
         return InventoryCategory.CONFIGURATION
     return InventoryCategory.UNKNOWN
 

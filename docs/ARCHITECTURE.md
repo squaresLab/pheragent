@@ -1,5 +1,8 @@
 # HerAgent (`pheragent`) Architecture
 
+This document describes the original Docker environment builder. For the
+progressive deployment module map and current command, see [README.md](../README.md).
+
 This document maps the paper's conceptual model of HerAgent onto the actual
 `pheragent` source tree, as of the `mosip-baselines` branch (identical to
 `main` at the time of writing — `git diff main --stat` is empty).

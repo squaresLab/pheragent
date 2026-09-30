@@ -1,7 +1,7 @@
 [project]
 name = "pheragent"
 version = "0.1.0"
-description = "Command-driven, checkpointed Docker environment builder agent"
+description = "Progressive deployment and checkpointed environment setup agent"
 readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
@@ -12,7 +12,6 @@ dependencies = [
 
 [project.scripts]
 pheragent = "pheragent.cli:main"
-heragentdeploy = "pheragent.deploy_agent_cli:main"
 
 [dependency-groups]
 dev = [

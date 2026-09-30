@@ -10,7 +10,6 @@ from .evaluation.cli import add_evaluation_parser, run_evaluation_command
 from .models import DEFAULT_ABLATION_MODE, BuildRequest, to_jsonable
 from .orchestrator import EnvironmentBuilder
 from .project_batch import ProjectBatchBuilder
-from .research.cli import add_research_parser, run_research_command
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -49,9 +48,6 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "deployment":
         return run_deployment_command(args)
 
-    if args.command == "research":
-        return run_research_command(args)
-
     if args.command == "evaluation":
         return run_evaluation_command(args)
 
@@ -65,7 +61,6 @@ def _build_parser() -> argparse.ArgumentParser:
 
     add_deployment_parser(subparsers)
     add_evaluation_parser(subparsers)
-    add_research_parser(subparsers)
 
     plan = subparsers.add_parser("plan", help="Analyze a repo and write setup block scripts.")
     _add_common_args(plan, include_dockerfile=False)

@@ -1,158 +1,72 @@
 # pheragent
 
-`pheragent` contains two command-driven workflows built on repository analysis:
+HerAgent has two workflows:
 
-- **HerAgent-Deploy** analyzes deployment repositories and documentation, produces a
-  human-reviewable workflow, and executes only the exact approved operations.
-- The original **environment builder** plans setup blocks, executes them in an isolated
-  Docker container, and repairs failed blocks when possible.
-
-The environment builder's default planner mode is `auto`: it uses the LLM planner when the
-configured OpenAI-compatible API key is present, otherwise it falls back to deterministic rules.
-HerAgent-Deploy uses its versioned product analysis policy and reports degraded fallback when model
-reasoning is unavailable.
+- `pheragent deployment run` observes a target environment, reads deployment
+  sources, proposes one grounded action at a time, and checks the result before
+  continuing.
+- `pheragent plan`, `build`, and `build-projects` are the original Docker
+  environment-setup workflow.
 
 ## Requirements
 
-- `uv`
-- Python `>=3.14`, as declared in `pyproject.toml`
-- Optional: an OpenAI-compatible endpoint for LLM planning and repair
+- `uv` and Python 3.14 or newer
+- An OpenAI-compatible API key for progressive deployment
+- The target tools needed by the system, such as `kubectl` and Helm
 
-HerAgent-Deploy additionally requires the tools used by the generated workflow, such as
-`kubectl` and Helm. The environment builder requires the Docker CLI and a running Docker daemon.
-
-Install dependencies and check the CLI:
+Install and test:
 
 ```bash
-uv sync
-uv run pheragent --help
-```
-
-Run the local test suite:
-
-```bash
+uv sync --locked
 uv run pytest -q
 uv run ruff check .
 ```
 
-## Deployment Repository Analyzer (Phase 1)
+## Progressive deployment
 
-The Phase 1 analyzer statically discovers deployable units and produces a compact
-functional-block DAG. It parses structural relationships in shell automation,
-Terraform, Ansible, Compose, Helm, Kustomize, Kubernetes, GitHub Actions, Flux, and
-Argo CD sources. Repository code and deployment commands are never executed.
-
-```bash
-uv run pheragent deployment analyze \
-  --repo https://github.com/mosip/mosip-infra.git \
-  --docs https://github.com/mosip/documentation.git \
-  --context configs/deployment/mosip/deployment-context.yaml \
-  --output .pheragent/deployment/mosip
-```
-
-The product uses the versioned `deployment-analysis-v1` policy. Experimental methods belong to the
-separate `pheragent research` entry point, so operators do not select research treatments when
-producing a deployment plan. Its default analysis model is
-`gpt-5.6-terra`; `--model` and `PHERAGENT_MODEL` remain explicit overrides.
-
-Each invocation creates an immutable UTC directory under
-`.pheragent/deployment/mosip/runs/`. Source clones and content-addressed LLM synthesis
-responses are shared in `.source-cache/` and `.llm-cache/`, so prior runs are retained
-without paying repeated acquisition or synthesis costs. A normal run contains:
-
-```text
-runs/<timestamp>-<run-name>/
-├── functional-blocks.yaml
-├── deployment-workflow.yaml
-├── unresolved-work.yaml
-└── .heragent/                 # internal records used by evaluation
-    ├── run-manifest.json
-    ├── events.jsonl
-    └── metrics.json
-```
-
-Use `--debug` to add the repository index, reference graph, candidate components,
-deployment signals, and compact LLM input beneath `.heragent/debug/`. Analysis uses at most two
-schema-constrained LLM requests by default: one bounded retrieval plan and one grounded
-synthesis. The raw repository is never included in either request.
-
-Blocks and components use separate namespaces: blocks are `B0`, `B1`, and so on,
-while discovered components are deterministically sequenced as `C001_postgresql`,
-`C002_keycloak`, etc. The synthesis JSON Schema enumerates the exact allowed `C*`
-IDs, so provided `B*` IDs cannot be returned as components.
-
-Failed synthesis attempts are retained under `.llm-cache/failures/`, including the
-error, token usage when available, and rejected structured response. An identical
-model/input/prompt request is not charged again; the analyzer reuses the failure
-record and falls back deterministically. Use `--retry-failed-llm` only when an
-intentional retry is appropriate, such as after changing external account state.
-
-### Dry-run and execution
-
-Review `deployment-workflow.yaml`, then preview the exact local commands and their order:
+A task file names the goal, source repositories, target environment, safety
+limits, and a bounded stopping check. The agent derives its next step from the
+sources and live state; the task does not need to list components.
 
 ```bash
-pheragent deployment run path/to/deployment-workflow.yaml \
-  --source-root mosip-infra=/path/to/mosip-infra
+uv run pheragent deployment run path/to/task.yaml \
+  --model gpt-5.6-terra \
+  --output .pheragent/agent-runs/trial
 ```
 
-Dry-run is the default and never starts a repository command. If the workflow is ready,
-the output includes an approval token tied to the workflow, ordered commands, and source
-roots. Supply that token to execute the unchanged plan:
+Without `--execute`, HerAgent can inspect sources and the target but cannot
+change it. Add `--execute` to permit proposed changes. The harness applies
+its safety rules and asks for terminal approval when required:
 
 ```bash
-pheragent deployment run path/to/deployment-workflow.yaml \
-  --source-root mosip-infra=/path/to/mosip-infra \
-  --execute \
-  --approve 'sha256:...'
+uv run pheragent deployment run path/to/task.yaml \
+  --model gpt-5.6-terra \
+  --output .pheragent/agent-runs/live-trial \
+  --execute
 ```
 
-For fail-fast experiments, add `--allow-unready` to the dry-run and execution commands.
-HerAgent then selects only grounded, ready steps whose prerequisites are also selected;
-blocked steps and their dependents remain excluded. The approval token records this mode.
+For a Kubernetes task, set an explicit `environment.context` and, if needed,
+`environment.kubeconfig` in the task. HerAgent will not choose another
+cluster. An example bounded MOSIP task is
+[agent-two-outcomes.yaml](configs/deployment/mosip/agent-two-outcomes.yaml).
 
-Limit a trial to one discovered block whose block prerequisites are already provided with
-`--block B6`. HerAgent resolves membership from the adjacent `functional-blocks.yaml`; the
-selected block is included in the dry-run and approval token.
+Each run writes `task.json`, `sources.json`, `trajectory.jsonl`,
+`actions.jsonl` (when actions are attempted), `state.json`, and
+`final-report.json` beneath its output directory. Repository scripts run
+from a copied workspace; acquired source repositories remain unchanged.
+A failed action is returned to the agent for further investigation. Automatic
+source patching, rollback, and resuming a stopped run are not yet implemented.
 
-Commands run on the machine hosting the CLI. Deployment scripts are responsible for
-reaching Kubernetes or worker nodes. Failed operations enter bounded recovery while independent
-operations continue. The recovery worker classifies each failure and returns one of three small
-results: patch the current installer, insert one source-backed prerequisite before the failed step,
-or revisit an existing prerequisite. The main execution loop validates and applies plan changes,
-then resumes from the affected step. A newly introduced command requires terminal approval because
-it was not covered by the original dry-run token.
+The current stopping check can verify fixed commands or a chosen number of
+newly observed outcomes. It does **not** establish that an arbitrary whole
+system is fully deployed.
 
-A completed execution run keeps the revised functional blocks, revised workflow, unresolved work,
-accepted changed files, and short change notes at the run root. Logs and machine-readable traces
-remain under `.heragent/`.
-
-The MOSIP context deliberately supplies only the already-provisioned infrastructure
-and Kubernetes blocks. The analyzer discovers installer roots and service/application
-components without exact path hints. A human must reconcile the generated workflow with the live
-environment before approving execution.
-
-## Deployment Research
-
-Research uses the same analyzer core through a separate CLI. A study selects pinned sources,
-contexts, treatments, repetitions, and budgets:
-
-```bash
-uv run pheragent research run \
-  --study path/to/study.yaml
-```
-
-This defaults to cost preflight and reports the planned run and LLM-request ceilings. Add
-`--execute` to run the declared study. Research alone exposes the analysis treatments:
-
-- `a0`: deterministic baseline
-- `a1`: bounded hybrid analysis
-
-Rebuild derived result tables without modifying sealed runs with:
-
-```bash
-uv run pheragent research summarize .pheragent/research/<study-id>
-```
+Deployment code is organized by responsibility: `deployment/agent.py` owns
+the decision loop, `task.py` the task and decision shapes, `sources.py`
+source reading, `runtime.py` target observation and actions, and
+`progress.py` the run record. Shared source and LLM helpers remain in the
+same package. The previous full-plan implementation is preserved on the
+`archive/full-plan-before-progressive-20260929` Git branch.
 
 ## Configuration
 

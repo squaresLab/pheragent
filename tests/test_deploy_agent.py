@@ -7,18 +7,10 @@ from pathlib import Path
 import pytest
 import yaml
 
-from pheragent.deploy_agent import (
-    _INSTRUCTIONS,
-    Decision,
-    DeploymentTask,
-    _brief,
-    _checks,
-    _execute,
-    _policy,
-    _target_command,
-    run_deployment_agent,
-)
-from pheragent.deploy_agent_cli import main as deploy_main
+from pheragent.cli import main as pheragent_main
+from pheragent.deployment.agent import _INSTRUCTIONS, _brief, run_deployment_agent
+from pheragent.deployment.runtime import _checks, _execute, _policy, _target_command
+from pheragent.deployment.task import Decision, DeploymentTask
 
 
 def _decision(kind: str, tool: str | None = None, **changes: object) -> Decision:
@@ -379,14 +371,14 @@ def test_read_only_execute_is_observed_without_approval(tmp_path: Path, monkeypa
             }
         )
     )
-    monkeypatch.setattr("pheragent.deploy_agent._observe", lambda _task: {})
+    monkeypatch.setattr("pheragent.deployment.agent._observe", lambda _task: {})
     observed = []
 
     def inspect(command, _task, **_kwargs):
         observed.append(command)
         return {"exit_code": 0, "stdout": "No resources found", "stderr": ""}
 
-    monkeypatch.setattr("pheragent.deploy_agent._command", inspect)
+    monkeypatch.setattr("pheragent.deployment.agent._command", inspect)
     decisions = iter(
         [
             _decision(
@@ -416,7 +408,7 @@ def test_repeated_denied_observation_stops_early(tmp_path: Path, monkeypatch) ->
     task = tmp_path / "task.yaml"
     output = tmp_path / "run"
     _task(task, source, output)
-    monkeypatch.setattr("pheragent.deploy_agent._observe", lambda _task: {})
+    monkeypatch.setattr("pheragent.deployment.agent._observe", lambda _task: {})
     calls = 0
 
     def decide(_state, _observation, _last_result, _sources, _cycle):
@@ -491,8 +483,8 @@ def test_kubernetes_change_waits_for_terminal_approval(
             }
         return {"exit_code": 0, "stdout": "", "stderr": ""}
 
-    monkeypatch.setattr("pheragent.deploy_agent.sys.stdin", Terminal(answer))
-    monkeypatch.setattr("pheragent.deploy_agent._command", run_command)
+    monkeypatch.setattr("pheragent.deployment.runtime.sys.stdin", Terminal(answer))
+    monkeypatch.setattr("pheragent.deployment.runtime._command", run_command)
     result = _execute(decision, task, Evidence(), tmp_path, enabled=True, approve=False, timeout=10)
     assert (result["status"] == "validated") is should_run
     prompt = capsys.readouterr().out
@@ -503,9 +495,9 @@ def test_kubernetes_change_waits_for_terminal_approval(
 
 
 def test_cli_reports_usage_and_verified_changes(tmp_path: Path, monkeypatch, capsys) -> None:
-    monkeypatch.setattr("pheragent.deploy_agent_cli.load_dotenv", lambda _path: None)
+    monkeypatch.setattr("pheragent.cli.load_dotenv", lambda _path: None)
     monkeypatch.setattr(
-        "pheragent.deploy_agent_cli.run_deployment_agent",
+        "pheragent.deployment.cli.run_deployment_agent",
         lambda *_args, **_kwargs: {
             "status": "SUCCESS",
             "reason": "verified",
@@ -522,12 +514,23 @@ def test_cli_reports_usage_and_verified_changes(tmp_path: Path, monkeypatch, cap
             },
         },
     )
-    assert deploy_main(["run", "task.yaml", "--output", str(tmp_path / "run")]) == 0
+    assert (
+        pheragent_main(["deployment", "run", "task.yaml", "--output", str(tmp_path / "run")]) == 0
+    )
     summary = capsys.readouterr().out
     assert "3 requests; 120 tokens (input 100, output 20)" in summary
     assert "Actions attempted: 2" in summary
     assert "Validated changes: storage ready" in summary
     assert "New verified outcomes: storage" in summary
+
+
+def test_deployment_exposes_only_progressive_run() -> None:
+    from pheragent.cli import _build_parser
+
+    parser = _build_parser()
+    assert parser.parse_args(["deployment", "run", "task.yaml"]).task == Path("task.yaml")
+    with pytest.raises(SystemExit):
+        parser.parse_args(["deployment", "analyze"])
 
 
 def test_missing_key_stops_before_source_acquisition(tmp_path: Path, monkeypatch) -> None:
@@ -657,7 +660,7 @@ def test_agent_asks_human_to_choose_between_supported_routes(tmp_path: Path, mon
         def isatty(self):
             return True
 
-    monkeypatch.setattr("pheragent.deploy_agent.sys.stdin", Terminal("2\n"))
+    monkeypatch.setattr("pheragent.deployment.agent.sys.stdin", Terminal("2\n"))
     decisions = iter(
         [
             _decision(
@@ -706,8 +709,8 @@ def test_unknown_preflight_does_not_execute(tmp_path: Path, monkeypatch) -> None
         calls.append(command)
         return {"exit_code": 1, "stdout": "", "stderr": "Permission denied"}
 
-    monkeypatch.setattr("pheragent.deploy_agent._source_grounded", lambda *_args: True)
-    monkeypatch.setattr("pheragent.deploy_agent._command", cannot_read)
+    monkeypatch.setattr("pheragent.deployment.runtime._source_grounded", lambda *_args: True)
+    monkeypatch.setattr("pheragent.deployment.runtime._command", cannot_read)
     result = _execute(decision, task, Evidence(), tmp_path, enabled=True, approve=False, timeout=10)
     assert result["status"] == "needs_better_check"
     assert calls == [["ls", str(tmp_path / "ready")]]
@@ -739,8 +742,8 @@ def test_successful_command_without_verified_change_is_failure(tmp_path: Path, m
             return {"exit_code": 1, "stdout": "", "stderr": "No such file or directory"}
         return {"exit_code": 0, "stdout": "", "stderr": ""}
 
-    monkeypatch.setattr("pheragent.deploy_agent._source_grounded", lambda *_args: True)
-    monkeypatch.setattr("pheragent.deploy_agent._command", run_command)
+    monkeypatch.setattr("pheragent.deployment.runtime._source_grounded", lambda *_args: True)
+    monkeypatch.setattr("pheragent.deployment.runtime._command", run_command)
     result = _execute(decision, task, Evidence(), tmp_path, enabled=True, approve=False, timeout=0)
     assert result["status"] == "verification_failed"
     assert result["execution"]["exit_code"] == 0
@@ -769,8 +772,8 @@ def test_delayed_readiness_is_verified_before_next_action(tmp_path: Path, monkey
             result[0]["passed"] = False
         return result
 
-    monkeypatch.setattr("pheragent.deploy_agent.time.sleep", lambda _seconds: None)
-    monkeypatch.setattr("pheragent.deploy_agent._checks", delayed_checks)
+    monkeypatch.setattr("pheragent.deployment.runtime.time.sleep", lambda _seconds: None)
+    monkeypatch.setattr("pheragent.deployment.runtime._checks", delayed_checks)
     decision = _decision(
         "ACT",
         "execute",
