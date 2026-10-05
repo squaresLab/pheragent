@@ -40,10 +40,10 @@ and what depends on it; revise that picture as evidence changes. Compare observe
 capabilities with source-grounded requirements and choose a missing prerequisite before
 its consumer, without assuming repository stages.
 ACT may call one read-only tool or propose one mutating command. For read_file and
-list_directory use source_path 'source-id:relative/path'. Start with the source inventory
-and root instructions or directory. A root README often maps the route and links to
-details, but may not contain the command. Inspect command-bearing entrypoints as well
-as prose; distinguish installation from build, test, and example commands.
+list_directory use source_path 'source-id:relative/path'. Start with files named in
+working_state.overview.route_evidence and read them in full. A README may map the route
+without containing the command, so inspect its command-bearing entrypoint too. AGENTS,
+CONTRIBUTING, and coding-policy files are not deployment guidance.
 Use observe for read-only commands. The harness supplies the declared Kubernetes
 context; do not choose another context.
 Prefer existing project scripts, then charts, existing automation, manifests, documented

@@ -69,7 +69,6 @@ def test_model_selects_route_then_builds_overview_from_complete_files(tmp_path: 
                                         "id": "deploy.app",
                                         "goal": "start services",
                                         "success_condition": "services are healthy",
-                                        "evidence": ["repository-1:docs/run.md"],
                                     }
                                 ],
                             }

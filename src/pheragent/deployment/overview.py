@@ -22,9 +22,7 @@ class EntrypointSelection(Record):
 class OverviewStep(Record):
     id: str = Field(min_length=1)
     goal: str = Field(min_length=1)
-    required_inputs: list[str] = Field(default_factory=list)
     success_condition: str = Field(min_length=1)
-    evidence: list[str] = Field(min_length=1)
     status: StepStatus = "pending"
 
 
@@ -47,18 +45,18 @@ _ENTRYPOINT_INSTRUCTIONS = """You are a senior DevOps engineer choosing where to
 The harness provides a repository tree, generic deployment-artifact candidates, and local
 references between files. These hints are not a semantic ranking. Reason from filenames,
 directory structure, references, the target, and the objective. Select one coherent deployment
-route and one to four exact files that best explain that route. Prefer a root guide plus its
-command-bearing entrypoint or workflow. Do not mix unrelated routes, examples, tests, or CI
-unless CI is the documented deployment route. Return only paths present in the inventory.
+route and one to four exact files that best explain it. Include a root guide and at least one
+command-bearing file such as a Makefile, script, or workflow when one is available; a manifest
+alone may not show how it is invoked. Do not mix unrelated routes, examples, tests, or CI.
+Return only paths present in the inventory.
 """
 
 _OVERVIEW_INSTRUCTIONS = """You are a senior DevOps engineer forming a compact working map.
 Use the complete selected files to describe the chosen deployment route in order. Produce no
 more than six semantic stages and no more than four steps per stage. This is a two-level
-overview, not a command transcript and not a full plan. A stage describes purpose; a step
-describes a deployable outcome, required human input, or validation boundary. Use generic
-stage kinds. Cite exact source IDs supplied with the files. Do not invent commands, runtime
-state, or missing details. Exact commands will be resolved only when a step becomes active.
+overview, not a command transcript or full plan. Stages and steps describe deployable
+outcomes, not host inspection or speculative human inputs. Do not invent commands, runtime
+state, or missing details. Exact commands and inputs are resolved only for the active step.
 """
 
 
@@ -101,7 +99,7 @@ def create_overview(
         },
         response_format=strict_response_format(DeploymentOverview, name="deployment_overview"),
         response_model=DeploymentOverview,
-        validate=lambda value: _validate_overview(value, sources),
+        validate=_validate_overview,
     )
     if planned.value is None:
         raise RuntimeError(planned.warning or "deployment overview failed")
@@ -162,11 +160,8 @@ def _validate_files(files: list[str], sources: SourceTools) -> None:
         raise ValueError("entrypoint files must be distinct")
 
 
-def _validate_overview(overview: DeploymentOverview, sources: SourceTools) -> None:
+def _validate_overview(overview: DeploymentOverview) -> None:
     steps = [step for stage in overview.stages for step in stage.steps]
     ids = [stage.id for stage in overview.stages] + [step.id for step in steps]
     if len(ids) != len(set(ids)):
         raise ValueError("overview IDs must be unique")
-    missing = {reference for step in steps for reference in step.evidence} - sources.readable_paths
-    if missing:
-        raise ValueError(f"overview evidence is absent from inventory: {sorted(missing)}")
