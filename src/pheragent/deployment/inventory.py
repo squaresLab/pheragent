@@ -170,6 +170,8 @@ def classify_file(relative_path: str, sample: str) -> InventoryCategory:
         return InventoryCategory.CI_WORKFLOW
     if _COMPOSE_FILE.fullmatch(name):
         return InventoryCategory.COMPOSE
+    if name in {"makefile", "gnumakefile", "justfile", "taskfile"}:
+        return InventoryCategory.BUILD
     if name == "chart.yaml" or name.startswith("values") and suffix in _YAML_SUFFIXES:
         return InventoryCategory.HELM
     if "templates" in parts and suffix in _YAML_SUFFIXES:

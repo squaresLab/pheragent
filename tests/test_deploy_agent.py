@@ -317,6 +317,7 @@ def test_matching_context_storage_check_is_read_only() -> None:
         ["ansible-playbook", "--syntax-check", "site.yaml"],
         ["bash", "-n", "install.sh"],
         ["stat", "install.sh"],
+        ["docker", "compose", "version"],
     ],
 )
 def test_supported_read_only_probes(command: list[str]) -> None:
@@ -342,6 +343,7 @@ def test_supported_read_only_probes(command: list[str]) -> None:
         ["ansible-playbook", "site.yaml"],
         ["bash", "-n", "-i", "install.sh"],
         ["bash", "install.sh"],
+        ["docker", "compose", "up", "-d"],
     ],
 )
 def test_unsafe_observations_are_not_read_only(command: list[str]) -> None:

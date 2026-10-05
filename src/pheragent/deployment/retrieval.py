@@ -19,9 +19,7 @@ _MARKDOWN_SUFFIXES = {".md", ".markdown"}
 _YAML_SUFFIXES = {".yaml", ".yml"}
 _SHELL_SUFFIXES = {".sh", ".bash", ".zsh"}
 _MARKDOWN_HEADING = re.compile(r"^\s*#{1,6}\s+\S")
-_SHELL_FUNCTION = re.compile(
-    r"^\s*(?:function\s+)?[A-Za-z_][A-Za-z0-9_]*\s*(?:\(\s*\))?\s*\{\s*$"
-)
+_SHELL_FUNCTION = re.compile(r"^\s*(?:function\s+)?[A-Za-z_][A-Za-z0-9_]*\s*(?:\(\s*\))?\s*\{\s*$")
 _MAX_PASSAGE_LINES = 80
 _PASSAGE_OVERLAP_LINES = 8
 
@@ -124,7 +122,6 @@ class DeploymentRetrievalEngine:
                 reasons[key].add(label)
         ranked = self._select_diverse(
             sorted(fused, key=lambda key: (-fused[key], key)),
-            query=query,
             limit=limit,
         )
         return [
@@ -235,21 +232,19 @@ class DeploymentRetrievalEngine:
         self,
         ranked: list[str],
         *,
-        query: RetrievalQuery,
         limit: int,
     ) -> list[str]:
-        if query.source_kind is not None or limit < 2 or not ranked:
-            return ranked[:limit]
-        selected = [ranked[0]]
-        first_kind = self._documents[ranked[0]].source_kind
-        contrasting = next(
-            (key for key in ranked[1:] if self._documents[key].source_kind != first_kind),
-            None,
-        )
-        if contrasting:
-            selected.append(contrasting)
-        selected.extend(key for key in ranked if key not in selected)
-        return selected[:limit]
+        selected = []
+        seen_files = set()
+        for key in ranked:
+            file_key = self._documents[key].file_key
+            if file_key in seen_files:
+                continue
+            selected.append(key)
+            seen_files.add(file_key)
+            if len(selected) == limit:
+                break
+        return selected
 
     @staticmethod
     def _eligible(document: RetrievalDocument, query: RetrievalQuery) -> bool:
@@ -325,9 +320,7 @@ def _passage_ranges(path: str, lines: list[str]) -> list[tuple[int, int]]:
     starts = [0]
     if suffix in _MARKDOWN_SUFFIXES:
         starts.extend(
-            index
-            for index, line in enumerate(lines[1:], start=1)
-            if _MARKDOWN_HEADING.match(line)
+            index for index, line in enumerate(lines[1:], start=1) if _MARKDOWN_HEADING.match(line)
         )
     elif suffix in _YAML_SUFFIXES:
         starts.extend(
@@ -335,14 +328,9 @@ def _passage_ranges(path: str, lines: list[str]) -> list[tuple[int, int]]:
         )
     elif suffix in _SHELL_SUFFIXES:
         starts.extend(
-            index
-            for index, line in enumerate(lines[1:], start=1)
-            if _SHELL_FUNCTION.match(line)
+            index for index, line in enumerate(lines[1:], start=1) if _SHELL_FUNCTION.match(line)
         )
-    ranges = [
-        (start, end)
-        for start, end in zip(starts, [*starts[1:], len(lines)], strict=True)
-    ]
+    ranges = [(start, end) for start, end in zip(starts, [*starts[1:], len(lines)], strict=True)]
     return [bounded for start, end in ranges for bounded in _bounded_ranges(start, end)]
 
 

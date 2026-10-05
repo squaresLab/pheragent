@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
 
 from pheragent.deployment.enums import InventoryCategory, SourceKind
 from pheragent.deployment.inventory import RepositoryInventoryBuilder, classify_file
 from pheragent.deployment.models import SourceManifestEntry, SourceSpec
 from pheragent.deployment.source_manager import AcquiredSource
+from pheragent.deployment.sources import SourceTools, _source_grounded
 
 
 def _source(path: Path, *, include: list[str] | None = None) -> AcquiredSource:
@@ -59,6 +63,7 @@ def test_inventory_applies_patterns_and_classifies_files(tmp_path: Path) -> None
 
 
 def test_classification_detects_deployment_yaml_types() -> None:
+    assert classify_file("Makefile", "start:\n\tdocker compose up -d\n") == InventoryCategory.BUILD
     assert (
         classify_file(".github/workflows/deploy.yml", "jobs:\n  deploy: {}\n")
         == InventoryCategory.CI_WORKFLOW
@@ -79,6 +84,68 @@ def test_classification_detects_deployment_yaml_types() -> None:
         classify_file("main.tf", 'resource "aws_instance" "node" {}\n')
         == InventoryCategory.TERRAFORM
     )
+
+
+def test_source_tools_search_build_file_and_read_unfamiliar_safe_text(tmp_path: Path) -> None:
+    (tmp_path / "Makefile").write_text("start:\n\tdocker compose up -d\n")
+    (tmp_path / "instructions.custom").write_text("Run make start.\n")
+    (tmp_path / "binary.dat").write_bytes(b"\0not text")
+    (tmp_path / "assets").mkdir()
+    (tmp_path / "assets/excluded.png").write_text("Run make start.\n")
+    tools = SourceTools((_source(tmp_path),))
+
+    hits = tools.call(SimpleNamespace(tool="search_sources", query="make start docker compose"))
+    assert any(hit["source"] == "fixture:Makefile" for hit in hits["hits"])
+
+    def read(name: str) -> dict:
+        return tools.call(
+            SimpleNamespace(
+                tool="read_file", source_path=f"fixture:{name}", start_line=None, end_line=None
+            )
+        )
+
+    assert read("instructions.custom")["text"] == "Run make start."
+    assert _source_grounded(
+        SimpleNamespace(
+            command=["make", "start"],
+            evidence=["fixture:instructions.custom"],
+            working_directory=None,
+        ),
+        tools,
+    )
+    for name in ("binary.dat", "assets/excluded.png"):
+        with pytest.raises(ValueError, match="readable inventory"):
+            read(name)
+
+
+def test_source_inventory_shows_root_entrypoint_before_deep_files(tmp_path: Path) -> None:
+    workflows = tmp_path / ".github" / "workflows"
+    workflows.mkdir(parents=True)
+    for index in range(25):
+        (workflows / f"{index:02}.yaml").write_text("jobs: {}\n")
+    (tmp_path / "Makefile").write_text("start:\n\tdocker compose up -d\n")
+
+    result = SourceTools((_source(tmp_path),)).call(SimpleNamespace(tool="inventory_sources"))
+
+    assert result["total"] == 26
+    assert result["tree"].startswith("fixture:\n  Makefile\n")
+    assert ".github/" in result["tree"]
+
+
+def test_source_search_returns_distinct_files_and_matching_lines(tmp_path: Path) -> None:
+    (tmp_path / "README.md").write_text(
+        "\n".join(f"# Section {index}\ndocker compose deploy application" for index in range(9))
+    )
+    (tmp_path / "Makefile").write_text("start:\n\tdocker compose up -d\n")
+    result = SourceTools((_source(tmp_path),)).call(
+        SimpleNamespace(tool="search_sources", query="docker compose deploy")
+    )
+
+    assert [hit["source"] for hit in result["hits"]] == [
+        "fixture:README.md",
+        "fixture:Makefile",
+    ]
+    assert all(hit["start_line"] <= hit["line"] <= hit["end_line"] for hit in result["hits"])
 
 
 def test_inventory_includes_sample_and_example_files(tmp_path: Path) -> None:

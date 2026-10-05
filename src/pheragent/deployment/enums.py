@@ -13,6 +13,7 @@ class InventoryCategory(StrEnum):
     """A source file's deployment-relevant format."""
 
     DOCUMENTATION = "documentation"
+    BUILD = "build"
     SHELL = "shell"
     ANSIBLE = "ansible"
     TERRAFORM = "terraform"

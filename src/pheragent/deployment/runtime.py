@@ -147,7 +147,10 @@ def _read_only(command: list[str]) -> bool:
     if command[0] == "git":
         return len(command) > 1 and command[1] in {"status", "log", "show", "rev-parse"}
     if command[0] == "docker":
-        return len(command) > 1 and command[1] in {"ps", "info", "version"}
+        return len(command) > 1 and (
+            command[1] in {"ps", "info", "version"}
+            or command[1:] == ["compose", "version"]
+        )
     return command[0] in {"ls", "pwd", "uname", "df", "free", "ps", "stat"}
 
 
