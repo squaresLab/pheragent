@@ -166,6 +166,8 @@ def classify_file(relative_path: str, sample: str) -> InventoryCategory:
     parts = {part.lower() for part in path.parts}
     normalized_path = relative_path.lower()
 
+    if name.startswith("dockerfile"):
+        return InventoryCategory.BUILD
     if normalized_path.startswith(".github/workflows/") and suffix in _YAML_SUFFIXES:
         return InventoryCategory.CI_WORKFLOW
     if _COMPOSE_FILE.fullmatch(name):
@@ -173,6 +175,8 @@ def classify_file(relative_path: str, sample: str) -> InventoryCategory:
     if name in {"makefile", "gnumakefile", "justfile", "taskfile"}:
         return InventoryCategory.BUILD
     if name == "chart.yaml" or name.startswith("values") and suffix in _YAML_SUFFIXES:
+        return InventoryCategory.HELM
+    if name.startswith("helmfile"):
         return InventoryCategory.HELM
     if "templates" in parts and suffix in _YAML_SUFFIXES:
         return InventoryCategory.HELM

@@ -58,6 +58,22 @@ class TaskGoal(Record):
     stop_after_verified_outcomes: int | None = Field(default=None, gt=0)
 
 
+class TaskInput(Record):
+    value: str | None = None
+    from_env: str | None = None
+    from_file: Path | None = None
+    sensitive: bool = False
+
+    @model_validator(mode="after")
+    def require_one_source(self) -> TaskInput:
+        sources = [self.value is not None, self.from_env is not None, self.from_file is not None]
+        if sum(sources) != 1:
+            raise ValueError("input needs exactly one of value, from_env, or from_file")
+        if self.sensitive and self.value is not None:
+            raise ValueError("sensitive inputs cannot be stored inline")
+        return self
+
+
 class DeploymentTask(Record):
     task: TaskGoal
     sources: TaskSources
@@ -65,6 +81,7 @@ class DeploymentTask(Record):
     constraints: Constraints = Field(default_factory=Constraints)
     budgets: Budgets = Field(default_factory=Budgets)
     success_checks: list[Check] = Field(default_factory=list)
+    inputs: dict[str, TaskInput] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def require_sources(self) -> DeploymentTask:
@@ -76,7 +93,7 @@ class DeploymentTask(Record):
 
 
 class Decision(Record):
-    kind: Literal["ACT", "DONE", "BLOCKED", "ASK_HUMAN"]
+    kind: Literal["ACT", "DONE", "BLOCKED", "ASK_HUMAN", "WAITING_FOR_INPUT"]
     tool: (
         Literal[
             "inventory_sources",
@@ -98,6 +115,9 @@ class Decision(Record):
     working_directory: str | None
     evidence: list[str]
     selected_route: str | None = None
+    step_id: str | None = None
+    required_inputs: list[str] = Field(default_factory=list)
+    completes_step: bool = False
     options: list[str] = Field(default_factory=list)
     outcome_id: str | None = None
     expected_change: str | None

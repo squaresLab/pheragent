@@ -184,6 +184,60 @@ def test_route_choice_and_repeated_read_reach_next_decision(tmp_path: Path) -> N
     assert seen[2][1]["repeated_result_count"] == 1
 
 
+def test_agent_waits_for_referenced_secret_and_resumes_same_run(
+    tmp_path: Path, monkeypatch
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "README.md").write_text("Deploy the sample.\n")
+    task = tmp_path / "task.yaml"
+    output = tmp_path / "run"
+    _task(task, source, output)
+    document = yaml.safe_load(task.read_text())
+    document["inputs"] = {
+        "service_token": {"from_env": "SAMPLE_SERVICE_TOKEN", "sensitive": True}
+    }
+    task.write_text(yaml.safe_dump(document))
+    monkeypatch.delenv("SAMPLE_SERVICE_TOKEN", raising=False)
+
+    def wait(_state, _observation, _last_result, _sources, _cycle):
+        return _decision(
+            "WAITING_FOR_INPUT",
+            reason="service token is required",
+            required_inputs=["service_token"],
+        ), {}
+
+    first = run_deployment_agent(task, output, decide=wait)
+    assert first["status"] == "WAITING_FOR_INPUT"
+    request = yaml.safe_load((output / "human-request.yaml").read_text())
+    assert request["required_inputs"]["service_token"]["available"] is False
+    assert "SAMPLE_SERVICE_TOKEN" not in (output / "human-request.yaml").read_text() or (
+        request["required_inputs"]["service_token"]["source"] == "env:SAMPLE_SERVICE_TOKEN"
+    )
+
+    monkeypatch.setenv("SAMPLE_SERVICE_TOKEN", "not-written-to-artifacts")
+
+    def stop(state, _observation, _last_result, _sources, _cycle):
+        assert state["inputs"]["service_token"]["available"] is True
+        assert "not-written-to-artifacts" not in json.dumps(state)
+        return _decision("BLOCKED", reason="resume verified"), {}
+
+    second = run_deployment_agent(task, output, resume=True, decide=stop)
+    assert second["reason"] == "resume verified"
+
+
+def test_sensitive_input_cannot_be_stored_inline() -> None:
+    with pytest.raises(ValueError, match="sensitive inputs cannot be stored inline"):
+        DeploymentTask.model_validate(
+            {
+                "task": {"objective": "sample"},
+                "sources": {"repositories": ["/tmp/sample"]},
+                "environment": {"type": "shell"},
+                "inputs": {"token": {"value": "secret", "sensitive": True}},
+            }
+        )
+
+
 def test_agent_prompt_requires_route_choice_and_deployment_progress() -> None:
     assert "senior DevOps engineer" in _INSTRUCTIONS
     assert "step by step" in _INSTRUCTIONS
@@ -256,6 +310,12 @@ def test_brief_retains_a_long_result_start_and_end() -> None:
     assert len(brief) < len(result)
 
 
+def test_brief_keeps_a_complete_selected_file_intact() -> None:
+    text = "header\n" + "deployment step\n" * 600 + "make start\n"
+    brief = _brief({"complete": True, "text": text, "total_lines": 602})
+    assert brief["text"] == text
+
+
 def test_policy_denies_direct_and_disguised_destructive_commands() -> None:
     task = DeploymentTask.model_validate(
         {
@@ -307,17 +367,30 @@ def test_matching_context_storage_check_is_read_only() -> None:
         ["helm", "repo", "list"],
         ["helm", "search", "repo", "postgresql"],
         ["helm", "history", "postgres"],
+        ["helm", "lint", "chart"],
+        ["helm", "template", "demo", "chart"],
         ["kubectl", "auth", "can-i", "get", "pods"],
         ["kubectl", "config", "current-context"],
         ["kubectl", "explain", "deployments"],
+        ["kubectl", "events", "-A"],
         ["aws", "sts", "get-caller-identity"],
         ["aws", "ec2", "describe-instances"],
         ["aws", "eks", "describe-cluster", "--name", "example"],
         ["ansible", "--version"],
         ["ansible-playbook", "--syntax-check", "site.yaml"],
         ["bash", "-n", "install.sh"],
+        ["git", "diff", "--stat"],
         ["stat", "install.sh"],
+        ["docker", "ps", "--all"],
+        ["docker", "images"],
+        ["docker", "inspect", "demo"],
+        ["docker", "logs", "demo"],
         ["docker", "compose", "version"],
+        ["docker", "compose", "ps", "--all"],
+        ["docker", "compose", "ls"],
+        ["lsblk"],
+        ["lscpu"],
+        ["whoami"],
     ],
 )
 def test_supported_read_only_probes(command: list[str]) -> None:
@@ -531,6 +604,7 @@ def test_deployment_exposes_only_progressive_run() -> None:
 
     parser = _build_parser()
     assert parser.parse_args(["deployment", "run", "task.yaml"]).task == Path("task.yaml")
+    assert parser.parse_args(["deployment", "run", "task.yaml", "--resume"]).resume is True
     with pytest.raises(SystemExit):
         parser.parse_args(["deployment", "analyze"])
 

@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
+import posixpath
+import re
 import shlex
 import shutil
 from pathlib import Path, PurePosixPath
@@ -13,6 +16,19 @@ from .redaction import redact_secrets
 from .retrieval import DeploymentRetrievalEngine, RetrievalQuery
 from .source_manager import AcquiredSource
 from .task import Decision, SourceLocation
+
+_ENTRYPOINT_CATEGORIES = {
+    "ansible",
+    "build",
+    "ci_workflow",
+    "compose",
+    "helm",
+    "helmsman",
+    "terraform",
+}
+_ENTRYPOINT_DIRECTORIES = {"ansible", "deploy", "deployment", "scripts"}
+_MAX_COMPLETE_FILE_CHARACTERS = 100_000
+_REFERENCE = re.compile(r"(?:\[[^\]]*\]\(([^)]+)\)|(?:^|[\s'\"`])([.\w/-]+\.[\w.-]+))")
 
 
 def _source_spec(item: str | SourceLocation, purpose: str, index: int, base: Path) -> SourceSpec:
@@ -101,6 +117,74 @@ class SourceTools:
             if entry.selected or entry.skip_reason == "unsupported_file_type"
         }
 
+    def reference_graph(self) -> list[dict[str, str]]:
+        edges = set()
+        by_source = {
+            source_id: {
+                reference.partition(":")[2]
+                for reference in self.readable_paths
+                if reference.startswith(source_id + ":")
+            }
+            for source_id in self.sources
+        }
+        for reference in self.readable_paths:
+            source_id, _, relative = reference.partition(":")
+            try:
+                text = self.sources[source_id].resolve_path(relative).read_text(
+                    encoding="utf-8", errors="replace"
+                )
+            except OSError:
+                continue
+            parent = PurePosixPath(relative).parent
+            for match in _REFERENCE.finditer(text):
+                target = (match.group(1) or match.group(2)).split("#", 1)[0].strip()
+                if not target or "://" in target or target.startswith(("#", "/")):
+                    continue
+                candidates = (
+                    posixpath.normpath((parent / target).as_posix()),
+                    posixpath.normpath(PurePosixPath(target).as_posix()),
+                )
+                resolved = next((item for item in candidates if item in by_source[source_id]), None)
+                if resolved:
+                    edges.add((reference, f"{source_id}:{resolved}"))
+        return [
+            {"from": source, "to": target}
+            for source, target in sorted(edges)[:500]
+        ]
+
+    def entrypoint_candidates(self) -> list[str]:
+        candidates = []
+        for reference in self.paths:
+            _source_id, _, relative = reference.partition(":")
+            path = PurePosixPath(relative)
+            name = path.name.casefold()
+            explicit = name.startswith(
+                ("readme", "dockerfile", "docker-compose", "helmfile")
+            ) or name in {"chart.yaml", "makefile"}
+            if (
+                explicit
+                or self.categories[reference] in _ENTRYPOINT_CATEGORIES
+                or _ENTRYPOINT_DIRECTORIES.intersection(
+                    part.casefold() for part in path.parts[:-1]
+                )
+            ):
+                root = len(path.parts) == 1
+                rank = (
+                    0
+                    if root and name.startswith("readme")
+                    else 1
+                    if root and explicit
+                    else 2
+                    if name.startswith("readme")
+                    else 3
+                    if explicit
+                    else 4
+                    if self.categories[reference] in _ENTRYPOINT_CATEGORIES
+                    else 5
+                )
+                candidates.append((rank, len(path.parts), reference.casefold(), reference))
+        return [item[-1] for item in sorted(candidates)[:200]]
+
     def existing_refs(self, references: list[str]) -> set[str]:
         return {
             path
@@ -108,9 +192,50 @@ class SourceTools:
             if any(ref == path or ref.startswith((path + ":", path + " —")) for ref in references)
         }
 
+    def read_file(
+        self, reference: str, start_line: int | None = None, end_line: int | None = None
+    ) -> dict:
+        identifier, separator, relative = reference.partition(":")
+        if not separator or identifier not in self.sources:
+            raise ValueError("source_path must be source-id:relative/path")
+        if reference not in self.readable_paths:
+            raise ValueError("source file is not in the readable inventory")
+        content = self.sources[identifier].resolve_path(relative).read_text(
+            encoding="utf-8", errors="replace"
+        )
+        lines = content.splitlines()
+        start = max(1, start_line or 1)
+        complete = start_line is None and end_line is None
+        digest = hashlib.sha256(content.encode()).hexdigest()
+        if complete and len(content) > _MAX_COMPLETE_FILE_CHARACTERS:
+            return {
+                "source": reference,
+                "complete": False,
+                "total_lines": len(lines),
+                "sha256": digest,
+                "reason": "file is too large for one model call; request a line range",
+            }
+        end = len(lines) if complete else min(len(lines), end_line or start + 119)
+        return {
+            "source": reference,
+            "start_line": start,
+            "end_line": end,
+            "total_lines": len(lines),
+            "complete": complete,
+            "sha256": digest,
+            "text": redact_secrets("\n".join(lines[start - 1 : end])),
+        }
+
+    def inventory(self) -> dict:
+        return {
+            **_source_tree(self.readable_paths),
+            "entrypoint_candidates": self.entrypoint_candidates(),
+            "references": self.reference_graph(),
+        }
+
     def call(self, decision: Decision) -> dict:
         if decision.tool == "inventory_sources":
-            return _source_tree(self.paths)
+            return self.inventory()
         if decision.tool == "search_sources":
             hits = self.search_index.search(RetrievalQuery(terms=(decision.query or "",)), limit=10)
             result = []
@@ -139,17 +264,9 @@ class SourceTools:
                 if not path.is_dir():
                     raise ValueError("source path is not a directory")
                 return {"entries": sorted(item.name for item in path.iterdir())[:200]}
-            if decision.source_path not in self.readable_paths:
-                raise ValueError("source file is not in the readable inventory")
-            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
-            start = max(1, decision.start_line or 1)
-            end = min(len(lines), decision.end_line or start + 119, start + 119)
-            return {
-                "source": decision.source_path,
-                "start_line": start,
-                "end_line": end,
-                "text": redact_secrets("\n".join(lines[start - 1 : end])),
-            }
+            return self.read_file(
+                decision.source_path, decision.start_line, decision.end_line
+            )
         raise ValueError("unknown source tool")
 
 

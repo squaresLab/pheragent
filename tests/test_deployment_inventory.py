@@ -63,6 +63,7 @@ def test_inventory_applies_patterns_and_classifies_files(tmp_path: Path) -> None
 
 
 def test_classification_detects_deployment_yaml_types() -> None:
+    assert classify_file("Dockerfile.dev", "FROM python:3.13\n") == InventoryCategory.BUILD
     assert classify_file("Makefile", "start:\n\tdocker compose up -d\n") == InventoryCategory.BUILD
     assert (
         classify_file(".github/workflows/deploy.yml", "jobs:\n  deploy: {}\n")
@@ -84,6 +85,7 @@ def test_classification_detects_deployment_yaml_types() -> None:
         classify_file("main.tf", 'resource "aws_instance" "node" {}\n')
         == InventoryCategory.TERRAFORM
     )
+    assert classify_file("helmfile.yaml", "releases: []\n") == InventoryCategory.HELM
 
 
 def test_source_tools_search_build_file_and_read_unfamiliar_safe_text(tmp_path: Path) -> None:
@@ -105,6 +107,8 @@ def test_source_tools_search_build_file_and_read_unfamiliar_safe_text(tmp_path: 
         )
 
     assert read("instructions.custom")["text"] == "Run make start."
+    inventory = tools.call(SimpleNamespace(tool="inventory_sources"))
+    assert "instructions.custom" in inventory["tree"]
     assert _source_grounded(
         SimpleNamespace(
             command=["make", "start"],
@@ -116,6 +120,18 @@ def test_source_tools_search_build_file_and_read_unfamiliar_safe_text(tmp_path: 
     for name in ("binary.dat", "assets/excluded.png"):
         with pytest.raises(ValueError, match="readable inventory"):
             read(name)
+
+
+def test_source_inventory_maps_local_deployment_references(tmp_path: Path) -> None:
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    (tmp_path / "README.md").write_text("Deploy with [the run guide](docs/run.md).\n")
+    (docs / "run.md").write_text("Run `make start`.\n")
+    (tmp_path / "Makefile").write_text("start:\n\tdocker compose up -d\n")
+
+    result = SourceTools((_source(tmp_path),)).call(SimpleNamespace(tool="inventory_sources"))
+
+    assert {"from": "fixture:README.md", "to": "fixture:docs/run.md"} in result["references"]
 
 
 def test_source_inventory_shows_root_entrypoint_before_deep_files(tmp_path: Path) -> None:
@@ -130,6 +146,29 @@ def test_source_inventory_shows_root_entrypoint_before_deep_files(tmp_path: Path
     assert result["total"] == 26
     assert result["tree"].startswith("fixture:\n  Makefile\n")
     assert ".github/" in result["tree"]
+    assert result["entrypoint_candidates"][0] == "fixture:Makefile"
+
+
+def test_read_file_returns_the_complete_file_and_metadata(tmp_path: Path) -> None:
+    content = "\n".join(f"line {number}" for number in range(1, 202))
+    (tmp_path / "README.md").write_text(content)
+    tools = SourceTools((_source(tmp_path),))
+
+    result = tools.call(
+        SimpleNamespace(
+            tool="read_file",
+            source_path="fixture:README.md",
+            start_line=None,
+            end_line=None,
+        )
+    )
+
+    assert result["complete"] is True
+    assert result["total_lines"] == 201
+    assert result["start_line"] == 1
+    assert result["end_line"] == 201
+    assert result["text"] == content
+    assert len(result["sha256"]) == 64
 
 
 def test_source_search_returns_distinct_files_and_matching_lines(tmp_path: Path) -> None:

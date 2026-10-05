@@ -24,8 +24,9 @@ _READ_KUBECTL = {
     "wait",
     "explain",
     "top",
+    "events",
 }
-_READ_HELM = {"list", "status", "show", "get", "version", "history", "env"}
+_READ_HELM = {"list", "status", "show", "get", "version", "history", "env", "lint", "template"}
 _READ_AWS = {
     ("sts", "get-caller-identity"),
     ("ec2", "describe-instances"),
@@ -145,13 +146,27 @@ def _read_only(command: list[str]) -> bool:
     if command[0] in {"bash", "sh"}:
         return command[1:2] == ["-n"] and len(command) == 3 and not command[2].startswith("-")
     if command[0] == "git":
-        return len(command) > 1 and command[1] in {"status", "log", "show", "rev-parse"}
+        return len(command) > 1 and command[1] in {"status", "log", "show", "rev-parse", "diff"}
     if command[0] == "docker":
-        return len(command) > 1 and (
-            command[1] in {"ps", "info", "version"}
-            or command[1:] == ["compose", "version"]
-        )
-    return command[0] in {"ls", "pwd", "uname", "df", "free", "ps", "stat"}
+        if len(command) < 2:
+            return False
+        if command[1] in {"ps", "images", "inspect", "logs", "info", "version"}:
+            return True
+        return command[1:3] in (["compose", "version"], ["compose", "ps"], ["compose", "ls"])
+    return command[0] in {
+        "ls",
+        "pwd",
+        "uname",
+        "df",
+        "du",
+        "free",
+        "ps",
+        "stat",
+        "lsblk",
+        "lscpu",
+        "whoami",
+        "id",
+    }
 
 
 def _policy(command: list[str], task: DeploymentTask, *, mutating: bool) -> str:

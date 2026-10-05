@@ -18,6 +18,7 @@ def add_deployment_parser(subparsers) -> None:
     run.add_argument("--output", type=Path)
     run.add_argument("--model", default="gpt-5.6-terra")
     run.add_argument("--execute", action="store_true", help="Permit approved changes.")
+    run.add_argument("--resume", action="store_true", help="Continue an existing output run.")
 
 
 def run_deployment_command(args: argparse.Namespace) -> int:
@@ -25,7 +26,13 @@ def run_deployment_command(args: argparse.Namespace) -> int:
         Path(".pheragent/agent-runs") / datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     )
     try:
-        report = run_deployment_agent(args.task, output, model=args.model, execute=args.execute)
+        report = run_deployment_agent(
+            args.task,
+            output,
+            model=args.model,
+            execute=args.execute,
+            resume=args.resume,
+        )
     except (OSError, RuntimeError, ValueError) as exc:
         print(f"deployment error: {exc}", file=sys.stderr)
         return 2

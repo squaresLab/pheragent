@@ -16,9 +16,16 @@ from .analysis_llm import (
     strict_response_format,
 )
 from .models import SourcesConfig
+from .overview import (
+    DeploymentOverview,
+    active_step,
+    create_overview,
+    set_discoveries,
+    set_step_status,
+)
 from .progress import _append, _fingerprint, _now, _record_outcome, _update_state
 from .runtime import _checks, _command, _execute, _observe, _policy, _target_command
-from .serialization import load_yaml, write_json
+from .serialization import load_yaml, write_json, write_yaml
 from .source_manager import SourceManager
 from .sources import SourceTools, _source_spec
 from .task import Check, Decision, DeploymentTask
@@ -61,9 +68,15 @@ If a source-grounded remedy is within task constraints, propose it with read-onl
 validation of the resulting capability. After validation, resolve the gap and resume
 the original objective. If no route is supported or permission is missing, BLOCKED
 must name the exact unresolved prerequisite and needed source or approval.
+Stay focused on working_state.active_step. Set step_id to that exact ID. Mark
+completes_step only when this decision's read-only result or validation proves its success
+condition; the harness advances the overview only after that proof.
 ASK_HUMAN only when two or three source-supported routes remain genuinely viable after
 considering the target and constraints. Put concise alternatives in options. The choice
-selects a route, not permission to execute it.
+selects a route, not permission to execute it. Use WAITING_FOR_INPUT when an exact external
+value or secret is required. Name its task input keys in required_inputs; never request or
+print the value itself. The human supplies it through the task's env or file reference and
+resumes the same run.
 For execute, provide an argv command, working_directory as source-id:relative/path
 (use source-id:. for a source root), a specific expected_change, and read-only
 validation commands. Evidence entries must be exact source-id:file/path IDs from
@@ -108,8 +121,36 @@ def _brief(value):
     if isinstance(value, list):
         return [_brief(item) for item in value[:20]]
     if isinstance(value, dict):
-        return {key: _brief(item) for key, item in value.items()}
+        return {
+            key: item if key == "text" and value.get("complete") is True else _brief(item)
+            for key, item in value.items()
+        }
     return value
+
+
+def _input_state(task: DeploymentTask, base: Path) -> dict[str, dict]:
+    result = {}
+    for name, item in task.inputs.items():
+        if item.value is not None:
+            available, source = True, "task"
+        elif item.from_env is not None:
+            available, source = bool(os.getenv(item.from_env)), f"env:{item.from_env}"
+        else:
+            path = item.from_file or Path()
+            path = path if path.is_absolute() else base / path
+            available, source = path.is_file(), f"file:{path}"
+        result[name] = {
+            "available": available,
+            "sensitive": item.sensitive,
+            "source": source,
+        }
+        if item.value is not None and not item.sensitive:
+            result[name]["value"] = item.value
+    return result
+
+
+def _missing_inputs(state: dict, names: list[str]) -> list[str]:
+    return sorted(name for name in names if not state["inputs"].get(name, {}).get("available"))
 
 
 def _decide(
@@ -170,6 +211,7 @@ def run_deployment_agent(
     model: str = "gpt-5.6-terra",
     execute: bool = False,
     approve: bool = False,
+    resume: bool = False,
     decide=None,
 ) -> dict:
     """Run one bounded agent trajectory; source and runtime observations stay separate."""
@@ -182,7 +224,11 @@ def run_deployment_agent(
         task.environment.kubeconfig = (task_path.parent / task.environment.kubeconfig).resolve()
         if not task.environment.kubeconfig.is_file():
             raise ValueError("environment.kubeconfig does not exist")
-    output.mkdir(parents=True, exist_ok=False)
+    if resume:
+        if not (output / "state.json").is_file():
+            raise ValueError("--resume requires an existing run with state.json")
+    else:
+        output.mkdir(parents=True, exist_ok=False)
     write_json(output / "task.json", task)
     specs = [
         _source_spec(item, purpose, index, task_path.parent)
@@ -197,39 +243,72 @@ def run_deployment_agent(
     ).acquire(SourcesConfig(system="deployment", sources=specs))
     write_json(output / "sources.json", acquired.manifest)
     sources = SourceTools(acquired.sources)
-    state = {
-        "objective": task.task.objective,
-        "target_verified_outcomes": task.task.stop_after_verified_outcomes,
-        "target": task.environment.model_dump(exclude={"kubeconfig"}),
-        "constraints": task.constraints.model_dump(),
-        "completion_checks": [check.model_dump() for check in task.success_checks],
-        "source_workspaces": {
-            source_id: str((output / "workspace" / source_id).resolve())
-            for source_id in sources.sources
-        },
-        "gaps": [],
-        "unresolved": [],
-        "focus": "",
-        "selected_route": None,
-        "milestones": [],
-        "verified_outcomes": [],
-        "evidence": [],
-        "last_action": None,
-    }
+    request_limit = task.budgets.max_cycles * (task.budgets.max_read_actions_per_cycle + 1) + 2
     classifier = CachedStructuredClassifier(
-        AnalysisLLMConfig(
-            model=model,
-            max_requests=task.budgets.max_cycles * (task.budgets.max_read_actions_per_cycle + 1),
-            cache_dir=None,
-        ),
-        LLMRequestBudget(task.budgets.max_cycles * (task.budgets.max_read_actions_per_cycle + 1)),
+        AnalysisLLMConfig(model=model, max_requests=request_limit, cache_dir=None),
+        LLMRequestBudget(request_limit),
     )
+    usage: dict[str, int] = {}
+    if resume:
+        state = json.loads((output / "state.json").read_text(encoding="utf-8"))
+        overview = (
+            DeploymentOverview.model_validate(state["overview"])
+            if state.get("overview")
+            else None
+        )
+    else:
+        overview = None
+        if decide is None:
+            overview, overview_usage = create_overview(
+                classifier,
+                objective=task.task.objective,
+                target=task.environment.model_dump(exclude={"kubeconfig"}),
+                sources=sources,
+            )
+            usage.update(overview_usage)
+        state = {
+            "objective": task.task.objective,
+            "target_verified_outcomes": task.task.stop_after_verified_outcomes,
+            "target": task.environment.model_dump(exclude={"kubeconfig"}),
+            "constraints": task.constraints.model_dump(),
+            "completion_checks": [check.model_dump() for check in task.success_checks],
+            "gaps": [],
+            "unresolved": [],
+            "focus": "",
+            "selected_route": (
+                {"choice": overview.route, "evidence": overview.route_evidence}
+                if overview
+                else None
+            ),
+            "milestones": [],
+            "verified_outcomes": [],
+            "evidence": [],
+            "last_action": None,
+        }
+    state.update(
+        {
+            "inputs": _input_state(task, task_path.parent),
+            "source_workspaces": {
+                source_id: str((output / "workspace" / source_id).resolve())
+                for source_id in sources.sources
+            },
+            "overview": overview.model_dump() if overview else None,
+        }
+    )
+    if resume and state.get("pending_input"):
+        pending = state["pending_input"]
+        if not _missing_inputs(state, list(pending["required_inputs"])):
+            state.pop("pending_input")
+            if overview and pending.get("step_id"):
+                set_step_status(overview, pending["step_id"], "active")
+                state["overview"] = overview.model_dump()
+    if overview:
+        write_yaml(output / "overview.yaml", overview)
     mutations = 0
     unchanged = 0
     fingerprints: list[str] = []
     failed_actions: dict[tuple[str, ...], int] = {}
     seen_results: dict[str, int] = {}
-    usage: dict[str, int] = {}
     last_result: dict = {}
     status = "BUDGET_EXHAUSTED"
     reason = "cycle budget exhausted"
@@ -237,6 +316,13 @@ def run_deployment_agent(
         if time.monotonic() - started >= task.budgets.max_runtime_minutes * 60:
             reason = "runtime budget exhausted"
             break
+        if overview:
+            current = active_step(overview)
+            if current and current.status == "pending":
+                set_step_status(overview, current.id, "active")
+            state["active_step"] = current.model_dump() if current else None
+            state["overview"] = overview.model_dump()
+            write_yaml(output / "overview.yaml", overview)
         print(f"agent: cycle {cycle}: observing {task.environment.type} environment", flush=True)
         observation = _observe(task)
         state["environment"] = {
@@ -283,6 +369,47 @@ def run_deployment_agent(
                     "usage": call_usage,
                 },
             )
+            if decision.kind == "WAITING_FOR_INPUT" or _missing_inputs(
+                state, decision.required_inputs
+            ):
+                missing = _missing_inputs(state, decision.required_inputs)
+                if not missing:
+                    last_result = {"status": "inputs_available"}
+                    continue
+                request = {
+                    "status": "WAITING_FOR_INPUT",
+                    "reason": decision.reason,
+                    "step_id": decision.step_id,
+                    "required_inputs": {
+                        name: state["inputs"].get(
+                            name,
+                            {
+                                "available": False,
+                                "configure": f"add inputs.{name}.from_env or from_file",
+                            },
+                        )
+                        for name in missing
+                    },
+                    "resume_command": [
+                        "pheragent",
+                        "deployment",
+                        "run",
+                        str(task_path),
+                        "--output",
+                        str(output),
+                        "--resume",
+                        *(["--execute"] if execute else []),
+                    ],
+                }
+                state["pending_input"] = request
+                if overview and decision.step_id:
+                    set_step_status(overview, decision.step_id, "waiting_for_input")
+                    state["overview"] = overview.model_dump()
+                    write_yaml(output / "overview.yaml", overview)
+                write_yaml(output / "human-request.yaml", request)
+                status, reason = "WAITING_FOR_INPUT", decision.reason
+                last_result = request
+                break
             if decision.kind == "ASK_HUMAN":
                 options = decision.options
                 evidence = sorted(sources.existing_refs(decision.evidence))
@@ -419,7 +546,27 @@ def run_deployment_agent(
                     and last_result["repeated_result_count"] >= 2
                 ):
                     status, reason = "BLOCKED", "repeated denied observation; revise the command"
+            step_satisfied = (
+                decision.tool == "observe" and last_result.get("exit_code") == 0
+            ) or (
+                decision.tool == "execute"
+                and last_result.get("status") in {"validated", "already_satisfied"}
+            )
+            if (
+                overview
+                and decision.completes_step
+                and decision.step_id == (state.get("active_step") or {}).get("id")
+                and step_satisfied
+            ):
+                set_step_status(overview, decision.step_id, "verified")
+                state["overview"] = overview.model_dump()
+                last_result["overview_step_verified"] = decision.step_id
+                write_yaml(output / "overview.yaml", overview)
             _update_state(state, decision, last_result, sources)
+            if overview:
+                set_discoveries(overview, state["gaps"] + state["unresolved"])
+                state["overview"] = overview.model_dump()
+                write_yaml(output / "overview.yaml", overview)
             _append(
                 output / "trajectory.jsonl",
                 {
@@ -430,7 +577,11 @@ def run_deployment_agent(
                     "result": last_result,
                 },
             )
-            if decision.tool == "execute" or status in {"BLOCKED", "POLICY_DENIED"}:
+            if (
+                decision.tool == "execute"
+                or decision.completes_step and step_satisfied
+                or status in {"BLOCKED", "POLICY_DENIED"}
+            ):
                 break
             if read_count == task.budgets.max_read_actions_per_cycle:
                 last_result = {
@@ -445,7 +596,15 @@ def run_deployment_agent(
         )
         if (
             status
-            in {"SUCCESS", "FAILED", "BLOCKED", "POLICY_DENIED", "BUDGET_EXHAUSTED", "OSCILLATING"}
+            in {
+                "SUCCESS",
+                "FAILED",
+                "BLOCKED",
+                "WAITING_FOR_INPUT",
+                "POLICY_DENIED",
+                "BUDGET_EXHAUSTED",
+                "OSCILLATING",
+            }
             and reason != "cycle budget exhausted"
         ):
             break

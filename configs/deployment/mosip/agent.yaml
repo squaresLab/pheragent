@@ -1,0 +1,25 @@
+task:
+  objective: >-
+    Deploy the system described by the supplied sources on the declared target.
+    Determine the supported deployment route, compare its requirements with live
+    state, and progress one verified step at a time. Ask for missing human input
+    rather than inventing it. Do not switch Kubernetes contexts or delete data.
+
+sources:
+  repositories:
+    - location: https://github.com/mosip/infra.git
+
+environment:
+  type: kubernetes
+  context: mosip
+
+constraints:
+  allow_new_infrastructure: true
+  allow_destructive_actions: false
+  allowed_namespaces: ["*"]
+
+budgets:
+  max_cycles: 30
+  max_mutating_actions: 20
+  max_runtime_minutes: 180
+  max_read_actions_per_cycle: 20

@@ -47,15 +47,27 @@ uv run pheragent deployment run path/to/task.yaml \
 
 For a Kubernetes task, set an explicit `environment.context` and, if needed,
 `environment.kubeconfig` in the task. HerAgent will not choose another
-cluster. An example bounded MOSIP task is
-[agent-two-outcomes.yaml](configs/deployment/mosip/agent-two-outcomes.yaml).
+cluster. A generic MOSIP task using the current deployment repository is
+[agent.yaml](configs/deployment/mosip/agent.yaml).
 
-Each run writes `task.json`, `sources.json`, `trajectory.jsonl`,
-`actions.jsonl` (when actions are attempted), `state.json`, and
-`final-report.json` beneath its output directory. Repository scripts run
+Each run writes `task.json`, `sources.json`, `overview.yaml`,
+`trajectory.jsonl`, `actions.jsonl` (when actions are attempted), `state.json`,
+and `final-report.json` beneath its output directory. Repository scripts run
 from a copied workspace; acquired source repositories remain unchanged.
-A failed action is returned to the agent for further investigation. Automatic
-source patching, rollback, and resuming a stopped run are not yet implemented.
+A failed action is returned to the agent for further investigation. When human
+input is missing, the run writes `human-request.yaml`. Add a secure environment or
+file reference to the task, then continue the same output directory with `--resume`.
+Automatic source patching and rollback are not yet implemented. Secrets are
+referenced rather than stored in the task:
+
+```yaml
+inputs:
+  iam_host:
+    value: iam.example.org
+  admin_password:
+    from_env: MOSIP_ADMIN_PASSWORD
+    sensitive: true
+```
 
 The current stopping check can verify fixed commands or a chosen number of
 newly observed outcomes. It does **not** establish that an arbitrary whole
