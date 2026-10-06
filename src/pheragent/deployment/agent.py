@@ -27,7 +27,7 @@ from .progress import _append, _fingerprint, _now, _record_outcome, _update_stat
 from .runtime import _checks, _command, _execute, _observe, _policy, _target_command
 from .serialization import load_yaml, write_json, write_yaml
 from .source_manager import SourceManager
-from .sources import SourceTools, _source_spec
+from .sources import SourceTools, _source_cwd, _source_spec
 from .task import Check, Decision, DeploymentTask
 
 _INSTRUCTIONS = """You are a senior DevOps engineer responsible for deploying the requested system.
@@ -94,7 +94,12 @@ If a command fails, inspect its output and observed state, search for a grounded
 and propose the next safe action within the task budget. Do not repeat a failing command
 without new evidence or a changed prerequisite.
 Use add_gaps/resolve_gaps and add_questions/resolve_questions to keep working memory
-small and current. DONE means the objective seems achieved; external checks still
+small and current. Return working_memory as the complete notebook for the active step:
+at most eight short facts covering grounded commands and paths, observed state, failed
+attempts, and the remaining question. Preserve useful facts across calls and replace
+them only when newer evidence disproves them. Do not reread a source merely to recover
+a fact already recorded there. New wording does not make a repeated denied observation
+new. DONE means the objective seems achieved; external checks still
 decide success. BLOCKED means no safe meaningful step is available. Empty unused fields.
 
 Examples of good decisions (fictional; use the provided response schema):
@@ -283,8 +288,12 @@ def run_deployment_agent(
             "milestones": [],
             "verified_outcomes": [],
             "evidence": [],
+            "working_memory": [],
+            "memory_step_id": None,
             "last_action": None,
         }
+    state.setdefault("working_memory", [])
+    state.setdefault("memory_step_id", None)
     state.update(
         {
             "inputs": _input_state(task, task_path.parent),
@@ -309,6 +318,7 @@ def run_deployment_agent(
     fingerprints: list[str] = []
     failed_actions: dict[tuple[str, ...], int] = {}
     seen_results: dict[str, int] = {}
+    denied_observations: dict[tuple[str, str], int] = {}
     last_result: dict = {}
     status = "BUDGET_EXHAUSTED"
     reason = "cycle budget exhausted"
@@ -320,6 +330,9 @@ def run_deployment_agent(
             current = active_step(overview)
             if current and current.status == "pending":
                 set_step_status(overview, current.id, "active")
+            if current and state["memory_step_id"] != current.id:
+                state["working_memory"] = []
+                state["memory_step_id"] = current.id
             state["active_step"] = current.model_dump() if current else None
             state["overview"] = overview.model_dump()
             write_yaml(output / "overview.yaml", overview)
@@ -468,11 +481,15 @@ def run_deployment_agent(
                     last_result = {"error": str(exc)}
             elif decision.tool == "observe":
                 policy = _policy(decision.command, task, mutating=False)
-                last_result = (
-                    _command(_target_command(decision.command, task), task)
-                    if policy == "allowed"
-                    else {"error": policy}
-                )
+                try:
+                    cwd = _source_cwd(decision, sources, output / "workspace")
+                    last_result = (
+                        _command(_target_command(decision.command, task), task, cwd=cwd)
+                        if policy == "allowed"
+                        else {"error": policy}
+                    )
+                except (OSError, ValueError) as exc:
+                    last_result = {"error": str(exc)}
             elif decision.tool == "execute":
                 if mutations >= task.budgets.max_mutating_actions:
                     status, reason = "BUDGET_EXHAUSTED", "mutation budget exhausted"
@@ -540,12 +557,16 @@ def run_deployment_agent(
                 ).hexdigest()
                 last_result["repeated_result_count"] = seen_results.get(digest, 0)
                 seen_results[digest] = last_result["repeated_result_count"] + 1
-                if (
-                    decision.tool == "observe"
-                    and last_result.get("error", "").startswith("denied:")
-                    and last_result["repeated_result_count"] >= 2
-                ):
-                    status, reason = "BLOCKED", "repeated denied observation; revise the command"
+                error = last_result.get("error", "")
+                if decision.tool == "observe" and error.startswith("denied:"):
+                    key = ((state.get("active_step") or {}).get("id", "run"), error)
+                    denied_observations[key] = denied_observations.get(key, 0) + 1
+                    last_result["repeated_denial_count"] = denied_observations[key]
+                    if denied_observations[key] >= 3:
+                        status, reason = (
+                            "BLOCKED",
+                            "repeated denied observation; revise the command",
+                        )
             step_satisfied = (
                 decision.tool == "observe" and last_result.get("exit_code") == 0
             ) or (

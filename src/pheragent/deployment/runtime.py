@@ -42,6 +42,28 @@ _READ_AWS = {
     ("eks", "describe-nodegroup"),
 }
 _DENIED = {"rm", "sudo", "shutdown", "reboot", "mkfs", "dd", "terraform", "az", "gcloud"}
+_COMPOSE_OPTIONS_WITH_VALUE = {
+    "-f",
+    "--file",
+    "--env-file",
+    "-p",
+    "--project-name",
+    "--profile",
+    "--project-directory",
+}
+
+
+def _compose_subcommand(arguments: list[str]) -> str | None:
+    index = 0
+    while index < len(arguments) and arguments[index].startswith("-"):
+        option = arguments[index].split("=", 1)[0]
+        if option in _COMPOSE_OPTIONS_WITH_VALUE and "=" not in arguments[index]:
+            index += 2
+        elif option in {"--compatibility", "--dry-run"}:
+            index += 1
+        else:
+            return None
+    return arguments[index] if index < len(arguments) else None
 
 
 def _command(
@@ -152,7 +174,11 @@ def _read_only(command: list[str]) -> bool:
             return False
         if command[1] in {"ps", "images", "inspect", "logs", "info", "version"}:
             return True
-        return command[1:3] in (["compose", "version"], ["compose", "ps"], ["compose", "ls"])
+        return command[1:2] == ["compose"] and _compose_subcommand(command[2:]) in {
+            "version",
+            "ps",
+            "ls",
+        }
     return command[0] in {
         "ls",
         "pwd",
@@ -254,13 +280,13 @@ def _observe(task: DeploymentTask) -> dict:
     }
 
 
-def _checks(task: DeploymentTask, checks: list[Check]) -> list[dict]:
+def _checks(task: DeploymentTask, checks: list[Check], cwd: Path | None = None) -> list[dict]:
     results = []
     for check in checks:
         command = _target_command(check.command, task)
         policy = _policy(check.command, task, mutating=False)
         result = (
-            _command(command, task)
+            _command(command, task, cwd=cwd)
             if policy == "allowed"
             else {"exit_code": None, "stderr": policy}
         )
@@ -333,7 +359,7 @@ def _execute(
                 "reason": "source script would use a different Kubernetes context",
             }
     cwd = _source_cwd(decision, sources, workspace)
-    before = _checks(task, decision.validation)
+    before = _checks(task, decision.validation, cwd)
     if all(item["passed"] for item in before):
         return {
             "status": "already_satisfied",
@@ -370,14 +396,14 @@ def _execute(
     command = _target_command(decision.command, task)
     deadline = time.monotonic() + timeout
     result = _command(command, task, cwd=cwd, timeout=timeout, output_limit=None)
-    after = _checks(task, decision.validation)
+    after = _checks(task, decision.validation, cwd)
     deadline = min(deadline, time.monotonic() + 300)
     while result["exit_code"] == 0 and not all(item["passed"] for item in after):
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             break
         time.sleep(min(5, remaining))
-        after = _checks(task, decision.validation)
+        after = _checks(task, decision.validation, cwd)
     return {
         "status": (
             "command_failed"

@@ -38,6 +38,12 @@ def _update_state(state: dict, decision: Decision, result: dict, sources: Source
         "reason": decision.reason,
         "outcome": result.get("status", result.get("exit_code")),
     }
+    if decision.command:
+        state["last_action"]["command"] = decision.command
+    if decision.working_directory:
+        state["last_action"]["working_directory"] = decision.working_directory
+    if decision.working_memory:
+        state["working_memory"] = decision.working_memory
 
 
 def _fingerprint(state: dict) -> str:
@@ -51,6 +57,7 @@ def _fingerprint(state: dict) -> str:
             "verified_outcomes",
             "evidence",
             "selected_route",
+            "working_memory",
         )
     }
     relevant["health"] = {

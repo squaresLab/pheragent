@@ -165,6 +165,9 @@ def test_route_choice_and_repeated_read_reach_next_decision(tmp_path: Path) -> N
                 source_path="repository-1:README.md",
                 selected_route="Use ./install.sh for this target",
                 evidence=["repository-1:README.md"],
+                working_memory=[
+                    "Installer: ./install.sh [repository-1:README.md]"
+                ],
             ),
             _decision("BLOCKED", reason="prerequisite is missing"),
         ]
@@ -182,6 +185,9 @@ def test_route_choice_and_repeated_read_reach_next_decision(tmp_path: Path) -> N
     }
     assert seen[2][1]["text"] == seen[1][1]["text"]
     assert seen[2][1]["repeated_result_count"] == 1
+    assert seen[2][0]["working_memory"] == [
+        "Installer: ./install.sh [repository-1:README.md]"
+    ]
 
 
 def test_agent_waits_for_referenced_secret_and_resumes_same_run(
@@ -387,6 +393,8 @@ def test_matching_context_storage_check_is_read_only() -> None:
         ["docker", "logs", "demo"],
         ["docker", "compose", "version"],
         ["docker", "compose", "ps", "--all"],
+        ["docker", "compose", "-f", "compose.yaml", "ps", "--all"],
+        ["docker", "compose", "--env-file", ".env", "-f", "compose.yaml", "ps"],
         ["docker", "compose", "ls"],
         ["lsblk"],
         ["lscpu"],
@@ -417,6 +425,7 @@ def test_supported_read_only_probes(command: list[str]) -> None:
         ["bash", "-n", "-i", "install.sh"],
         ["bash", "install.sh"],
         ["docker", "compose", "up", "-d"],
+        ["docker", "compose", "-f", "compose.yaml", "up", "-d"],
     ],
 )
 def test_unsafe_observations_are_not_read_only(command: list[str]) -> None:
@@ -476,7 +485,43 @@ def test_read_only_execute_is_observed_without_approval(tmp_path: Path, monkeypa
     assert not (output / "actions.jsonl").exists()
 
 
-def test_repeated_denied_observation_stops_early(tmp_path: Path, monkeypatch) -> None:
+def test_observation_uses_selected_source_directory(tmp_path: Path, monkeypatch) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "compose.yaml").write_text("services: {}\n")
+    task = tmp_path / "task.yaml"
+    output = tmp_path / "run"
+    _task(task, source, output)
+    monkeypatch.setattr("pheragent.deployment.agent._observe", lambda _task: {})
+    working_directories = []
+
+    def inspect(_command, _task, **kwargs):
+        working_directories.append(kwargs.get("cwd"))
+        return {"exit_code": 0, "stdout": "", "stderr": ""}
+
+    monkeypatch.setattr("pheragent.deployment.agent._command", inspect)
+    decisions = iter(
+        [
+            _decision(
+                "ACT",
+                "observe",
+                command=["docker", "compose", "-f", "compose.yaml", "ps"],
+                working_directory="repository-1:.",
+            ),
+            _decision("BLOCKED", reason="inspection complete"),
+        ]
+    )
+
+    def decide(_state, _observation, _last_result, _sources, _cycle):
+        return next(decisions), {}
+
+    report = run_deployment_agent(task, output, decide=decide)
+    assert report["status"] == "BLOCKED"
+    assert working_directories == [output / "workspace/repository-1"]
+    assert (working_directories[0] / "compose.yaml").is_file()
+
+
+def test_reworded_denied_observations_stop_early(tmp_path: Path, monkeypatch) -> None:
     source = tmp_path / "source"
     source.mkdir()
     (source / "README.md").write_text("Sample deployment source\n")
@@ -484,12 +529,19 @@ def test_repeated_denied_observation_stops_early(tmp_path: Path, monkeypatch) ->
     output = tmp_path / "run"
     _task(task, source, output)
     monkeypatch.setattr("pheragent.deployment.agent._observe", lambda _task: {})
+    commands = iter(
+        [
+            ["docker", "compose", "config"],
+            ["docker", "compose", "pull"],
+            ["docker", "compose", "up"],
+        ]
+    )
     calls = 0
 
     def decide(_state, _observation, _last_result, _sources, _cycle):
         nonlocal calls
         calls += 1
-        return _decision("ACT", "observe", command=["helm", "repo", "update"]), {}
+        return _decision("ACT", "observe", command=next(commands)), {}
 
     report = run_deployment_agent(task, output, decide=decide)
     assert report["status"] == "BLOCKED"
@@ -840,10 +892,10 @@ def test_delayed_readiness_is_verified_before_next_action(tmp_path: Path, monkey
     task.write_text(yaml.safe_dump(document))
     reads = 0
 
-    def delayed_checks(task, checks):
+    def delayed_checks(task, checks, cwd=None):
         nonlocal reads
         reads += 1
-        result = _checks(task, checks)
+        result = _checks(task, checks, cwd)
         if reads == 2:
             result[0]["passed"] = False
         return result

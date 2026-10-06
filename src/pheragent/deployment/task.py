@@ -117,6 +117,7 @@ class Decision(Record):
     selected_route: str | None = None
     step_id: str | None = None
     required_inputs: list[str] = Field(default_factory=list)
+    working_memory: list[str] = Field(default_factory=list, max_length=8)
     completes_step: bool = False
     options: list[str] = Field(default_factory=list)
     outcome_id: str | None = None
