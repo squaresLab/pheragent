@@ -3,7 +3,8 @@ task:
     Deploy the system described by the supplied sources on the declared target.
     Determine the supported deployment route, compare its requirements with live
     state, and progress one verified step at a time. Ask for missing human input
-    rather than inventing it. Do not switch Kubernetes contexts or delete data.
+    rather than inventing it. Do not switch Kubernetes contexts. Require explicit
+    high-risk human approval before destructive actions.
 
 sources:
   repositories:
@@ -15,7 +16,7 @@ environment:
 
 constraints:
   allow_new_infrastructure: true
-  allow_destructive_actions: false
+  allow_destructive_actions: true
   allowed_namespaces: ["*"]
 
 budgets:
