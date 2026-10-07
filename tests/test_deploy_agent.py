@@ -175,6 +175,33 @@ def test_failed_action_reaches_next_decision(tmp_path: Path) -> None:
     assert calls[1]["execution"]["exit_code"] == 1
 
 
+def test_three_incomplete_actions_stop_the_agent(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "README.md").write_text("Run the installer.\n")
+    task = tmp_path / "task.yaml"
+    output = tmp_path / "incomplete"
+    _task(task, source, output)
+    calls = []
+
+    def decide(_state, _observation, last_result, _sources, _cycle):
+        calls.append(last_result)
+        return _decision(
+            "ACT",
+            "execute",
+            command=["touch", "ready"],
+            evidence=["repository-1:README.md"],
+            expected_change="ready file exists",
+        ), {}
+
+    report = run_deployment_agent(task, output, execute=True, approve=True, decide=decide)
+    assert report["status"] == "BLOCKED"
+    assert report["reason"] == "three incomplete action proposals"
+    assert calls[1]["status"] == "needs_revision"
+    assert calls[1]["revision_attempt"] == 1
+    assert len(calls) == 3
+
+
 def test_route_choice_and_repeated_read_reach_next_decision(tmp_path: Path) -> None:
     source = tmp_path / "source"
     source.mkdir()
@@ -638,6 +665,7 @@ def test_kubernetes_global_options_do_not_hide_a_read_only_verb() -> None:
         ["ansible-playbook", "--syntax-check", "site.yaml"],
         ["bash", "-n", "install.sh"],
         ["git", "diff", "--stat"],
+        ["grep", "-Fx", "  host: iam.example.org", "values.yaml"],
         ["stat", "install.sh"],
         ["docker", "ps", "--all"],
         ["docker", "images"],

@@ -410,6 +410,7 @@ def run_deployment_agent(
     write_json(output / "state.json", state)
     mutations = state.get("mutating_actions", 0)
     unchanged = 0
+    invalid_actions = 0
     failed_actions: dict[tuple[str, ...], int] = {}
     seen_results: dict[str, int] = {}
     denied_observations: dict[tuple[str, str], int] = {}
@@ -701,6 +702,13 @@ def run_deployment_agent(
                     timeout=max(1, min(1800, int(remaining))),
                 )
                 refresh_environment = "execution" in last_result
+                if last_result["status"] == "needs_revision":
+                    invalid_actions += 1
+                    last_result["revision_attempt"] = invalid_actions
+                    if invalid_actions >= 3:
+                        status, reason = "BLOCKED", "three incomplete action proposals"
+                else:
+                    invalid_actions = 0
                 if last_result["status"] in {"blocked", "policy_denied"}:
                     status = (
                         "POLICY_DENIED" if last_result["status"] == "policy_denied" else "BLOCKED"

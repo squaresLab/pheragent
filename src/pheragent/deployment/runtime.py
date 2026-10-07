@@ -227,6 +227,7 @@ def _read_only(command: list[str]) -> bool:
         "lscpu",
         "whoami",
         "id",
+        "grep",
     }
 
 
@@ -419,17 +420,17 @@ def _execute(
 ) -> dict:
     if not decision.command or not decision.expected_change or not decision.validation:
         return {
-            "status": "blocked",
+            "status": "needs_revision",
             "reason": "mutation needs command, expected change, and validation",
         }
     if not sources.existing_refs(decision.evidence):
         return {
-            "status": "blocked",
+            "status": "needs_revision",
             "reason": "mutation needs an inventoried source file as evidence",
         }
     policy = _policy(decision.command, task, mutating=True)
     if decision.command[0].startswith("./") and not decision.working_directory:
-        return {"status": "blocked", "reason": "source script needs a working directory"}
+        return {"status": "needs_revision", "reason": "source script needs a working directory"}
     if policy == "allowed" and not _source_grounded(decision, sources):
         policy = "approval_required: command is not shown by its cited source"
     if policy.startswith("denied"):
