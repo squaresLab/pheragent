@@ -248,6 +248,31 @@ def test_agent_waits_for_referenced_secret_and_resumes_same_run(
     assert second["reason"] == "resume verified"
 
 
+def test_resume_uses_current_task_constraints(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "README.md").write_text("Deploy the sample.\n")
+    task = tmp_path / "task.yaml"
+    output = tmp_path / "run"
+    _task(task, source, output)
+
+    def stop(state, _observation, _last_result, _sources, _cycle):
+        assert state["constraints"]["allow_destructive_actions"] is False
+        return _decision("BLOCKED", reason="approval required"), {}
+
+    run_deployment_agent(task, output, decide=stop)
+    document = yaml.safe_load(task.read_text())
+    document["constraints"] = {"allow_destructive_actions": True}
+    task.write_text(yaml.safe_dump(document))
+
+    def resume(state, _observation, _last_result, _sources, _cycle):
+        assert state["constraints"]["allow_destructive_actions"] is True
+        return _decision("BLOCKED", reason="updated constraints loaded"), {}
+
+    report = run_deployment_agent(task, output, resume=True, decide=resume)
+    assert report["reason"] == "updated constraints loaded"
+
+
 def test_agent_requests_approval_for_a_linked_source(tmp_path: Path) -> None:
     source = tmp_path / "source"
     source.mkdir()

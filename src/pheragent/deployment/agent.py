@@ -341,6 +341,11 @@ def run_deployment_agent(
     state.setdefault("goal_stack", state.get("gaps", []))
     state.update(
         {
+            "objective": task.task.objective,
+            "target_verified_outcomes": task.task.stop_after_verified_outcomes,
+            "target": task.environment.model_dump(exclude={"kubeconfig"}),
+            "constraints": task.constraints.model_dump(),
+            "completion_checks": [check.model_dump() for check in task.success_checks],
             "inputs": _input_state(task, task_path.parent),
             "source_workspaces": {
                 source_id: str((output / "workspace" / source_id).resolve())
