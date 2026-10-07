@@ -8,7 +8,7 @@ from pydantic import Field
 
 from .analysis_llm import CachedStructuredClassifier, strict_response_format
 from .sources import SourceTools
-from .task import Record
+from .task import OverviewChange, Record
 
 StepStatus = Literal["pending", "active", "verified", "waiting_for_input", "blocked"]
 
@@ -23,6 +23,7 @@ class OverviewStep(Record):
     id: str = Field(min_length=1)
     goal: str = Field(min_length=1)
     success_condition: str = Field(min_length=1)
+    source_refs: list[str] = Field(min_length=1)
     status: StepStatus = "pending"
 
 
@@ -57,6 +58,8 @@ more than six semantic stages and no more than four steps per stage. This is a t
 overview, not a command transcript or full plan. Stages and steps describe deployable
 outcomes, not host inspection or speculative human inputs. Do not invent commands, runtime
 state, or missing details. Exact commands and inputs are resolved only for the active step.
+For every step, cite one or more selected files in source_refs. These files are the starting
+point for resolving that step, not proof that it is already complete.
 """
 
 
@@ -99,7 +102,7 @@ def create_overview(
         },
         response_format=strict_response_format(DeploymentOverview, name="deployment_overview"),
         response_model=DeploymentOverview,
-        validate=_validate_overview,
+        validate=lambda value: _validate_overview(value, sources),
     )
     if planned.value is None:
         raise RuntimeError(planned.warning or "deployment overview failed")
@@ -112,8 +115,7 @@ def create_overview(
                 stage.model_copy(
                     update={
                         "steps": [
-                            step.model_copy(update={"status": "pending"})
-                            for step in stage.steps
+                            step.model_copy(update={"status": "pending"}) for step in stage.steps
                         ]
                     }
                 )
@@ -135,9 +137,7 @@ def active_step(overview: DeploymentOverview) -> OverviewStep | None:
     return None
 
 
-def set_step_status(
-    overview: DeploymentOverview, step_id: str, status: StepStatus
-) -> None:
+def set_step_status(overview: DeploymentOverview, step_id: str, status: StepStatus) -> None:
     matches = [step for stage in overview.stages for step in stage.steps if step.id == step_id]
     if len(matches) != 1:
         raise ValueError(f"overview step must exist exactly once: {step_id}")
@@ -152,6 +152,42 @@ def set_discoveries(overview: DeploymentOverview, discoveries: list[str]) -> Non
         overview.revision += 1
 
 
+def apply_change(
+    overview: DeploymentOverview, change: OverviewChange, sources: SourceTools
+) -> None:
+    missing = set(change.source_refs) - sources.readable_paths
+    if missing:
+        raise ValueError(f"overview evidence is absent from inventory: {sorted(missing)}")
+    existing = [
+        step for stage in overview.stages for step in stage.steps if step.id == change.step_id
+    ]
+    if change.operation == "update":
+        if len(existing) != 1 or existing[0].status == "verified":
+            raise ValueError("only one unverified overview step can be updated")
+        existing[0].goal = change.goal
+        existing[0].success_condition = change.success_condition
+        existing[0].source_refs = change.source_refs
+    else:
+        if existing or not change.before_step_id:
+            raise ValueError("inserted steps need a new ID and before_step_id")
+        for stage in overview.stages:
+            for index, step in enumerate(stage.steps):
+                if step.id == change.before_step_id:
+                    stage.steps.insert(
+                        index,
+                        OverviewStep(
+                            id=change.step_id,
+                            goal=change.goal,
+                            success_condition=change.success_condition,
+                            source_refs=change.source_refs,
+                        ),
+                    )
+                    overview.revision += 1
+                    return
+        raise ValueError(f"overview step does not exist: {change.before_step_id}")
+    overview.revision += 1
+
+
 def _validate_files(files: list[str], sources: SourceTools) -> None:
     missing = set(files) - sources.readable_paths
     if missing:
@@ -160,8 +196,17 @@ def _validate_files(files: list[str], sources: SourceTools) -> None:
         raise ValueError("entrypoint files must be distinct")
 
 
-def _validate_overview(overview: DeploymentOverview) -> None:
+def _validate_overview(overview: DeploymentOverview, sources: SourceTools | None = None) -> None:
     steps = [step for stage in overview.stages for step in stage.steps]
     ids = [stage.id for stage in overview.stages] + [step.id for step in steps]
     if len(ids) != len(set(ids)):
         raise ValueError("overview IDs must be unique")
+    if sources:
+        missing = {
+            reference
+            for step in steps
+            for reference in step.source_refs
+            if reference not in sources.readable_paths
+        }
+        if missing:
+            raise ValueError(f"overview evidence is absent from inventory: {sorted(missing)}")

@@ -15,15 +15,16 @@ from .analysis_llm import (
     LLMRequestBudget,
     strict_response_format,
 )
+from .history import RunHistory, record_outcome, update_state
 from .models import SourcesConfig
 from .overview import (
     DeploymentOverview,
     active_step,
+    apply_change,
     create_overview,
     set_discoveries,
     set_step_status,
 )
-from .progress import _append, _fingerprint, _now, _record_outcome, _update_state
 from .runtime import _checks, _command, _execute, _observe, _policy, _target_command
 from .serialization import load_yaml, write_json, write_yaml
 from .source_manager import SourceManager
@@ -40,9 +41,10 @@ and what depends on it; revise that picture as evidence changes. Compare observe
 capabilities with source-grounded requirements and choose a missing prerequisite before
 its consumer, without assuming repository stages.
 ACT may call one read-only tool or propose one mutating command. For read_file and
-list_directory use source_path 'source-id:relative/path'. Start with files named in
-working_state.overview.route_evidence and read them in full. A README may map the route
-without containing the command, so inspect its command-bearing entrypoint too. AGENTS,
+list_directory use source_path 'source-id:relative/path'. First check whether the active
+step's success condition is already true. Then read files in active_step.source_refs in
+full; use overview.route_evidence only when the step has no useful reference. A README may
+map the route without containing the command, so inspect its command-bearing entrypoint. AGENTS,
 CONTRIBUTING, and coding-policy files are not deployment guidance.
 Use observe for read-only commands. The harness supplies the declared Kubernetes
 context; do not choose another context.
@@ -82,6 +84,12 @@ For execute, provide an argv command, working_directory as source-id:relative/pa
 validation commands. Evidence entries must be exact source-id:file/path IDs from
 inventory or search, without line numbers or quotations. Never use a shell interpreter to
 combine commands. Do not treat command exit zero as proof of deployment success.
+Prefer a verifier documented by the selected deployment route. A listing check must use
+contains to name the expected resource; use a bare exit-zero check only when the source
+defines that command as its verifier. When a verifier's documented "not installed" result
+is nonzero, put those codes in unsatisfied_exit_codes. Other nonzero results are unknown
+and must not authorize deployment. Reuse the same validation on retries unless evidence
+shows that its contract is wrong; do not keep proposing equivalent checks with new wording.
 Set outcome_id to a stable name only when this action deploys a missing, durable system
 capability or component. Use the same name on retries. Repository setup, namespaces,
 configuration alone, and already-present resources are not deployed outcomes. Validate
@@ -93,13 +101,14 @@ a check that already passes before execution cannot prove a new installation.
 If a command fails, inspect its output and observed state, search for a grounded fix,
 and propose the next safe action within the task budget. Do not repeat a failing command
 without new evidence or a changed prerequisite.
-Use add_gaps/resolve_gaps and add_questions/resolve_questions to keep working memory
-small and current. Return working_memory as the complete notebook for the active step:
-at most eight short facts covering grounded commands and paths, observed state, failed
-attempts, and the remaining question. Preserve useful facts across calls and replace
-them only when newer evidence disproves them. Do not reread a source merely to recover
-a fact already recorded there. New wording does not make a repeated denied observation
-new. DONE means the objective seems achieved; external checks still
+Use add_gaps/resolve_gaps and add_questions/resolve_questions to keep the active goal
+small and current. The last entry in goal_stack is the active prerequisite; resolve it
+before returning to the overview step. The harness supplies recent or summarized history;
+do not reread a source merely to recover a fact already recorded there. New wording does not make a
+repeated denied observation new. Use overview_change only when new source or runtime
+evidence changes the ordered outcomes: insert a prerequisite before its consumer or
+update one unverified step, and cite the exact source files. DONE means the objective
+seems achieved; external checks still
 decide success. BLOCKED means no safe meaningful step is available. Empty unused fields.
 
 Examples of good decisions (fictional; use the provided response schema):
@@ -163,18 +172,43 @@ def _decide(
     state: dict,
     last_result: dict,
     sources: SourceTools,
+    history: RunHistory,
+    task: DeploymentTask,
     cycle: int,
 ) -> tuple[Decision, dict]:
+    working_state = {
+        key: state.get(key)
+        for key in (
+            "objective",
+            "target",
+            "constraints",
+            "inputs",
+            "overview",
+            "active_step",
+            "goal_stack",
+            "unresolved",
+            "selected_route",
+            "environment",
+            "verified_outcomes",
+            "last_action",
+        )
+    }
     payload = {
         "objective": state["objective"],
-        "working_state": state,
+        "working_state": working_state,
+        "history": _brief(
+            history.context(
+                mode=task.context.mode,
+                window=task.context.history_window,
+            )
+        ),
         "last_tool_result": _brief(last_result),
         "source_count": len(sources.paths),
         "cycle": cycle,
     }
     outcome = classifier.classify(
         stage="deployment_agent",
-        prompt_version="deployment-agent-v0.5",
+        prompt_version="deployment-agent-v0.7",
         instructions=_INSTRUCTIONS,
         payload=payload,
         response_format=strict_response_format(Decision, name="deployment_agent_decision"),
@@ -206,7 +240,7 @@ def _completion(task: DeploymentTask, state: dict) -> tuple[bool, dict]:
     first = _checks(task, checks)
     second = _checks(task, checks)
     result = {"status": "completion_checked", "first": first, "second": second}
-    return all(item["passed"] for item in first + second), result
+    return all(item["status"] == "satisfied" for item in first + second), result
 
 
 def run_deployment_agent(
@@ -230,10 +264,11 @@ def run_deployment_agent(
         if not task.environment.kubeconfig.is_file():
             raise ValueError("environment.kubeconfig does not exist")
     if resume:
-        if not (output / "state.json").is_file():
-            raise ValueError("--resume requires an existing run with state.json")
+        if not (output / "events.jsonl").is_file():
+            raise ValueError("--resume requires an existing run with events.jsonl")
     else:
         output.mkdir(parents=True, exist_ok=False)
+    history = RunHistory(output)
     write_json(output / "task.json", task)
     specs = [
         _source_spec(item, purpose, index, task_path.parent)
@@ -253,13 +288,11 @@ def run_deployment_agent(
         AnalysisLLMConfig(model=model, max_requests=request_limit, cache_dir=None),
         LLMRequestBudget(request_limit),
     )
-    usage: dict[str, int] = {}
+    usage = history.usage()
     if resume:
-        state = json.loads((output / "state.json").read_text(encoding="utf-8"))
+        state = history.restore()
         overview = (
-            DeploymentOverview.model_validate(state["overview"])
-            if state.get("overview")
-            else None
+            DeploymentOverview.model_validate(state["overview"]) if state.get("overview") else None
         )
     else:
         overview = None
@@ -271,6 +304,7 @@ def run_deployment_agent(
                 sources=sources,
             )
             usage.update(overview_usage)
+            history.append("overview_created", overview=overview.model_dump(), usage=overview_usage)
         state = {
             "objective": task.task.objective,
             "target_verified_outcomes": task.task.stop_after_verified_outcomes,
@@ -278,6 +312,7 @@ def run_deployment_agent(
             "constraints": task.constraints.model_dump(),
             "completion_checks": [check.model_dump() for check in task.success_checks],
             "gaps": [],
+            "goal_stack": [],
             "unresolved": [],
             "focus": "",
             "selected_route": (
@@ -288,12 +323,9 @@ def run_deployment_agent(
             "milestones": [],
             "verified_outcomes": [],
             "evidence": [],
-            "working_memory": [],
-            "memory_step_id": None,
             "last_action": None,
         }
-    state.setdefault("working_memory", [])
-    state.setdefault("memory_step_id", None)
+    state.setdefault("goal_stack", state.get("gaps", []))
     state.update(
         {
             "inputs": _input_state(task, task_path.parent),
@@ -313,16 +345,20 @@ def run_deployment_agent(
                 state["overview"] = overview.model_dump()
     if overview:
         write_yaml(output / "overview.yaml", overview)
-    mutations = 0
+    history.checkpoint(state)
+    write_json(output / "state.json", state)
+    mutations = state.get("mutating_actions", 0)
     unchanged = 0
-    fingerprints: list[str] = []
     failed_actions: dict[tuple[str, ...], int] = {}
     seen_results: dict[str, int] = {}
     denied_observations: dict[tuple[str, str], int] = {}
     last_result: dict = {}
+    observation: dict = {}
+    refresh_environment = True
     status = "BUDGET_EXHAUSTED"
-    reason = "cycle budget exhausted"
-    for cycle in range(1, task.budgets.max_cycles + 1):
+    reason = "decision budget exhausted"
+    decision_limit = task.budgets.max_cycles * (task.budgets.max_read_actions_per_cycle + 1)
+    for cycle in range(1, decision_limit + 1):
         if time.monotonic() - started >= task.budgets.max_runtime_minutes * 60:
             reason = "runtime budget exhausted"
             break
@@ -330,27 +366,25 @@ def run_deployment_agent(
             current = active_step(overview)
             if current and current.status == "pending":
                 set_step_status(overview, current.id, "active")
-            if current and state["memory_step_id"] != current.id:
-                state["working_memory"] = []
-                state["memory_step_id"] = current.id
             state["active_step"] = current.model_dump() if current else None
             state["overview"] = overview.model_dump()
             write_yaml(output / "overview.yaml", overview)
-        print(f"agent: cycle {cycle}: observing {task.environment.type} environment", flush=True)
-        observation = _observe(task)
-        state["environment"] = {
-            name: {
-                "available": result["exit_code"] == 0,
-                "summary": result.get("stdout", "")[:1000],
+        if refresh_environment:
+            print(
+                f"agent: iteration {cycle}: observing {task.environment.type} environment",
+                flush=True,
+            )
+            observation = _observe(task)
+            state["environment"] = {
+                name: {
+                    "available": result["exit_code"] == 0,
+                    "summary": result.get("stdout", "")[:1000],
+                }
+                for name, result in observation.items()
             }
-            for name, result in observation.items()
-        }
-        _append(
-            output / "trajectory.jsonl",
-            {"time": _now(), "cycle": cycle, "event": "observe", "result": observation},
-        )
-        before = _fingerprint(state)
-        for read_count in range(task.budgets.max_read_actions_per_cycle + 1):
+            history.append("observe", iteration=cycle, result=observation)
+            refresh_environment = False
+        for _ in range(1):
             if time.monotonic() - started >= task.budgets.max_runtime_minutes * 60:
                 status, reason = "BUDGET_EXHAUSTED", "runtime budget exhausted"
                 break
@@ -358,7 +392,7 @@ def run_deployment_agent(
                 decision, call_usage = (
                     decide(state, observation, last_result, sources, cycle)
                     if decide
-                    else _decide(classifier, state, last_result, sources, cycle)
+                    else _decide(classifier, state, last_result, sources, history, task, cycle)
                 )
             except Exception as exc:
                 status, reason = "FAILED", f"decision failed: {exc}"
@@ -372,15 +406,11 @@ def run_deployment_agent(
             ):
                 decision.tool = "observe"
             print(f"agent: {decision.kind}/{decision.tool or '-'}: {decision.focus}", flush=True)
-            _append(
-                output / "trajectory.jsonl",
-                {
-                    "time": _now(),
-                    "cycle": cycle,
-                    "event": "decision",
-                    "value": decision.model_dump(),
-                    "usage": call_usage,
-                },
+            history.append(
+                "decision",
+                iteration=cycle,
+                value=decision.model_dump(),
+                usage=call_usage,
             )
             if decision.kind == "WAITING_FOR_INPUT" or _missing_inputs(
                 state, decision.required_inputs
@@ -443,15 +473,7 @@ def run_deployment_agent(
                         state["selected_route"] = {"choice": choice, "evidence": evidence}
                         state["focus"] = decision.focus
                         last_result = {"status": "human_selected", "choice": choice}
-                        _append(
-                            output / "trajectory.jsonl",
-                            {
-                                "time": _now(),
-                                "cycle": cycle,
-                                "event": "human_choice",
-                                "result": last_result,
-                            },
-                        )
+                        history.append("human_choice", iteration=cycle, result=last_result)
                         continue
                     reason = "human did not select a route"
                 status = "BLOCKED"
@@ -507,6 +529,7 @@ def run_deployment_agent(
                     approve=approve,
                     timeout=max(1, min(1800, int(remaining))),
                 )
+                refresh_environment = "execution" in last_result
                 if last_result["status"] in {"blocked", "policy_denied"}:
                     status = (
                         "POLICY_DENIED" if last_result["status"] == "policy_denied" else "BLOCKED"
@@ -514,23 +537,15 @@ def run_deployment_agent(
                     reason = last_result["reason"]
                 elif "execution" in last_result:
                     mutations += 1
+                    state["mutating_actions"] = mutations
                     if last_result["status"] == "validated":
                         state["milestones"].append(decision.expected_change)
-                        _record_outcome(state, decision, last_result)
+                        record_outcome(state, decision, last_result)
                     elif last_result["status"] in {"command_failed", "verification_failed"}:
                         action_key = tuple(decision.command)
                         failed_actions[action_key] = failed_actions.get(action_key, 0) + 1
                         if failed_actions[action_key] >= 3:
                             status, reason = "OSCILLATING", "same action failed three times"
-                _append(
-                    output / "actions.jsonl",
-                    {
-                        "time": _now(),
-                        "cycle": cycle,
-                        "decision": decision.model_dump(),
-                        "result": last_result,
-                    },
-                )
                 if (
                     task.task.stop_after_verified_outcomes
                     and len(state["verified_outcomes"]) >= task.task.stop_after_verified_outcomes
@@ -567,9 +582,7 @@ def run_deployment_agent(
                             "BLOCKED",
                             "repeated denied observation; revise the command",
                         )
-            step_satisfied = (
-                decision.tool == "observe" and last_result.get("exit_code") == 0
-            ) or (
+            step_satisfied = (decision.tool == "observe" and last_result.get("exit_code") == 0) or (
                 decision.tool == "execute"
                 and last_result.get("status") in {"validated", "already_satisfied"}
             )
@@ -582,61 +595,46 @@ def run_deployment_agent(
                 set_step_status(overview, decision.step_id, "verified")
                 state["overview"] = overview.model_dump()
                 last_result["overview_step_verified"] = decision.step_id
+                refresh_environment = True
                 write_yaml(output / "overview.yaml", overview)
-            _update_state(state, decision, last_result, sources)
+            if overview and decision.overview_change:
+                try:
+                    apply_change(overview, decision.overview_change, sources)
+                    history.append(
+                        "overview_revised",
+                        iteration=cycle,
+                        change=decision.overview_change.model_dump(),
+                    )
+                except ValueError as exc:
+                    last_result["overview_change_error"] = str(exc)
+            update_state(state, decision, last_result, sources)
             if overview:
                 set_discoveries(overview, state["gaps"] + state["unresolved"])
                 state["overview"] = overview.model_dump()
                 write_yaml(output / "overview.yaml", overview)
-            _append(
-                output / "trajectory.jsonl",
-                {
-                    "time": _now(),
-                    "cycle": cycle,
-                    "event": "tool",
-                    "tool": decision.tool,
-                    "result": last_result,
-                },
-            )
+            history.append("tool", iteration=cycle, tool=decision.tool, result=last_result)
             if (
                 decision.tool == "execute"
-                or decision.completes_step and step_satisfied
+                or decision.completes_step
+                and step_satisfied
                 or status in {"BLOCKED", "POLICY_DENIED"}
             ):
                 break
-            if read_count == task.budgets.max_read_actions_per_cycle:
-                last_result = {
-                    "status": "read_cycle_limit",
-                    "reason": "observe state before more reads",
-                }
-                break
         write_json(output / "state.json", state)
-        _append(
-            output / "trajectory.jsonl",
-            {"time": _now(), "cycle": cycle, "event": "state", "value": state},
-        )
-        if (
-            status
-            in {
-                "SUCCESS",
-                "FAILED",
-                "BLOCKED",
-                "WAITING_FOR_INPUT",
-                "POLICY_DENIED",
-                "BUDGET_EXHAUSTED",
-                "OSCILLATING",
-            }
-            and reason != "cycle budget exhausted"
-        ):
+        history.checkpoint(state)
+        if status in {
+            "SUCCESS",
+            "FAILED",
+            "BLOCKED",
+            "WAITING_FOR_INPUT",
+            "POLICY_DENIED",
+            "BUDGET_EXHAUSTED",
+            "OSCILLATING",
+        } and not (status == "BUDGET_EXHAUSTED" and reason == "decision budget exhausted"):
             break
-        fingerprint = _fingerprint(state)
-        unchanged = unchanged + 1 if fingerprint == before else 0
-        fingerprints.append(fingerprint)
-        if unchanged >= 4:
-            status, reason = "STAGNATED", "meaningful state unchanged for four cycles"
-            break
-        if len(fingerprints) >= 4 and fingerprints[-4:] == [fingerprints[-4], fingerprints[-3]] * 2:
-            status, reason = "OSCILLATING", "state pattern repeated"
+        unchanged = unchanged + 1 if last_result.get("repeated_result_count", 0) else 0
+        if unchanged >= task.budgets.max_read_actions_per_cycle:
+            status, reason = "STAGNATED", "repeated evidence produced no state change"
             break
     report = {
         "status": status,
@@ -650,5 +648,5 @@ def run_deployment_agent(
         "last_result": last_result,
     }
     write_json(output / "final-report.json", report)
-    _append(output / "trajectory.jsonl", {"time": _now(), "event": "stop", "result": report})
+    write_json(output / "run-summary.json", history.summary(report))
     return report

@@ -41,7 +41,7 @@ _READ_AWS = {
     ("eks", "list-nodegroups"),
     ("eks", "describe-nodegroup"),
 }
-_DENIED = {"rm", "sudo", "shutdown", "reboot", "mkfs", "dd", "terraform", "az", "gcloud"}
+_DENIED = {"rm", "shutdown", "reboot", "mkfs", "dd"}
 _COMPOSE_OPTIONS_WITH_VALUE = {
     "-f",
     "--file",
@@ -158,6 +158,10 @@ def _read_only(command: list[str]) -> bool:
         )
     if command[0] == "aws":
         return command[1:2] == ["--version"] or tuple(command[1:3]) in _READ_AWS
+    if command[0] == "terraform":
+        return command[1:2] in (["version"], ["validate"], ["show"], ["output"], ["plan"]) or (
+            command[1:2] == ["state"] and command[2:3] in (["list"], ["show"])
+        )
     if command[0] in {"ansible", "ansible-playbook"}:
         return command[1:] == ["--version"] or (
             command[0] == "ansible-playbook"
@@ -174,10 +178,25 @@ def _read_only(command: list[str]) -> bool:
             return False
         if command[1] in {"ps", "images", "inspect", "logs", "info", "version"}:
             return True
-        return command[1:2] == ["compose"] and _compose_subcommand(command[2:]) in {
-            "version",
-            "ps",
+        if command[1:3] in (["image", "ls"], ["image", "inspect"]):
+            return True
+        if command[1] == "events":
+            return any(part == "--until" or part.startswith("--until=") for part in command[2:])
+        if command[1:2] != ["compose"]:
+            return False
+        subcommand = _compose_subcommand(command[2:])
+        if subcommand == "config":
+            return any(
+                part in {"-q", "--quiet", "--images", "--profiles", "--services", "--volumes"}
+                for part in command[2:]
+            )
+        return subcommand in {
+            "images",
+            "logs",
             "ls",
+            "ps",
+            "top",
+            "version",
         }
     return command[0] in {
         "ls",
@@ -193,6 +212,34 @@ def _read_only(command: list[str]) -> bool:
         "whoami",
         "id",
     }
+
+
+def _high_risk(command: list[str]) -> str | None:
+    executable = Path(command[0]).name
+    if executable == "sudo":
+        return "privileged host change"
+    if executable == "kubectl" and any(
+        part in {"delete", "replace", "patch", "drain"} for part in command
+    ):
+        return "potentially destructive Kubernetes operation"
+    if executable == "helm" and any(part in {"uninstall", "rollback"} for part in command):
+        return "potentially destructive Helm operation"
+    if executable in {"aws", "az", "gcloud", "terraform"}:
+        return "cloud or infrastructure change"
+    if executable == "docker" and (
+        command[1:3] in (["system", "prune"], ["volume", "prune"], ["volume", "rm"])
+        or (
+            command[1:2] == ["compose"]
+            and _compose_subcommand(command[2:]) == "down"
+            and any(part in {"-v", "--volumes"} for part in command)
+        )
+    ):
+        return "potentially destructive container operation"
+    return None
+
+
+def _infrastructure_change(command: list[str]) -> bool:
+    return Path(command[0]).name in {"aws", "az", "gcloud", "terraform"} and not _read_only(command)
 
 
 def _policy(command: list[str], task: DeploymentTask, *, mutating: bool) -> str:
@@ -211,26 +258,18 @@ def _policy(command: list[str], task: DeploymentTask, *, mutating: bool) -> str:
         command = _without_target_context(command, task)
     except ValueError as exc:
         return f"denied: {exc}"
-    if Path(command[0]).name == "aws":
-        if mutating:
-            return "denied: AWS changes are outside this agent's scope"
-        if any(
-            part.split("=", 1)[0] in {"--profile", "--endpoint-url", "--no-verify-ssl", "--debug"}
-            for part in command[1:]
-        ):
-            return "denied: AWS profile, endpoint, and debug overrides are not allowed"
-    if mutating and _read_only(command):
-        return "denied: execute must propose a mutating command"
-    if not mutating and not _read_only(command):
-        return "denied: observation and validation must be read-only"
-    if mutating and task.environment.type == "kubernetes" and command[0] not in {"kubectl", "helm"}:
-        return "approval_required: source script or host command can change the target"
-    if command[0] == "kubectl" and any(
-        part in {"delete", "replace", "patch", "drain"} for part in command
+    if Path(command[0]).name == "aws" and any(
+        part.split("=", 1)[0] in {"--profile", "--endpoint-url", "--no-verify-ssl", "--debug"}
+        for part in command[1:]
     ):
-        return "denied: potentially destructive Kubernetes operation"
-    if command[0] == "helm" and any(part in {"uninstall", "rollback"} for part in command):
-        return "denied: potentially destructive Helm operation"
+        return "denied: AWS profile, endpoint, and debug overrides are not allowed"
+    if command[:2] == ["kubectl", "config"] and command[2:3] not in (
+        ["current-context"],
+        ["get-contexts"],
+    ):
+        return "denied: Kubernetes context changes are not allowed"
+    if _read_only(command):
+        return "allowed"
     if mutating and (
         command[0] == "kubectl" or command[:2] in (["helm", "install"], ["helm", "upgrade"])
     ):
@@ -247,8 +286,15 @@ def _policy(command: list[str], task: DeploymentTask, *, mutating: bool) -> str:
             and namespace not in task.constraints.allowed_namespaces
         ):
             return "denied: namespace outside allowed scope or not explicit"
-    if not mutating or (task.environment.type == "shell" and task.environment.sandbox):
-        return "allowed"
+    risk = _high_risk(command)
+    if risk and "destructive" in risk and not task.constraints.allow_destructive_actions:
+        return "denied: destructive actions are outside task constraints"
+    if _infrastructure_change(command) and not task.constraints.allow_new_infrastructure:
+        return "denied: infrastructure changes are outside task constraints"
+    if risk:
+        return f"high_risk_approval: {risk}"
+    if not mutating:
+        return "approval_required: command is not known to be read-only; propose it as execute"
     return "approval_required: deployment changes require human review"
 
 
@@ -293,28 +339,19 @@ def _checks(task: DeploymentTask, checks: list[Check], cwd: Path | None = None) 
         results.append(
             {
                 "command": command,
-                "passed": result["exit_code"] == 0
-                and (check.contains is None or check.contains in result.get("stdout", "")),
+                "status": (
+                    "satisfied"
+                    if result["exit_code"] == 0
+                    and (check.contains is None or check.contains in result.get("stdout", ""))
+                    else "unsatisfied"
+                    if result["exit_code"] == 0
+                    or result["exit_code"] in check.unsatisfied_exit_codes
+                    else "unknown"
+                ),
                 "result": result,
             }
         )
     return results
-
-
-def _absent(check: dict) -> bool:
-    """Only a completed read or a known not-found response proves absence."""
-    if check["passed"]:
-        return False
-    result = check["result"]
-    if result["exit_code"] == 0:
-        return True
-    command = check["command"]
-    error = result.get("stderr", "").casefold()
-    return (
-        (command[0] == "kubectl" and "(notfound)" in error)
-        or (command[0] == "helm" and "not found" in error)
-        or (command[0] == "ls" and "no such file or directory" in error)
-    )
 
 
 def _execute(
@@ -360,34 +397,44 @@ def _execute(
             }
     cwd = _source_cwd(decision, sources, workspace)
     before = _checks(task, decision.validation, cwd)
-    if all(item["passed"] for item in before):
+    if all(item["status"] == "satisfied" for item in before):
         return {
             "status": "already_satisfied",
             "reason": "the proposed outcome already passes; choose another gap or a stronger check",
             "before": before,
             "command": _target_command(decision.command, task),
         }
-    if not any(_absent(item) for item in before):
+    if any(item["status"] == "unknown" for item in before):
         return {
             "status": "needs_better_check",
-            "reason": "checks could not prove absence; inspect and refine them",
+            "reason": (
+                "validation was inconclusive; use a source-defined check and declare "
+                "its unsatisfied exit codes"
+            ),
             "before": before,
             "command": _target_command(decision.command, task),
         }
-    if policy.startswith("approval_required") and not approve:
+    needs_review = policy.startswith("high_risk_approval") or (
+        policy.startswith("approval_required") and not approve
+    )
+    if needs_review:
         if not sys.stdin.isatty():
             return {"status": "blocked", "reason": policy, "command": decision.command}
+        high_risk = policy.startswith("high_risk_approval")
+        confirmation = "approve" if high_risk else "y"
         print(
-            f"Approve deployment action on {task.environment.context or task.environment.type}?\n"
+            f"Approve {'HIGH-RISK ' if high_risk else ''}deployment action on "
+            f"{task.environment.context or task.environment.type}\n"
             f"Change: {decision.expected_change}\n"
             f"Source: {decision.working_directory or ', '.join(decision.evidence)}\n"
             f"Command: {shlex.join(_target_command(decision.command, task))}\n"
             f"Check: {'; '.join(shlex.join(check.command) for check in decision.validation)}\n"
-            f"Reason: {decision.reason}\nPolicy: {policy}\n[y/N] ",
+            f"Reason: {decision.reason}\nPolicy: {policy}\n"
+            f"[{'type approve' if high_risk else 'y'}/N] ",
             end="",
             flush=True,
         )
-        if input().strip().casefold() != "y":
+        if input().strip().casefold() != confirmation:
             return {
                 "status": "blocked",
                 "reason": "human declined action",
@@ -398,7 +445,9 @@ def _execute(
     result = _command(command, task, cwd=cwd, timeout=timeout, output_limit=None)
     after = _checks(task, decision.validation, cwd)
     deadline = min(deadline, time.monotonic() + 300)
-    while result["exit_code"] == 0 and not all(item["passed"] for item in after):
+    while result["exit_code"] == 0 and not all(
+        item["status"] == "satisfied" for item in after
+    ):
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             break
@@ -409,14 +458,14 @@ def _execute(
             "command_failed"
             if result["exit_code"] != 0
             else "validated"
-            if all(item["passed"] for item in after)
+            if all(item["status"] == "satisfied" for item in after)
             else "verification_failed"
         ),
         "expected_change": decision.expected_change,
         "policy": policy,
         "command": command,
         "before": before,
-        "before_absent": any(_absent(item) for item in before),
+        "before_unsatisfied": any(item["status"] == "unsatisfied" for item in before),
         "execution": result,
         "after": after,
     }

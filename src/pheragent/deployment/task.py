@@ -48,9 +48,15 @@ class Budgets(Record):
     max_read_actions_per_cycle: int = Field(default=20, gt=0)
 
 
+class ContextSettings(Record):
+    mode: Literal["recent", "summary"] = "recent"
+    history_window: int = Field(default=8, gt=0, le=50)
+
+
 class Check(Record):
     command: list[str] = Field(min_length=1)
     contains: str | None = None
+    unsatisfied_exit_codes: list[int] = Field(default_factory=list)
 
 
 class TaskGoal(Record):
@@ -80,6 +86,7 @@ class DeploymentTask(Record):
     environment: Target
     constraints: Constraints = Field(default_factory=Constraints)
     budgets: Budgets = Field(default_factory=Budgets)
+    context: ContextSettings = Field(default_factory=ContextSettings)
     success_checks: list[Check] = Field(default_factory=list)
     inputs: dict[str, TaskInput] = Field(default_factory=dict)
 
@@ -90,6 +97,15 @@ class DeploymentTask(Record):
         if self.task.stop_after_verified_outcomes and self.success_checks:
             raise ValueError("choose fixed success checks or a verified-outcome target")
         return self
+
+
+class OverviewChange(Record):
+    operation: Literal["insert_before", "update"]
+    step_id: str = Field(min_length=1)
+    goal: str = Field(min_length=1)
+    success_condition: str = Field(min_length=1)
+    source_refs: list[str] = Field(min_length=1)
+    before_step_id: str | None = None
 
 
 class Decision(Record):
@@ -117,7 +133,7 @@ class Decision(Record):
     selected_route: str | None = None
     step_id: str | None = None
     required_inputs: list[str] = Field(default_factory=list)
-    working_memory: list[str] = Field(default_factory=list, max_length=8)
+    overview_change: OverviewChange | None = None
     completes_step: bool = False
     options: list[str] = Field(default_factory=list)
     outcome_id: str | None = None
