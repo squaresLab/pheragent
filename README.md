@@ -57,6 +57,9 @@ from a copied workspace; acquired source repositories remain unchanged.
 A failed action is returned to the agent for further investigation. When human
 input is missing, the run writes `human-request.yaml`. Add a secure environment or
 file reference to the task, then continue the same output directory with `--resume`.
+When a configured source links to another required HTTPS Git repository, HerAgent asks
+before cloning it. Approved sources and their pinned revisions are stored in the run's
+`task.json` for resume. Source approval never approves commands from that source.
 Automatic source patching and rollback are not yet implemented. Secrets are
 referenced rather than stored in the task:
 
@@ -72,6 +75,21 @@ inputs:
 The current stopping check can verify fixed commands or a chosen number of
 newly observed outcomes. It does **not** establish that an arbitrary whole
 system is fully deployed.
+
+### Optional traces
+
+OpenTelemetry traces are disabled unless an endpoint or Laminar project key is set:
+
+```bash
+uv sync --locked --extra observability
+export LMNR_PROJECT_API_KEY="..."       # sends OTLP/HTTP traces to Laminar Cloud
+export PHERAGENT_TRACE_CONTENT=1         # opt in to redacted prompts and tool results
+```
+
+Use any OTLP/HTTP backend instead by setting `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` and,
+when required, `OTEL_EXPORTER_OTLP_HEADERS`. Each deployment is one trace containing LLM,
+decision, observation, and tool events. Without `PHERAGENT_TRACE_CONTENT=1`, trace payloads
+are omitted while names, status, token counts, and concise decision metadata remain.
 
 Deployment code is organized by responsibility: `deployment/agent.py` owns
 the decision loop, `task.py` the task and decision shapes, `sources.py`

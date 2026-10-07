@@ -10,6 +10,7 @@ from pathlib import Path
 from .redaction import redact_secrets
 from .sources import SourceTools
 from .task import Decision
+from .telemetry import record_event
 
 
 def _now() -> str:
@@ -30,6 +31,7 @@ class RunHistory:
             handle.write(encoded + "\n")
             handle.flush()
             os.fsync(handle.fileno())
+        record_event(event, data)
         return record
 
     def checkpoint(self, state: dict) -> None:

@@ -116,6 +116,7 @@ class Decision(Record):
             "search_sources",
             "read_file",
             "list_directory",
+            "add_source",
             "observe",
             "execute",
         ]
@@ -130,6 +131,7 @@ class Decision(Record):
     command: list[str]
     working_directory: str | None
     evidence: list[str]
+    source: SourceLocation | None = None
     selected_route: str | None = None
     step_id: str | None = None
     required_inputs: list[str] = Field(default_factory=list)

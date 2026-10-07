@@ -9,7 +9,10 @@ import yaml
 
 from pheragent.cli import main as pheragent_main
 from pheragent.deployment.agent import _INSTRUCTIONS, _brief, run_deployment_agent
+from pheragent.deployment.enums import SourceKind
+from pheragent.deployment.models import SourcesConfig
 from pheragent.deployment.runtime import _checks, _execute, _policy, _target_command
+from pheragent.deployment.source_manager import SourceManager
 from pheragent.deployment.task import Check, Decision, DeploymentTask
 
 
@@ -26,6 +29,7 @@ def _decision(kind: str, tool: str | None = None, **changes: object) -> Decision
         "command": [],
         "working_directory": None,
         "evidence": [],
+        "source": None,
         "expected_change": None,
         "validation": [],
         "add_gaps": [],
@@ -242,6 +246,88 @@ def test_agent_waits_for_referenced_secret_and_resumes_same_run(
 
     second = run_deployment_agent(task, output, resume=True, decide=stop)
     assert second["reason"] == "resume verified"
+
+
+def test_agent_requests_approval_for_a_linked_source(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "README.md").write_text(
+        "Continue with https://github.com/example/deployment-infra.\n"
+    )
+    task = tmp_path / "task.yaml"
+    output = tmp_path / "run"
+    _task(task, source, output)
+
+    def decide(_state, _observation, _last_result, _sources, _cycle):
+        return _decision(
+            "ACT",
+            "add_source",
+            source={"location": "https://github.com/example/deployment-infra"},
+            evidence=["repository-1:README.md"],
+            reason="the active deployment guide delegates infrastructure setup",
+        ), {}
+
+    report = run_deployment_agent(task, output, decide=decide)
+    request = yaml.safe_load((output / "human-request.yaml").read_text())
+    assert report["status"] == "WAITING_FOR_INPUT"
+    assert request["kind"] == "source_approval"
+    assert request["source"]["location"] == "https://github.com/example/deployment-infra"
+
+
+def test_agent_acquires_an_approved_linked_source(tmp_path: Path, monkeypatch) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "README.md").write_text(
+        "Continue with https://github.com/example/deployment-infra.\n"
+    )
+    linked = tmp_path / "linked"
+    linked.mkdir()
+    (linked / "README.md").write_text("Infrastructure instructions.\n")
+    task = tmp_path / "task.yaml"
+    output = tmp_path / "run"
+    _task(task, source, output)
+    acquire = SourceManager.acquire
+
+    def acquire_locally(manager, config):
+        if len(config.sources) == 1:
+            return acquire(manager, config)
+        replacement = config.sources[-1].model_copy(
+            update={"kind": SourceKind.LOCAL_DIRECTORY, "location": str(linked)}
+        )
+        return acquire(
+            manager,
+            SourcesConfig(system=config.system, sources=[*config.sources[:-1], replacement]),
+        )
+
+    monkeypatch.setattr(SourceManager, "acquire", acquire_locally)
+    decisions = iter(
+        [
+            _decision(
+                "ACT",
+                "add_source",
+                source={"location": "https://github.com/example/deployment-infra"},
+                evidence=["repository-1:README.md"],
+            ),
+            _decision("BLOCKED", reason="source was available for the next decision"),
+        ]
+    )
+
+    def decide(_state, _observation, _last_result, sources, _cycle):
+        decision = next(decisions)
+        if decision.kind == "BLOCKED":
+            assert "repository-2:README.md" in sources.readable_paths
+        return decision, {}
+
+    report = run_deployment_agent(task, output, approve=True, decide=decide)
+    effective_task = json.loads((output / "task.json").read_text())
+    assert report["reason"] == "source was available for the next decision"
+    assert effective_task["sources"]["repositories"][-1]["location"] == (
+        "https://github.com/example/deployment-infra"
+    )
+    assert any(
+        json.loads(line)["event"] == "source_approved"
+        for line in (output / "events.jsonl").read_text().splitlines()
+    )
 
 
 def test_sensitive_input_cannot_be_stored_inline() -> None:

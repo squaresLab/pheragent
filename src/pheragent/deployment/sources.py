@@ -8,6 +8,7 @@ import re
 import shlex
 import shutil
 from pathlib import Path, PurePosixPath
+from urllib.parse import urlsplit
 
 from .enums import SourceKind
 from .inventory import RepositoryInventoryBuilder
@@ -191,6 +192,20 @@ class SourceTools:
             for path in self.readable_paths
             if any(ref == path or ref.startswith((path + ":", path + " —")) for ref in references)
         }
+
+    def supports_source(self, location: str, references: list[str]) -> bool:
+        parsed = urlsplit(location)
+        if parsed.scheme != "https" or not parsed.netloc or parsed.username or parsed.password:
+            return False
+        expected = location.removesuffix(".git").rstrip("/")
+        for reference in self.existing_refs(references):
+            source_id, _, relative = reference.partition(":")
+            text = self.sources[source_id].resolve_path(relative).read_text(
+                encoding="utf-8", errors="replace"
+            )
+            if expected in text.replace(".git", ""):
+                return True
+        return False
 
     def read_file(
         self, reference: str, start_line: int | None = None, end_line: int | None = None

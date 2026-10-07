@@ -51,9 +51,10 @@ context; do not choose another context.
 Prefer existing project scripts, then charts, existing automation, manifests, documented
 commands, and only then a newly composed command. Give an exact source path as evidence.
 Follow relevant relative links within the configured sources. A repository URL or web
-link is not evidence of its contents: use it only if that source is available to your
-tools. If an essential linked source is unavailable, continue independent grounded
-work or BLOCKED with the exact link and question a human needs to resolve.
+link is not evidence of its contents. If an essential file cites an unavailable HTTPS
+Git repository, use ACT/add_source with source.location, optional revision, and the exact
+citing file in evidence. Source approval grants read-only acquisition, not command execution.
+Continue independent grounded work when possible; do not represent a repository as a task input.
 When sources offer several routes, choose the documented route matching the task target,
 constraints, and desired outcome. Set selected_route to a short explanation and cite its
 source in evidence; retain that choice unless new evidence disproves it. A documented
@@ -208,7 +209,7 @@ def _decide(
     }
     outcome = classifier.classify(
         stage="deployment_agent",
-        prompt_version="deployment-agent-v0.7",
+        prompt_version="deployment-agent-v0.8",
         instructions=_INSTRUCTIONS,
         payload=payload,
         response_format=strict_response_format(Decision, name="deployment_agent_decision"),
@@ -269,6 +270,17 @@ def run_deployment_agent(
     else:
         output.mkdir(parents=True, exist_ok=False)
     history = RunHistory(output)
+    if resume:
+        previous = DeploymentTask.model_validate(json.loads((output / "task.json").read_text()))
+        locations = {
+            item if isinstance(item, str) else item.location
+            for item in task.sources.repositories
+        }
+        task.sources.repositories.extend(
+            item
+            for item in previous.sources.repositories
+            if (item if isinstance(item, str) else item.location) not in locations
+        )
     write_json(output / "task.json", task)
     specs = [
         _source_spec(item, purpose, index, task_path.parent)
@@ -487,7 +499,96 @@ def run_deployment_agent(
                 if complete:
                     status, reason = "SUCCESS", "completion checks passed twice"
                 break
-            if decision.tool in {
+            if decision.tool == "add_source":
+                source = decision.source
+                evidence = sorted(sources.existing_refs(decision.evidence))
+                if source is None or not evidence or not sources.supports_source(
+                    source.location, decision.evidence
+                ):
+                    last_result = {
+                        "status": "blocked",
+                        "reason": "source addition needs a cited HTTPS repository link",
+                    }
+                elif any(
+                    (item if isinstance(item, str) else item.location) == source.location
+                    for item in task.sources.repositories
+                ):
+                    last_result = {"status": "already_available", "source": source.location}
+                elif not approve and not sys.stdin.isatty():
+                    request = {
+                        "status": "WAITING_FOR_INPUT",
+                        "kind": "source_approval",
+                        "source": source.model_dump(exclude_none=True),
+                        "reason": decision.reason,
+                        "evidence": evidence,
+                    }
+                    write_yaml(output / "human-request.yaml", request)
+                    status, reason, last_result = "WAITING_FOR_INPUT", decision.reason, request
+                    break
+                else:
+                    accepted = approve
+                    if not accepted:
+                        print(
+                            "Approve deployment source?\n"
+                            f"Source: {source.location}\n"
+                            f"Referenced by: {', '.join(evidence)}\n"
+                            f"Reason: {decision.reason}\n"
+                            "Access: read-only clone; commands still require separate approval\n"
+                            "[y/N] ",
+                            end="",
+                            flush=True,
+                        )
+                        try:
+                            accepted = input().strip().casefold() == "y"
+                        except EOFError:
+                            accepted = False
+                    if not accepted:
+                        status, reason = "BLOCKED", "human declined deployment source"
+                        last_result = {"status": "blocked", "reason": reason}
+                        break
+                    task.sources.repositories.append(source)
+                    write_json(output / "task.json", task)
+                    specs.append(
+                        _source_spec(
+                            source,
+                            "repository",
+                            len(task.sources.repositories),
+                            task_path.parent,
+                        )
+                    )
+                    acquired = SourceManager(
+                        cache_dir=output.parent / ".source-cache",
+                        config_dir=task_path.parent,
+                        strict=False,
+                    ).acquire(SourcesConfig(system="deployment", sources=specs))
+                    resolved_revision = acquired.manifest.sources[-1].resolved_revision
+                    pinned_source = source.model_copy(update={"revision": resolved_revision})
+                    task.sources.repositories[-1] = pinned_source
+                    specs[-1] = _source_spec(
+                        pinned_source,
+                        "repository",
+                        len(task.sources.repositories),
+                        task_path.parent,
+                    )
+                    write_json(output / "task.json", task)
+                    write_json(output / "sources.json", acquired.manifest)
+                    sources = SourceTools(acquired.sources)
+                    state["source_workspaces"] = {
+                        source_id: str((output / "workspace" / source_id).resolve())
+                        for source_id in sources.sources
+                    }
+                    last_result = {
+                        "status": "source_acquired",
+                        "source": source.location,
+                        "resolved_revision": resolved_revision,
+                    }
+                    history.append(
+                        "source_approved",
+                        iteration=cycle,
+                        source=source.model_dump(exclude_none=True),
+                        evidence=evidence,
+                    )
+            elif decision.tool in {
                 "inventory_sources",
                 "search_sources",
                 "read_file",

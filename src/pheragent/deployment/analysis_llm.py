@@ -22,6 +22,7 @@ from pheragent.llm_planner import (
 )
 
 from .serialization import write_json
+from .telemetry import set_output, span
 
 DEFAULT_ANALYSIS_MODEL = "gpt-5.6-terra"
 
@@ -225,88 +226,101 @@ class CachedStructuredClassifier:
         content = ""
         usage: dict[str, int] = {}
         started = time.monotonic()
-        try:
-            base_url = _resolve_openai_base_url(
-                configured_base_url=self._config.base_url,
-                base_url_env=self._config.base_url_env,
-                api_mode="responses",
-            )
-            client = _openai_client(
-                base_url=base_url,
-                api_key=api_key,
-                timeout=self._config.timeout,
-            )
-            request: dict[str, Any] = {
-                "model": self._config.model,
-                "instructions": instructions,
-                "input": [
-                    {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "input_text",
-                                "text": json.dumps(payload, ensure_ascii=False),
-                            }
-                        ],
-                    }
-                ],
-                "text": {"format": response_format},
-                "stream": True,
-            }
-            if effective_output_tokens is not None:
-                request["max_output_tokens"] = effective_output_tokens
-            if self._config.reasoning_effort:
-                request["reasoning"] = {"effort": self._config.reasoning_effort}
-            stream = client.responses.create(**request)
-            content, usage = _read_streamed_response_with_usage(
-                stream,
-                error_context=stage.replace("_", " "),
-            )
-            value = response_model.model_validate(_parse_structured_json_object(content))
-            validate(value)
-        except Exception as exc:
-            failure_status = "failed"
-            if isinstance(exc, IncompleteLLMResponseError):
-                content = exc.content
-                usage = exc.usage
-                reason = "".join(
-                    character if character.isalnum() else "_" for character in exc.reason.casefold()
-                ).strip("_")
-                failure_status = f"incomplete_{reason or 'response'}"
-            elif isinstance(exc, ValueError):
-                failure_status = "invalid_response"
-            usage["requests"] = max(1, int(usage.get("requests", 0)))
-            formatted_error = _format_llm_error(stage.replace("_", " "), exc)
-            if failure_path:
-                _record_failure(
-                    failure_path,
-                    cache_key=cache_key,
-                    prompt_version=prompt_version,
-                    model=self._config.model,
-                    failure_kind=failure_status,
-                    error=formatted_error,
-                    usage=usage,
-                    response=content,
+        with span(
+            f"llm.{stage}",
+            span_type="LLM",
+            input={"instructions": instructions, "payload": payload},
+            **{"gen_ai.request.model": self._config.model, "pheragent.stage": stage},
+        ) as active_span:
+            try:
+                base_url = _resolve_openai_base_url(
+                    configured_base_url=self._config.base_url,
+                    base_url_env=self._config.base_url_env,
+                    api_mode="responses",
                 )
-            return ClassificationOutcome(
-                None,
-                stage,
-                failure_status,
-                usage,
-                estimate,
-                warning="; ".join(
-                    item
-                    for item in (
-                        cache_warning,
-                        f"{stage} unavailable: {formatted_error}",
+                client = _openai_client(
+                    base_url=base_url,
+                    api_key=api_key,
+                    timeout=self._config.timeout,
+                )
+                request: dict[str, Any] = {
+                    "model": self._config.model,
+                    "instructions": instructions,
+                    "input": [
+                        {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "input_text",
+                                    "text": json.dumps(payload, ensure_ascii=False),
+                                }
+                            ],
+                        }
+                    ],
+                    "text": {"format": response_format},
+                    "stream": True,
+                }
+                if effective_output_tokens is not None:
+                    request["max_output_tokens"] = effective_output_tokens
+                if self._config.reasoning_effort:
+                    request["reasoning"] = {"effort": self._config.reasoning_effort}
+                stream = client.responses.create(**request)
+                content, usage = _read_streamed_response_with_usage(
+                    stream,
+                    error_context=stage.replace("_", " "),
+                )
+                value = response_model.model_validate(_parse_structured_json_object(content))
+                validate(value)
+            except Exception as exc:
+                failure_status = "failed"
+                if isinstance(exc, IncompleteLLMResponseError):
+                    content = exc.content
+                    usage = exc.usage
+                    reason = "".join(
+                        character if character.isalnum() else "_"
+                        for character in exc.reason.casefold()
+                    ).strip("_")
+                    failure_status = f"incomplete_{reason or 'response'}"
+                elif isinstance(exc, ValueError):
+                    failure_status = "invalid_response"
+                usage["requests"] = max(1, int(usage.get("requests", 0)))
+                formatted_error = _format_llm_error(stage.replace("_", " "), exc)
+                if failure_path:
+                    _record_failure(
+                        failure_path,
+                        cache_key=cache_key,
+                        prompt_version=prompt_version,
+                        model=self._config.model,
+                        failure_kind=failure_status,
+                        error=formatted_error,
+                        usage=usage,
+                        response=content,
                     )
-                    if item
-                ),
-                failure_history_path=failure_path,
-                duration_seconds=round(time.monotonic() - started, 6),
-            )
+                set_output(
+                    active_span,
+                    {"status": failure_status, "error": formatted_error},
+                    usage,
+                )
+                return ClassificationOutcome(
+                    None,
+                    stage,
+                    failure_status,
+                    usage,
+                    estimate,
+                    warning="; ".join(
+                        item
+                        for item in (
+                            cache_warning,
+                            f"{stage} unavailable: {formatted_error}",
+                        )
+                        if item
+                    ),
+                    failure_history_path=failure_path,
+                    duration_seconds=round(time.monotonic() - started, 6),
+                )
 
-        usage["requests"] = max(1, int(usage.get("requests", 0)))
+            usage["requests"] = max(1, int(usage.get("requests", 0)))
+            set_output(active_span, {"status": "succeeded", "response": content}, usage)
         if cache_path:
             write_json(
                 cache_path,
