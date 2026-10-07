@@ -11,7 +11,7 @@ from pheragent.cli import main as pheragent_main
 from pheragent.deployment.agent import _INSTRUCTIONS, _brief, run_deployment_agent
 from pheragent.deployment.enums import SourceKind
 from pheragent.deployment.models import SourcesConfig
-from pheragent.deployment.runtime import _checks, _execute, _policy, _target_command
+from pheragent.deployment.runtime import _checks, _execute, _inspect, _policy, _target_command
 from pheragent.deployment.source_manager import SourceManager
 from pheragent.deployment.task import Check, Decision, DeploymentTask
 
@@ -482,6 +482,27 @@ def test_matching_context_storage_check_is_read_only() -> None:
     assert _target_command(command, task) == command
 
 
+def test_kubernetes_global_options_do_not_hide_a_read_only_verb() -> None:
+    task = DeploymentTask.model_validate(
+        {
+            "task": {"objective": "sample"},
+            "sources": {"repositories": ["/tmp/sample"]},
+            "environment": {"type": "kubernetes", "context": "test-cluster"},
+        }
+    )
+    command = [
+        "kubectl",
+        "-n",
+        "istio-system",
+        "get",
+        "deployment/istio-ingressgateway",
+        "service/istio-ingressgateway",
+        "-o",
+        "wide",
+    ]
+    assert _policy(command, task, mutating=False) == "allowed"
+
+
 @pytest.mark.parametrize(
     "command",
     [
@@ -630,7 +651,7 @@ def test_read_only_execute_is_observed_without_approval(tmp_path: Path, monkeypa
         observed.append(command)
         return {"exit_code": 0, "stdout": "No resources found", "stderr": ""}
 
-    monkeypatch.setattr("pheragent.deployment.agent._command", inspect)
+    monkeypatch.setattr("pheragent.deployment.runtime._command", inspect)
     decisions = iter(
         [
             _decision(
@@ -667,7 +688,7 @@ def test_observation_uses_selected_source_directory(tmp_path: Path, monkeypatch)
         working_directories.append(kwargs.get("cwd"))
         return {"exit_code": 0, "stdout": "", "stderr": ""}
 
-    monkeypatch.setattr("pheragent.deployment.agent._command", inspect)
+    monkeypatch.setattr("pheragent.deployment.runtime._command", inspect)
     decisions = iter(
         [
             _decision(
@@ -687,6 +708,47 @@ def test_observation_uses_selected_source_directory(tmp_path: Path, monkeypatch)
     assert report["status"] == "BLOCKED"
     assert working_directories == [output / "workspace/repository-1"]
     assert (working_directories[0] / "compose.yaml").is_file()
+
+
+def test_unknown_observation_can_receive_one_time_human_approval(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    task = DeploymentTask.model_validate(
+        {
+            "task": {"objective": "sample"},
+            "sources": {"repositories": ["/tmp/sample"]},
+            "environment": {"type": "shell", "sandbox": True},
+        }
+    )
+    decision = _decision(
+        "ACT",
+        "observe",
+        command=["projectctl", "inspect"],
+        reason="inspect the project without changing it",
+    )
+
+    class Terminal(io.StringIO):
+        def isatty(self):
+            return True
+
+    commands = []
+    monkeypatch.setattr("pheragent.deployment.runtime.sys.stdin", Terminal("y\n"))
+    monkeypatch.setattr(
+        "pheragent.deployment.runtime._command",
+        lambda command, _task, **_kwargs: commands.append(command)
+        or {"exit_code": 0, "stdout": "ready", "stderr": ""},
+    )
+    result = _inspect(
+        decision,
+        task,
+        object(),
+        tmp_path,
+        enabled=True,
+        approve=False,
+    )
+    assert result["exit_code"] == 0
+    assert commands == [["projectctl", "inspect"]]
+    assert "Approve unclassified observation?" in capsys.readouterr().out
 
 
 def test_reworded_denied_observations_stop_early(tmp_path: Path, monkeypatch) -> None:

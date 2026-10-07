@@ -51,6 +51,18 @@ _COMPOSE_OPTIONS_WITH_VALUE = {
     "--profile",
     "--project-directory",
 }
+_KUBECTL_OPTIONS_WITH_VALUE = {"-n", "--namespace", "--request-timeout"}
+_HELM_OPTIONS_WITH_VALUE = {"-n", "--namespace"}
+
+
+def _subcommand(arguments: list[str], options_with_value: set[str]) -> tuple[str | None, int]:
+    index = 0
+    while index < len(arguments) and arguments[index].startswith("-"):
+        option = arguments[index].split("=", 1)[0]
+        if option not in options_with_value:
+            return None, index
+        index += 1 if "=" in arguments[index] else 2
+    return (arguments[index] if index < len(arguments) else None), index
 
 
 def _compose_subcommand(arguments: list[str]) -> str | None:
@@ -142,15 +154,19 @@ def _read_only(command: list[str]) -> bool:
     if not command:
         return False
     if command[0] == "kubectl":
-        verb = command[1] if len(command) > 1 else ""
+        verb, index = _subcommand(command[1:], _KUBECTL_OPTIONS_WITH_VALUE)
+        verb = verb or ""
+        offset = index + 1
         if verb == "auth":
-            return command[2:3] == ["can-i"]
+            return command[offset + 1 : offset + 2] == ["can-i"]
         if verb == "config":
-            return command[2:3] in (["current-context"], ["get-contexts"])
+            return command[offset + 1 : offset + 2] in (["current-context"], ["get-contexts"])
         return verb in _READ_KUBECTL and not (verb == "rollout" and "status" not in command)
     if command[0] == "helm":
-        verb = command[1] if len(command) > 1 else ""
-        return verb in _READ_HELM or command[1:3] in (
+        verb, index = _subcommand(command[1:], _HELM_OPTIONS_WITH_VALUE)
+        verb = verb or ""
+        offset = index + 1
+        return verb in _READ_HELM or command[offset : offset + 2] in (
             ["repo", "list"],
             ["search", "repo"],
             ["search", "hub"],
@@ -212,6 +228,43 @@ def _read_only(command: list[str]) -> bool:
         "whoami",
         "id",
     }
+
+
+def _inspect(
+    decision: Decision,
+    task: DeploymentTask,
+    sources: SourceTools,
+    workspace: Path,
+    *,
+    enabled: bool,
+    approve: bool,
+) -> dict:
+    policy = _policy(decision.command, task, mutating=False)
+    if policy.startswith("denied"):
+        return {"error": policy}
+    if policy != "allowed":
+        if not enabled:
+            return {
+                "status": "blocked",
+                "reason": "unclassified observation; pass --execute for human review",
+            }
+        high_risk = policy.startswith("high_risk_approval")
+        accepted = approve and not high_risk
+        if not accepted and sys.stdin.isatty():
+            confirmation = "approve" if high_risk else "y"
+            print(
+                f"Approve {'HIGH-RISK ' if high_risk else ''}unclassified observation?\n"
+                f"Command: {shlex.join(_target_command(decision.command, task))}\n"
+                f"Reason: {decision.reason}\nPolicy: {policy}\n"
+                f"[{'type approve' if high_risk else 'y'}/N] ",
+                end="",
+                flush=True,
+            )
+            accepted = input().strip().casefold() == confirmation
+        if not accepted:
+            return {"status": "blocked", "reason": policy}
+    cwd = _source_cwd(decision, sources, workspace)
+    return _command(_target_command(decision.command, task), task, cwd=cwd)
 
 
 def _high_risk(command: list[str]) -> str | None:

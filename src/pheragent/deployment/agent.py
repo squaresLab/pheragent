@@ -25,10 +25,10 @@ from .overview import (
     set_discoveries,
     set_step_status,
 )
-from .runtime import _checks, _command, _execute, _observe, _policy, _target_command
+from .runtime import _checks, _execute, _inspect, _observe, _policy
 from .serialization import load_yaml, write_json, write_yaml
 from .source_manager import SourceManager
-from .sources import SourceTools, _source_cwd, _source_spec
+from .sources import SourceTools, _source_spec
 from .task import Check, Decision, DeploymentTask
 
 _INSTRUCTIONS = """You are a senior DevOps engineer responsible for deploying the requested system.
@@ -46,8 +46,9 @@ step's success condition is already true. Then read files in active_step.source_
 full; use overview.route_evidence only when the step has no useful reference. A README may
 map the route without containing the command, so inspect its command-bearing entrypoint. AGENTS,
 CONTRIBUTING, and coding-policy files are not deployment guidance.
-Use observe for read-only commands. The harness supplies the declared Kubernetes
-context; do not choose another context.
+Use observe for read-only commands. If its policy is unknown, keep it as observe so a
+human can review it; never relabel an inspection as execute to bypass policy. The harness
+supplies the declared Kubernetes context; do not choose another context.
 Prefer existing project scripts, then charts, existing automation, manifests, documented
 commands, and only then a newly composed command. Give an exact source path as evidence.
 Follow relevant relative links within the configured sources. A repository URL or web
@@ -209,7 +210,7 @@ def _decide(
     }
     outcome = classifier.classify(
         stage="deployment_agent",
-        prompt_version="deployment-agent-v0.8",
+        prompt_version="deployment-agent-v0.9",
         instructions=_INSTRUCTIONS,
         payload=payload,
         response_format=strict_response_format(Decision, name="deployment_agent_decision"),
@@ -603,16 +604,24 @@ def run_deployment_agent(
                 except (OSError, ValueError) as exc:
                     last_result = {"error": str(exc)}
             elif decision.tool == "observe":
-                policy = _policy(decision.command, task, mutating=False)
                 try:
-                    cwd = _source_cwd(decision, sources, output / "workspace")
-                    last_result = (
-                        _command(_target_command(decision.command, task), task, cwd=cwd)
-                        if policy == "allowed"
-                        else {"error": policy}
+                    last_result = _inspect(
+                        decision,
+                        task,
+                        sources,
+                        output / "workspace",
+                        enabled=execute,
+                        approve=approve,
                     )
                 except (OSError, ValueError) as exc:
                     last_result = {"error": str(exc)}
+                if last_result.get("status") in {"blocked", "policy_denied"}:
+                    status = (
+                        "POLICY_DENIED"
+                        if last_result["status"] == "policy_denied"
+                        else "BLOCKED"
+                    )
+                    reason = last_result["reason"]
             elif decision.tool == "execute":
                 if mutations >= task.budgets.max_mutating_actions:
                     status, reason = "BUDGET_EXHAUSTED", "mutation budget exhausted"
