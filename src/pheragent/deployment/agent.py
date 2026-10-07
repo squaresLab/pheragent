@@ -7,6 +7,7 @@ import json
 import os
 import sys
 import time
+from getpass import getpass
 from pathlib import Path
 
 from .analysis_llm import (
@@ -29,7 +30,7 @@ from .runtime import _checks, _execute, _inspect, _observe, _policy
 from .serialization import load_yaml, write_json, write_yaml
 from .source_manager import SourceManager
 from .sources import SourceTools, _source_spec
-from .task import Check, Decision, DeploymentTask
+from .task import Check, Decision, DeploymentTask, TaskInput
 
 _INSTRUCTIONS = """You are a senior DevOps engineer responsible for deploying the requested system.
 Work progressively: discover enough for the next safe step, act, observe, and update your
@@ -78,9 +79,10 @@ condition; the harness advances the overview only after that proof.
 ASK_HUMAN only when two or three source-supported routes remain genuinely viable after
 considering the target and constraints. Put concise alternatives in options. The choice
 selects a route, not permission to execute it. Use WAITING_FOR_INPUT when an exact external
-value or secret is required. Name its task input keys in required_inputs; never request or
-print the value itself. The human supplies it through the task's env or file reference and
-resumes the same run.
+value or secret is required. Name its task input keys in required_inputs and put secret keys
+in sensitive_inputs. Use the exact documented environment-variable name for a newly
+discovered secret. The harness requests values interactively when possible, hides and never
+persists secrets, and otherwise writes a request for a later resume.
 For execute, provide an argv command, working_directory as source-id:relative/path
 (use source-id:. for a source root), a specific expected_change, and read-only
 validation commands. Evidence entries must be exact source-id:file/path IDs from
@@ -169,6 +171,45 @@ def _missing_inputs(state: dict, names: list[str]) -> list[str]:
     return sorted(name for name in names if not state["inputs"].get(name, {}).get("available"))
 
 
+def _prompt_for_inputs(
+    task: DeploymentTask,
+    state: dict,
+    decision: Decision,
+) -> list[str]:
+    if not sys.stdin.isatty():
+        return []
+    provided = []
+    print(decision.reason, flush=True)
+    for name in _missing_inputs(state, decision.required_inputs):
+        configured = task.inputs.get(name)
+        sensitive = name in decision.sensitive_inputs or bool(configured and configured.sensitive)
+        try:
+            value = getpass(f"{name} (hidden): ") if sensitive else input(f"{name}: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            value = ""
+        if not value:
+            continue
+        if sensitive:
+            variable = configured.from_env if configured and configured.from_env else name
+            os.environ[variable] = value
+            task.inputs[name] = TaskInput(from_env=variable, sensitive=True)
+            state["inputs"][name] = {
+                "available": True,
+                "sensitive": True,
+                "source": f"env:{variable}",
+            }
+        else:
+            task.inputs[name] = TaskInput(value=value)
+            state["inputs"][name] = {
+                "available": True,
+                "sensitive": False,
+                "source": "interactive",
+                "value": value,
+            }
+        provided.append(name)
+    return provided
+
+
 def _decide(
     classifier: CachedStructuredClassifier,
     state: dict,
@@ -193,6 +234,7 @@ def _decide(
             "environment",
             "verified_outcomes",
             "last_action",
+            "pending_input",
         )
     }
     payload = {
@@ -210,7 +252,7 @@ def _decide(
     }
     outcome = classifier.classify(
         stage="deployment_agent",
-        prompt_version="deployment-agent-v0.9",
+        prompt_version="deployment-agent-v0.10",
         instructions=_INSTRUCTIONS,
         payload=payload,
         response_format=strict_response_format(Decision, name="deployment_agent_decision"),
@@ -282,6 +324,7 @@ def run_deployment_agent(
             for item in previous.sources.repositories
             if (item if isinstance(item, str) else item.location) not in locations
         )
+        task.inputs = {**previous.inputs, **task.inputs}
     write_json(output / "task.json", task)
     specs = [
         _source_spec(item, purpose, index, task_path.parent)
@@ -437,6 +480,19 @@ def run_deployment_agent(
                 if not missing:
                     last_result = {"status": "inputs_available"}
                     continue
+                provided = _prompt_for_inputs(task, state, decision)
+                if provided:
+                    write_json(output / "task.json", task)
+                    history.append(
+                        "human_input",
+                        iteration=cycle,
+                        inputs=provided,
+                        sensitive=[name for name in provided if state["inputs"][name]["sensitive"]],
+                    )
+                    missing = _missing_inputs(state, decision.required_inputs)
+                    last_result = {"status": "inputs_provided", "inputs": provided}
+                    if not missing:
+                        continue
                 request = {
                     "status": "WAITING_FOR_INPUT",
                     "reason": decision.reason,

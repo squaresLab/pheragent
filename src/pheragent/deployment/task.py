@@ -135,6 +135,7 @@ class Decision(Record):
     selected_route: str | None = None
     step_id: str | None = None
     required_inputs: list[str] = Field(default_factory=list)
+    sensitive_inputs: list[str] = Field(default_factory=list)
     overview_change: OverviewChange | None = None
     completes_step: bool = False
     options: list[str] = Field(default_factory=list)
@@ -145,3 +146,9 @@ class Decision(Record):
     resolve_gaps: list[str]
     add_questions: list[str]
     resolve_questions: list[str]
+
+    @model_validator(mode="after")
+    def require_sensitive_inputs(self) -> Decision:
+        if not set(self.sensitive_inputs) <= set(self.required_inputs):
+            raise ValueError("sensitive inputs must also be required inputs")
+        return self

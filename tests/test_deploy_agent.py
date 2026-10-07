@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -30,6 +31,7 @@ def _decision(kind: str, tool: str | None = None, **changes: object) -> Decision
         "working_directory": None,
         "evidence": [],
         "source": None,
+        "sensitive_inputs": [],
         "expected_change": None,
         "validation": [],
         "add_gaps": [],
@@ -271,6 +273,95 @@ def test_resume_uses_current_task_constraints(tmp_path: Path) -> None:
 
     report = run_deployment_agent(task, output, resume=True, decide=resume)
     assert report["reason"] == "updated constraints loaded"
+
+
+def test_agent_collects_and_persists_interactive_configuration(
+    tmp_path: Path, monkeypatch
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "README.md").write_text("Deploy the sample.\n")
+    task = tmp_path / "task.yaml"
+    output = tmp_path / "run"
+    _task(task, source, output)
+
+    class Terminal(io.StringIO):
+        def isatty(self):
+            return True
+
+    monkeypatch.setattr("pheragent.deployment.agent.sys.stdin", Terminal("iam.example.org\n"))
+    decisions = iter(
+        [
+            _decision(
+                "WAITING_FOR_INPUT",
+                reason="IAM hostname is required",
+                required_inputs=["iam_hostname"],
+            ),
+            _decision("BLOCKED", reason="input received"),
+        ]
+    )
+
+    def decide(state, _observation, _last_result, _sources, _cycle):
+        decision = next(decisions)
+        if decision.kind == "BLOCKED":
+            assert state["inputs"]["iam_hostname"]["value"] == "iam.example.org"
+        return decision, {}
+
+    report = run_deployment_agent(task, output, decide=decide)
+    effective_task = json.loads((output / "task.json").read_text())
+    assert report["reason"] == "input received"
+    assert effective_task["inputs"]["iam_hostname"]["value"] == "iam.example.org"
+
+
+def test_agent_hides_and_never_persists_interactive_secrets(
+    tmp_path: Path, monkeypatch
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "README.md").write_text("Deploy the sample.\n")
+    task = tmp_path / "task.yaml"
+    output = tmp_path / "run"
+    _task(task, source, output)
+    secret = "not-written-anywhere"
+
+    class Terminal(io.StringIO):
+        def isatty(self):
+            return True
+
+    monkeypatch.delenv("IAM_ADMIN_PASSWORD", raising=False)
+    monkeypatch.setattr("pheragent.deployment.agent.sys.stdin", Terminal())
+    monkeypatch.setattr("pheragent.deployment.agent.getpass", lambda _prompt: secret)
+    decisions = iter(
+        [
+            _decision(
+                "WAITING_FOR_INPUT",
+                reason="IAM password is required",
+                required_inputs=["IAM_ADMIN_PASSWORD"],
+                sensitive_inputs=["IAM_ADMIN_PASSWORD"],
+            ),
+            _decision("BLOCKED", reason="secret received"),
+        ]
+    )
+
+    def decide(state, _observation, _last_result, _sources, _cycle):
+        decision = next(decisions)
+        if decision.kind == "BLOCKED":
+            assert state["inputs"]["IAM_ADMIN_PASSWORD"]["available"] is True
+            assert "value" not in state["inputs"]["IAM_ADMIN_PASSWORD"]
+        return decision, {}
+
+    report = run_deployment_agent(task, output, decide=decide)
+    artifacts = "\n".join(
+        path.read_text(errors="replace") for path in output.rglob("*") if path.is_file()
+    )
+    effective_task = json.loads((output / "task.json").read_text())
+    assert report["reason"] == "secret received"
+    assert os.environ["IAM_ADMIN_PASSWORD"] == secret
+    assert secret not in artifacts
+    assert effective_task["inputs"]["IAM_ADMIN_PASSWORD"] == {
+        "from_env": "IAM_ADMIN_PASSWORD",
+        "sensitive": True,
+    }
 
 
 def test_agent_requests_approval_for_a_linked_source(tmp_path: Path) -> None:
