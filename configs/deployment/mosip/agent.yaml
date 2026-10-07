@@ -7,7 +7,7 @@ task:
 
 sources:
   repositories:
-    - location: https://github.com/mosip/infra.git
+    - location: https://github.com/mosip/mosip-infra
 
 environment:
   type: kubernetes
