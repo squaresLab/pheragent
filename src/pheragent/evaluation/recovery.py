@@ -8,7 +8,8 @@ from typing import Any
 from pydantic import Field
 
 from pheragent.deployment.models import ContractModel
-from pheragent.deployment.run_records import run_record_path
+
+from ._legacy_run import run_record_path
 
 
 class RecoveryUsage(ContractModel):

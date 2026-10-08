@@ -5,8 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from pheragent.deployment.enums import SourceKind
-from pheragent.deployment.models import SourcesConfig, SourceSpec
+from pheragent.deployment.models import SourceKind, SourcesConfig, SourceSpec
 from pheragent.deployment.source_manager import SourceManager
 
 

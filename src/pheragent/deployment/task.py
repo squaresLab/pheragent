@@ -8,21 +8,21 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
-class Record(BaseModel):
+class StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
-class SourceLocation(Record):
+class SourceLocation(StrictModel):
     location: str
     revision: str | None = None
 
 
-class TaskSources(Record):
+class TaskSources(StrictModel):
     repositories: list[str | SourceLocation] = Field(default_factory=list)
     documentation: list[str | SourceLocation] = Field(default_factory=list)
 
 
-class Target(Record):
+class Target(StrictModel):
     type: Literal["shell", "kubernetes"]
     kubeconfig: Path | None = None
     context: str | None = None
@@ -35,36 +35,36 @@ class Target(Record):
         return self
 
 
-class Constraints(Record):
+class Constraints(StrictModel):
     allow_new_infrastructure: bool = False
     allow_destructive_actions: bool = False
     allowed_namespaces: list[str] = Field(default_factory=list)
 
 
-class Budgets(Record):
+class Budgets(StrictModel):
     max_cycles: int = Field(default=30, gt=0)
     max_mutating_actions: int = Field(default=20, gt=0)
     max_runtime_minutes: int = Field(default=60, gt=0)
     max_read_actions_per_cycle: int = Field(default=20, gt=0)
 
 
-class ContextSettings(Record):
+class ContextSettings(StrictModel):
     mode: Literal["recent", "summary"] = "recent"
     history_window: int = Field(default=8, gt=0, le=50)
 
 
-class Check(Record):
+class Check(StrictModel):
     command: list[str] = Field(min_length=1)
     contains: str | None = None
     unsatisfied_exit_codes: list[int] = Field(default_factory=list)
 
 
-class TaskGoal(Record):
+class TaskGoal(StrictModel):
     objective: str = Field(min_length=1)
     stop_after_verified_outcomes: int | None = Field(default=None, gt=0)
 
 
-class TaskInput(Record):
+class TaskInput(StrictModel):
     value: str | None = None
     from_env: str | None = None
     from_file: Path | None = None
@@ -80,7 +80,7 @@ class TaskInput(Record):
         return self
 
 
-class DeploymentTask(Record):
+class DeploymentTask(StrictModel):
     task: TaskGoal
     sources: TaskSources
     environment: Target
@@ -99,16 +99,18 @@ class DeploymentTask(Record):
         return self
 
 
-class OverviewChange(Record):
+class OverviewChange(StrictModel):
     operation: Literal["insert_before", "update"]
     step_id: str = Field(min_length=1)
     goal: str = Field(min_length=1)
     success_condition: str = Field(min_length=1)
+    components: list[str] = Field(default_factory=list, max_length=8)
     source_refs: list[str] = Field(min_length=1)
+    related_sources: list[str] = Field(default_factory=list, max_length=12)
     before_step_id: str | None = None
 
 
-class Decision(Record):
+class Decision(StrictModel):
     kind: Literal["ACT", "DONE", "BLOCKED", "ASK_HUMAN", "WAITING_FOR_INPUT"]
     tool: (
         Literal[

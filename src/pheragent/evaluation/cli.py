@@ -9,7 +9,7 @@ from typing import Any
 import yaml
 from pydantic import ValidationError
 
-from pheragent.deployment.analysis_llm import DEFAULT_ANALYSIS_MODEL
+from pheragent.deployment.llm import DEFAULT_MODEL
 from pheragent.deployment.serialization import write_json
 
 from ._judge import PhaseOneJudgeConfig
@@ -153,7 +153,7 @@ def _judge_config(args: argparse.Namespace, output: Path) -> PhaseOneJudgeConfig
         args.model
         or os.getenv("PHERAGENT_MODEL")
         or os.getenv("OPENAI_MODEL")
-        or DEFAULT_ANALYSIS_MODEL
+        or DEFAULT_MODEL
     )
     return PhaseOneJudgeConfig(
         model=model,

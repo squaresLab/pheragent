@@ -1,1 +1,1 @@
-"""Deployment agent, tools, and retained evaluation contracts."""
+"""Progressive deployment agent and its source and runtime tools."""

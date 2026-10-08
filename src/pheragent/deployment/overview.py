@@ -6,35 +6,37 @@ from typing import Literal
 
 from pydantic import Field
 
-from .analysis_llm import CachedStructuredClassifier, strict_response_format
+from .llm import LLMClient
 from .sources import SourceTools
-from .task import OverviewChange, Record
+from .task import OverviewChange, StrictModel
 
 StepStatus = Literal["pending", "active", "verified", "waiting_for_input", "blocked"]
 
 
-class EntrypointSelection(Record):
+class EntrypointSelection(StrictModel):
     route: str = Field(min_length=1)
     files: list[str] = Field(min_length=1, max_length=4)
     reason: str = Field(min_length=1)
 
 
-class OverviewStep(Record):
+class OverviewStep(StrictModel):
     id: str = Field(min_length=1)
     goal: str = Field(min_length=1)
     success_condition: str = Field(min_length=1)
+    components: list[str] = Field(default_factory=list, max_length=8)
     source_refs: list[str] = Field(min_length=1)
+    related_sources: list[str] = Field(default_factory=list, max_length=12)
     status: StepStatus = "pending"
 
 
-class OverviewStage(Record):
+class OverviewStage(StrictModel):
     id: str = Field(min_length=1)
     kind: Literal["prepare", "provision", "deploy", "configure", "initialize", "verify"]
     goal: str = Field(min_length=1)
     steps: list[OverviewStep] = Field(min_length=1, max_length=4)
 
 
-class DeploymentOverview(Record):
+class DeploymentOverview(StrictModel):
     route: str = Field(min_length=1)
     route_evidence: list[str] = Field(min_length=1)
     stages: list[OverviewStage] = Field(min_length=1, max_length=6)
@@ -58,8 +60,10 @@ more than six semantic stages and no more than four steps per stage. This is a t
 overview, not a command transcript or full plan. Stages and steps describe deployable
 outcomes, not host inspection or speculative human inputs. Do not invent commands, runtime
 state, or missing details. Exact commands and inputs are resolved only for the active step.
-For every step, cite one or more selected files in source_refs. These files are the starting
-point for resolving that step, not proof that it is already complete.
+For every step, cite primary selected files in source_refs and list named system components
+only when useful. related_sources may contain relevant exact paths from the supplied neighboring
+files; they are navigation hints, not evidence. Keep both lists small. Primary files are the
+starting point for resolving that step, not proof that it is already complete.
 """
 
 
@@ -69,47 +73,39 @@ def _usage(total: dict[str, int], addition: dict[str, int]) -> None:
 
 
 def create_overview(
-    classifier: CachedStructuredClassifier,
+    client: LLMClient,
     *,
     objective: str,
     target: dict,
     sources: SourceTools,
 ) -> tuple[DeploymentOverview, dict[str, int]]:
     inventory = sources.inventory()
-    selected = classifier.classify(
-        stage="deployment_entrypoints",
-        prompt_version="deployment-entrypoints-v1",
+    selection, selection_usage = client.complete(
+        EntrypointSelection,
         instructions=_ENTRYPOINT_INSTRUCTIONS,
         payload={"objective": objective, "target": target, "inventory": inventory},
-        response_format=strict_response_format(EntrypointSelection, name="entrypoint_selection"),
-        response_model=EntrypointSelection,
-        validate=lambda value: _validate_files(value.files, sources),
     )
-    if selected.value is None:
-        raise RuntimeError(selected.warning or "deployment entrypoint selection failed")
-    documents = [sources.read_file(reference) for reference in selected.value.files]
+    _validate_files(selection.files, sources)
+    documents = [sources.read_file(reference) for reference in selection.files]
     if any(not document.get("complete") for document in documents):
         raise RuntimeError("a selected deployment entrypoint is too large to read in full")
-    planned = classifier.classify(
-        stage="deployment_overview",
-        prompt_version="deployment-overview-v1",
+    related_sources = sources.related_paths(selection.files)
+    plan, plan_usage = client.complete(
+        DeploymentOverview,
         instructions=_OVERVIEW_INSTRUCTIONS,
         payload={
             "objective": objective,
             "target": target,
-            "route": selected.value.model_dump(),
+            "route": selection.model_dump(),
             "documents": documents,
+            "related_sources": related_sources,
         },
-        response_format=strict_response_format(DeploymentOverview, name="deployment_overview"),
-        response_model=DeploymentOverview,
-        validate=lambda value: _validate_overview(value, sources),
     )
-    if planned.value is None:
-        raise RuntimeError(planned.warning or "deployment overview failed")
-    overview = planned.value.model_copy(
+    _validate_overview(plan, sources)
+    overview = plan.model_copy(
         update={
-            "route": selected.value.route,
-            "route_evidence": selected.value.files,
+            "route": selection.route,
+            "route_evidence": selection.files,
             "discoveries": [],
             "stages": [
                 stage.model_copy(
@@ -119,13 +115,13 @@ def create_overview(
                         ]
                     }
                 )
-                for stage in planned.value.stages
+                for stage in plan.stages
             ],
         }
     )
     usage: dict[str, int] = {}
-    _usage(usage, selected.usage)
-    _usage(usage, planned.usage)
+    _usage(usage, selection_usage)
+    _usage(usage, plan_usage)
     return overview, usage
 
 
@@ -155,7 +151,7 @@ def set_discoveries(overview: DeploymentOverview, discoveries: list[str]) -> Non
 def apply_change(
     overview: DeploymentOverview, change: OverviewChange, sources: SourceTools
 ) -> None:
-    missing = set(change.source_refs) - sources.readable_paths
+    missing = set(change.source_refs + change.related_sources) - sources.readable_paths
     if missing:
         raise ValueError(f"overview evidence is absent from inventory: {sorted(missing)}")
     existing = [
@@ -166,7 +162,9 @@ def apply_change(
             raise ValueError("only one unverified overview step can be updated")
         existing[0].goal = change.goal
         existing[0].success_condition = change.success_condition
+        existing[0].components = change.components
         existing[0].source_refs = change.source_refs
+        existing[0].related_sources = change.related_sources
     else:
         if existing or not change.before_step_id:
             raise ValueError("inserted steps need a new ID and before_step_id")
@@ -179,7 +177,9 @@ def apply_change(
                             id=change.step_id,
                             goal=change.goal,
                             success_condition=change.success_condition,
+                            components=change.components,
                             source_refs=change.source_refs,
+                            related_sources=change.related_sources,
                         ),
                     )
                     overview.revision += 1
@@ -205,7 +205,7 @@ def _validate_overview(overview: DeploymentOverview, sources: SourceTools | None
         missing = {
             reference
             for step in steps
-            for reference in step.source_refs
+            for reference in step.source_refs + step.related_sources
             if reference not in sources.readable_paths
         }
         if missing:

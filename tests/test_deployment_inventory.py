@@ -5,11 +5,15 @@ from types import SimpleNamespace
 
 import pytest
 
-from pheragent.deployment.enums import InventoryCategory, SourceKind
 from pheragent.deployment.inventory import RepositoryInventoryBuilder, classify_file
-from pheragent.deployment.models import SourceManifestEntry, SourceSpec
+from pheragent.deployment.models import (
+    InventoryCategory,
+    SourceKind,
+    SourceManifestEntry,
+    SourceSpec,
+)
 from pheragent.deployment.source_manager import AcquiredSource
-from pheragent.deployment.sources import SourceTools, _source_grounded
+from pheragent.deployment.sources import SourceTools
 
 
 def _source(path: Path, *, include: list[str] | None = None) -> AcquiredSource:
@@ -109,13 +113,12 @@ def test_source_tools_search_build_file_and_read_unfamiliar_safe_text(tmp_path: 
     assert read("instructions.custom")["text"] == "Run make start."
     inventory = tools.call(SimpleNamespace(tool="inventory_sources"))
     assert "instructions.custom" in inventory["tree"]
-    assert _source_grounded(
+    assert tools.grounds(
         SimpleNamespace(
             command=["make", "start"],
             evidence=["fixture:instructions.custom"],
             working_directory=None,
-        ),
-        tools,
+        )
     )
     for name in ("binary.dat", "assets/excluded.png"):
         with pytest.raises(ValueError, match="readable inventory"):
@@ -129,9 +132,11 @@ def test_source_inventory_maps_local_deployment_references(tmp_path: Path) -> No
     (docs / "run.md").write_text("Run `make start`.\n")
     (tmp_path / "Makefile").write_text("start:\n\tdocker compose up -d\n")
 
-    result = SourceTools((_source(tmp_path),)).call(SimpleNamespace(tool="inventory_sources"))
+    tools = SourceTools((_source(tmp_path),))
+    result = tools.call(SimpleNamespace(tool="inventory_sources"))
 
     assert {"from": "fixture:README.md", "to": "fixture:docs/run.md"} in result["references"]
+    assert tools.related_paths(["fixture:README.md"]) == ["fixture:docs/run.md"]
 
 
 def test_source_inventory_shows_root_entrypoint_before_deep_files(tmp_path: Path) -> None:

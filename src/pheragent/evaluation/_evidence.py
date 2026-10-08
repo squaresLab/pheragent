@@ -6,8 +6,9 @@ from pathlib import Path, PurePosixPath
 
 import yaml
 
-from pheragent.deployment.analysis_models import DeploymentContext
 from pheragent.deployment.redaction import redact_secrets
+
+from ._legacy_models import DeploymentContext
 
 _IGNORED_DIRECTORIES = {
     ".git",

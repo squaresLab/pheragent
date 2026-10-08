@@ -309,7 +309,7 @@ def test_llm_judge_resolves_semantic_metrics_with_redacted_evidence(
 
     monkeypatch.setenv("TEST_OPENAI_KEY", "test-key")
     monkeypatch.setattr(
-        "pheragent.deployment.analysis_llm._openai_client",
+        "pheragent.deployment.llm._openai_client",
         lambda **_kwargs: SimpleNamespace(responses=Responses()),
     )
     config = PhaseOneJudgeConfig(
@@ -356,7 +356,7 @@ def test_llm_judge_failure_preserves_deterministic_results(
 
     monkeypatch.setenv("TEST_OPENAI_KEY", "test-key")
     monkeypatch.setattr(
-        "pheragent.deployment.analysis_llm._openai_client",
+        "pheragent.deployment.llm._openai_client",
         lambda **_kwargs: SimpleNamespace(responses=Responses()),
     )
     config = PhaseOneJudgeConfig(
@@ -764,7 +764,7 @@ def _names_overlap(left: str, right: str) -> bool:
 def _mock_openai(monkeypatch, responses_type) -> None:
     monkeypatch.setenv("TEST_OPENAI_KEY", "test-key")
     monkeypatch.setattr(
-        "pheragent.deployment.analysis_llm._openai_client",
+        "pheragent.deployment.llm._openai_client",
         lambda **_kwargs: SimpleNamespace(responses=responses_type()),
     )
 

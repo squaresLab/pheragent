@@ -1,10 +1,8 @@
 from __future__ import annotations
 
 from pathlib import Path
-from types import SimpleNamespace
 
-from pheragent.deployment.enums import SourceKind
-from pheragent.deployment.models import SourceManifestEntry, SourceSpec
+from pheragent.deployment.models import SourceKind, SourceManifestEntry, SourceSpec
 from pheragent.deployment.overview import (
     DeploymentOverview,
     EntrypointSelection,
@@ -43,13 +41,16 @@ def _source(path: Path) -> AcquiredSource:
 def test_model_selects_route_then_builds_overview_from_complete_files(tmp_path: Path) -> None:
     (tmp_path / "README.md").write_text("See [run guide](docs/run.md).\n")
     (tmp_path / "docs").mkdir()
-    guide = "\n".join(f"line {line}" for line in range(1, 151))
+    guide = "See [service details](details.md).\n" + "\n".join(
+        f"line {line}" for line in range(2, 151)
+    )
     (tmp_path / "docs/run.md").write_text(guide)
+    (tmp_path / "docs/details.md").write_text("The frontend is the user-facing service.\n")
     sources = SourceTools((_source(tmp_path),))
 
-    class Classifier:
-        def classify(self, *, stage, payload, validate, **_kwargs):
-            if stage == "deployment_entrypoints":
+    class Client:
+        def complete(self, response_model, *, payload, **_kwargs):
+            if response_model is EntrypointSelection:
                 value = EntrypointSelection(
                     route="documented local route",
                     files=["repository-1:README.md", "repository-1:docs/run.md"],
@@ -57,6 +58,7 @@ def test_model_selects_route_then_builds_overview_from_complete_files(tmp_path: 
                 )
             else:
                 assert payload["documents"][1]["text"].endswith("line 150")
+                assert payload["related_sources"] == ["repository-1:docs/details.md"]
                 value = DeploymentOverview.model_validate(
                     {
                         "route": "placeholder",
@@ -71,18 +73,21 @@ def test_model_selects_route_then_builds_overview_from_complete_files(tmp_path: 
                                         "id": "deploy.app",
                                         "goal": "start services",
                                         "success_condition": "services are healthy",
+                                        "components": ["frontend"],
                                         "source_refs": ["repository-1:docs/run.md"],
+                                        "related_sources": [
+                                            "repository-1:docs/details.md"
+                                        ],
                                     }
                                 ],
                             }
                         ],
                     }
                 )
-            validate(value)
-            return SimpleNamespace(value=value, usage={"requests": 1}, warning=None)
+            return value, {"requests": 1}
 
     overview, usage = create_overview(
-        Classifier(),
+        Client(),
         objective="Deploy sample",
         target={"type": "shell"},
         sources=sources,
@@ -92,6 +97,8 @@ def test_model_selects_route_then_builds_overview_from_complete_files(tmp_path: 
     assert overview.route_evidence == ["repository-1:README.md", "repository-1:docs/run.md"]
     assert active_step(overview).id == "deploy.app"
     assert active_step(overview).source_refs == ["repository-1:docs/run.md"]
+    assert active_step(overview).components == ["frontend"]
+    assert active_step(overview).related_sources == ["repository-1:docs/details.md"]
     assert usage == {"requests": 2}
     set_discoveries(overview, ["database endpoint missing", "database endpoint missing"])
     assert overview.discoveries == ["database endpoint missing"]

@@ -10,9 +10,8 @@ import shutil
 from pathlib import Path, PurePosixPath
 from urllib.parse import urlsplit
 
-from .enums import SourceKind
 from .inventory import RepositoryInventoryBuilder
-from .models import SourceSpec
+from .models import SourceKind, SourceSpec
 from .redaction import redact_secrets
 from .retrieval import DeploymentRetrievalEngine, RetrievalQuery
 from .source_manager import AcquiredSource
@@ -153,6 +152,17 @@ class SourceTools:
             for source, target in sorted(edges)[:500]
         ]
 
+    def related_paths(self, references: list[str], limit: int = 100) -> list[str]:
+        selected = set(references)
+        neighbors = {
+            endpoint
+            for edge in self.reference_graph()
+            if edge["from"] in selected or edge["to"] in selected
+            for endpoint in edge.values()
+            if endpoint not in selected
+        }
+        return sorted(neighbors)[:limit]
+
     def entrypoint_candidates(self) -> list[str]:
         candidates = []
         for reference in self.paths:
@@ -248,6 +258,49 @@ class SourceTools:
             "references": self.reference_graph(),
         }
 
+    def working_directory(self, decision: Decision, workspace: Path) -> Path | None:
+        if not decision.working_directory:
+            return None
+        source_id, separator, relative = decision.working_directory.partition(":")
+        if not separator and source_id in self.sources:
+            relative = "."
+        if source_id not in self.sources:
+            raise ValueError("working_directory must be source-id:relative/directory")
+        source = self.sources[source_id]
+        path = source.resolve_path(relative)
+        if not path.is_dir():
+            raise ValueError("working_directory does not exist")
+        copy = workspace / source_id
+        if not copy.exists():
+            copy.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copytree(
+                source.path,
+                copy,
+                symlinks=True,
+                ignore=shutil.ignore_patterns(".git", ".pheragent"),
+            )
+        return copy / path.relative_to(source.path)
+
+    def grounds(self, decision: Decision) -> bool:
+        evidence = self.existing_refs(decision.evidence)
+        if decision.working_directory and decision.command[0].startswith("./"):
+            source_id, _, directory = decision.working_directory.partition(":")
+            path = (PurePosixPath(directory or ".") / decision.command[0]).as_posix()
+            if f"{source_id}:{path}" in evidence:
+                return True
+        rendered = shlex.join(decision.command)
+        plain = " ".join(decision.command)
+        for reference in evidence:
+            source_id, _, path = reference.partition(":")
+            if source_id not in self.sources or reference not in self.readable_paths:
+                continue
+            content = self.sources[source_id].resolve_path(path).read_text(
+                encoding="utf-8", errors="replace"
+            )
+            if rendered in content or plain in content:
+                return True
+        return False
+
     def call(self, decision: Decision) -> dict:
         if decision.tool == "inventory_sources":
             return self.inventory()
@@ -283,47 +336,3 @@ class SourceTools:
                 decision.source_path, decision.start_line, decision.end_line
             )
         raise ValueError("unknown source tool")
-
-
-def _source_cwd(decision: Decision, sources: SourceTools, workspace: Path) -> Path | None:
-    if not decision.working_directory:
-        return None
-    source_id, separator, relative = decision.working_directory.partition(":")
-    if not separator and source_id in sources.sources:
-        relative = "."
-    if source_id not in sources.sources:
-        raise ValueError("working_directory must be source-id:relative/directory")
-    source = sources.sources[source_id]
-    path = source.resolve_path(relative)
-    if not path.is_dir():
-        raise ValueError("working_directory does not exist")
-    copy = workspace / source_id
-    if not copy.exists():
-        copy.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copytree(
-            source.path, copy, symlinks=True, ignore=shutil.ignore_patterns(".git", ".pheragent")
-        )
-    return copy / path.relative_to(source.path)
-
-
-def _source_grounded(decision: Decision, sources: SourceTools) -> bool:
-    evidence = sources.existing_refs(decision.evidence)
-    if decision.working_directory and decision.command[0].startswith("./"):
-        source_id, _, directory = decision.working_directory.partition(":")
-        path = (PurePosixPath(directory or ".") / decision.command[0]).as_posix()
-        if f"{source_id}:{path}" in evidence:
-            return True
-    rendered = shlex.join(decision.command)
-    plain = " ".join(decision.command)
-    for ref in evidence:
-        source_id, _, path = ref.partition(":")
-        if source_id not in sources.sources or ref not in sources.readable_paths:
-            continue
-        content = (
-            sources.sources[source_id]
-            .resolve_path(path)
-            .read_text(encoding="utf-8", errors="replace")
-        )
-        if rendered in content or plain in content:
-            return True
-    return False

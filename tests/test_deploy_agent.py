@@ -9,10 +9,19 @@ import pytest
 import yaml
 
 from pheragent.cli import main as pheragent_main
-from pheragent.deployment.agent import _INSTRUCTIONS, _brief, run_deployment_agent
-from pheragent.deployment.enums import SourceKind
-from pheragent.deployment.models import SourcesConfig
-from pheragent.deployment.runtime import _checks, _execute, _inspect, _policy, _target_command
+from pheragent.deployment.agent import (
+    _INNER_LOOP_INSTRUCTIONS,
+    compact_context,
+    run_deployment_agent,
+)
+from pheragent.deployment.models import SourceKind, SourcesConfig
+from pheragent.deployment.runtime import (
+    classify_command,
+    execute_action,
+    inspect_target,
+    run_checks,
+    target_command,
+)
 from pheragent.deployment.source_manager import SourceManager
 from pheragent.deployment.task import Check, Decision, DeploymentTask
 
@@ -486,21 +495,25 @@ def test_sensitive_input_cannot_be_stored_inline() -> None:
 
 
 def test_agent_prompt_requires_route_choice_and_deployment_progress() -> None:
-    assert "senior DevOps engineer" in _INSTRUCTIONS
-    assert "step by step" in _INSTRUCTIONS
-    assert "selected_route" in _INSTRUCTIONS
+    assert "senior DevOps engineer" in _INNER_LOOP_INSTRUCTIONS
+    assert "active_step" in _INNER_LOOP_INSTRUCTIONS
+    assert "private chain-of-thought" in _INNER_LOOP_INSTRUCTIONS
 
 
 def test_agent_prompt_expands_missing_prerequisites_before_blocking() -> None:
-    assert "missing prerequisite" in _INSTRUCTIONS
-    assert "configured sources" in _INSTRUCTIONS
-    assert "resume the original objective" in " ".join(_INSTRUCTIONS.split())
-    assert "validation" in _INSTRUCTIONS
+    assert "missing prerequisite" in _INNER_LOOP_INSTRUCTIONS
+    assert "source-supported" in _INNER_LOOP_INSTRUCTIONS
+    assert "return to the original" in " ".join(_INNER_LOOP_INSTRUCTIONS.split())
+    assert "validation" in _INNER_LOOP_INSTRUCTIONS
 
 
 def test_agent_prompt_requires_source_defined_validation_semantics() -> None:
-    assert "unsatisfied_exit_codes" in _INSTRUCTIONS
-    assert "reuse the same validation" in " ".join(_INSTRUCTIONS.split()).casefold()
+    assert "zero exit code does not prove success" in " ".join(
+        _INNER_LOOP_INSTRUCTIONS.split()
+    ).casefold()
+    assert "do not retry a failed command" in " ".join(
+        _INNER_LOOP_INSTRUCTIONS.split()
+    ).casefold()
 
 
 def test_agent_validates_prerequisite_then_resumes_original_goal(tmp_path: Path) -> None:
@@ -568,7 +581,7 @@ def test_agent_validates_prerequisite_then_resumes_original_goal(tmp_path: Path)
 
 def test_brief_retains_a_long_result_start_and_end() -> None:
     result = "Default route is in this header.\n" + "x" * 7000 + "\nLast error is here."
-    brief = _brief(result)
+    brief = compact_context(result)
     assert "Default route" in brief
     assert "Last error" in brief
     assert len(brief) < len(result)
@@ -576,7 +589,7 @@ def test_brief_retains_a_long_result_start_and_end() -> None:
 
 def test_brief_keeps_a_complete_selected_file_intact() -> None:
     text = "header\n" + "deployment step\n" * 600 + "make start\n"
-    brief = _brief({"complete": True, "text": text, "total_lines": 602})
+    brief = compact_context({"complete": True, "text": text, "total_lines": 602})
     assert brief["text"] == text
 
 
@@ -588,8 +601,12 @@ def test_policy_denies_direct_and_disguised_destructive_commands() -> None:
             "environment": {"type": "shell", "sandbox": True},
         }
     )
-    assert _policy(["/bin/rm", "-rf", "/tmp/sample"], task, mutating=True).startswith("denied")
-    assert _policy(["bash", "-c", "rm -rf /tmp/sample"], task, mutating=True).startswith("denied")
+    assert classify_command(["/bin/rm", "-rf", "/tmp/sample"], task, mutating=True).startswith(
+        "denied"
+    )
+    assert classify_command(
+        ["bash", "-c", "rm -rf /tmp/sample"], task, mutating=True
+    ).startswith("denied")
 
 
 def test_kubernetes_actions_use_the_declared_context() -> None:
@@ -601,7 +618,7 @@ def test_kubernetes_actions_use_the_declared_context() -> None:
             "constraints": {"allowed_namespaces": ["*"]},
         }
     )
-    assert _target_command(["kubectl", "get", "pods"], task) == [
+    assert target_command(["kubectl", "get", "pods"], task) == [
         "kubectl",
         "--context",
         "target-cluster",
@@ -609,7 +626,7 @@ def test_kubernetes_actions_use_the_declared_context() -> None:
         "pods",
     ]
     with pytest.raises(ValueError, match="must match the declared target context"):
-        _target_command(["kubectl", "--context", "other", "get", "pods"], task)
+        target_command(["kubectl", "--context", "other", "get", "pods"], task)
 
 
 def test_matching_context_storage_check_is_read_only() -> None:
@@ -621,8 +638,8 @@ def test_matching_context_storage_check_is_read_only() -> None:
         }
     )
     command = ["kubectl", "--context", "test-cluster", "get", "storageclass"]
-    assert _policy(command, task, mutating=False) == "allowed"
-    assert _target_command(command, task) == command
+    assert classify_command(command, task, mutating=False) == "allowed"
+    assert target_command(command, task) == command
 
 
 def test_kubernetes_global_options_do_not_hide_a_read_only_verb() -> None:
@@ -643,7 +660,7 @@ def test_kubernetes_global_options_do_not_hide_a_read_only_verb() -> None:
         "-o",
         "wide",
     ]
-    assert _policy(command, task, mutating=False) == "allowed"
+    assert classify_command(command, task, mutating=False) == "allowed"
 
 
 @pytest.mark.parametrize(
@@ -701,7 +718,7 @@ def test_supported_read_only_probes(command: list[str]) -> None:
             "environment": {"type": "kubernetes", "context": "target-cluster"},
         }
     )
-    assert _policy(command, task, mutating=False) == "allowed"
+    assert classify_command(command, task, mutating=False) == "allowed"
 
 
 @pytest.mark.parametrize(
@@ -730,11 +747,11 @@ def test_commands_not_known_to_be_read_only_require_review(command: list[str]) -
             "environment": {"type": "kubernetes", "context": "target-cluster"},
         }
     )
-    assert _policy(command, task, mutating=False).startswith(
+    assert classify_command(command, task, mutating=False).startswith(
         ("approval_required", "high_risk_approval", "denied")
     )
     if command[0] == "aws":
-        assert _policy(command, task, mutating=True).startswith("denied")
+        assert classify_command(command, task, mutating=True).startswith("denied")
 
 
 def test_policy_uses_review_as_the_default_for_unknown_mutations() -> None:
@@ -745,7 +762,9 @@ def test_policy_uses_review_as_the_default_for_unknown_mutations() -> None:
             "environment": {"type": "shell"},
         }
     )
-    assert _policy(["make", "start"], task, mutating=True).startswith("approval_required")
+    assert classify_command(["make", "start"], task, mutating=True).startswith(
+        "approval_required"
+    )
 
 
 @pytest.mark.parametrize(
@@ -771,7 +790,7 @@ def test_high_risk_changes_have_a_distinct_review_tier(command: list[str]) -> No
             },
         }
     )
-    assert _policy(command, task, mutating=True).startswith("high_risk_approval")
+    assert classify_command(command, task, mutating=True).startswith("high_risk_approval")
 
 
 def test_read_only_execute_is_observed_without_approval(tmp_path: Path, monkeypatch) -> None:
@@ -788,7 +807,7 @@ def test_read_only_execute_is_observed_without_approval(tmp_path: Path, monkeypa
             }
         )
     )
-    monkeypatch.setattr("pheragent.deployment.agent._observe", lambda _task: {})
+    monkeypatch.setattr("pheragent.deployment.agent.observe_target", lambda _task: {})
     observed = []
 
     def inspect(command, _task, **_kwargs):
@@ -825,7 +844,7 @@ def test_observation_uses_selected_source_directory(tmp_path: Path, monkeypatch)
     task = tmp_path / "task.yaml"
     output = tmp_path / "run"
     _task(task, source, output)
-    monkeypatch.setattr("pheragent.deployment.agent._observe", lambda _task: {})
+    monkeypatch.setattr("pheragent.deployment.agent.observe_target", lambda _task: {})
     working_directories = []
 
     def inspect(_command, _task, **kwargs):
@@ -882,7 +901,7 @@ def test_unknown_observation_can_receive_one_time_human_approval(
         lambda command, _task, **_kwargs: commands.append(command)
         or {"exit_code": 0, "stdout": "ready", "stderr": ""},
     )
-    result = _inspect(
+    result = inspect_target(
         decision,
         task,
         object(),
@@ -902,7 +921,7 @@ def test_reworded_denied_observations_stop_early(tmp_path: Path, monkeypatch) ->
     task = tmp_path / "task.yaml"
     output = tmp_path / "run"
     _task(task, source, output)
-    monkeypatch.setattr("pheragent.deployment.agent._observe", lambda _task: {})
+    monkeypatch.setattr("pheragent.deployment.agent.observe_target", lambda _task: {})
     commands = iter(
         [
             ["kubectl", "config", "use-context", "first"],
@@ -932,10 +951,10 @@ def test_unfamiliar_mutation_requires_review_and_wrong_context_is_denied() -> No
             "constraints": {"allowed_namespaces": ["postgres"]},
         }
     )
-    assert _policy(
+    assert classify_command(
         ["kubectl", "label", "pod", "db", "tested=yes", "-n", "postgres"], task, mutating=True
     ).startswith("approval_required")
-    assert _policy(
+    assert classify_command(
         ["kubectl", "--context", "other-cluster", "get", "pods"], task, mutating=False
     ).startswith("denied")
 
@@ -1007,6 +1026,12 @@ def test_kubernetes_change_waits_for_terminal_approval(
         def existing_refs(self, _references):
             return {"repository-1:README.md"}
 
+        def working_directory(self, _decision, _workspace):
+            return None
+
+        def grounds(self, _decision):
+            return True
+
     class Terminal(io.StringIO):
         def isatty(self):
             return True
@@ -1030,7 +1055,9 @@ def test_kubernetes_change_waits_for_terminal_approval(
 
     monkeypatch.setattr("pheragent.deployment.runtime.sys.stdin", Terminal(answer))
     monkeypatch.setattr("pheragent.deployment.runtime._command", run_command)
-    result = _execute(decision, task, Evidence(), tmp_path, enabled=True, approve=False, timeout=10)
+    result = execute_action(
+        decision, task, Evidence(), tmp_path, enabled=True, approve=False, timeout=10
+    )
     assert (result["status"] == "validated") is should_run
     prompt = capsys.readouterr().out
     assert prompt_text in prompt
@@ -1250,15 +1277,22 @@ def test_unknown_preflight_does_not_execute(tmp_path: Path, monkeypatch) -> None
         def existing_refs(self, _references):
             return {"repository-1:README.md"}
 
+        def working_directory(self, _decision, _workspace):
+            return None
+
+        def grounds(self, _decision):
+            return True
+
     calls = []
 
     def cannot_read(command, _task, **_kwargs):
         calls.append(command)
         return {"exit_code": 1, "stdout": "", "stderr": "Permission denied"}
 
-    monkeypatch.setattr("pheragent.deployment.runtime._source_grounded", lambda *_args: True)
     monkeypatch.setattr("pheragent.deployment.runtime._command", cannot_read)
-    result = _execute(decision, task, Evidence(), tmp_path, enabled=True, approve=False, timeout=10)
+    result = execute_action(
+        decision, task, Evidence(), tmp_path, enabled=True, approve=False, timeout=10
+    )
     assert result["status"] == "needs_better_check"
     assert calls == [["ls", str(tmp_path / "ready")]]
 
@@ -1288,7 +1322,7 @@ def test_checks_use_declared_generic_outcomes(tmp_path: Path, monkeypatch) -> No
         Check(command=["docker", "inspect", "demo"], unsatisfied_exit_codes=[1]),
         Check(command=["docker", "inspect", "demo"], unsatisfied_exit_codes=[1]),
     ]
-    assert [item["status"] for item in _checks(task, checks, tmp_path)] == [
+    assert [item["status"] for item in run_checks(task, checks, tmp_path)] == [
         "satisfied",
         "unsatisfied",
         "unsatisfied",
@@ -1322,6 +1356,12 @@ def test_declared_unsatisfied_preflight_allows_execution(tmp_path: Path, monkeyp
         def existing_refs(self, _references):
             return {"repository-1:README.md"}
 
+        def working_directory(self, _decision, _workspace):
+            return None
+
+        def grounds(self, _decision):
+            return True
+
     responses = iter(
         [
             {"exit_code": 1, "stdout": "", "stderr": "not found"},
@@ -1329,11 +1369,12 @@ def test_declared_unsatisfied_preflight_allows_execution(tmp_path: Path, monkeyp
             {"exit_code": 0, "stdout": "demo", "stderr": ""},
         ]
     )
-    monkeypatch.setattr("pheragent.deployment.runtime._source_grounded", lambda *_args: True)
     monkeypatch.setattr(
         "pheragent.deployment.runtime._command", lambda *_args, **_kwargs: next(responses)
     )
-    result = _execute(decision, task, Evidence(), tmp_path, enabled=True, approve=True, timeout=10)
+    result = execute_action(
+        decision, task, Evidence(), tmp_path, enabled=True, approve=True, timeout=10
+    )
     assert result["status"] == "validated"
     assert result["before_unsatisfied"] is True
 
@@ -1364,14 +1405,21 @@ def test_successful_command_without_verified_change_is_failure(tmp_path: Path, m
         def existing_refs(self, _references):
             return {"repository-1:README.md"}
 
+        def working_directory(self, _decision, _workspace):
+            return None
+
+        def grounds(self, _decision):
+            return True
+
     def run_command(command, _task, **_kwargs):
         if command[0] == "ls":
             return {"exit_code": 1, "stdout": "", "stderr": "No such file or directory"}
         return {"exit_code": 0, "stdout": "", "stderr": ""}
 
-    monkeypatch.setattr("pheragent.deployment.runtime._source_grounded", lambda *_args: True)
     monkeypatch.setattr("pheragent.deployment.runtime._command", run_command)
-    result = _execute(decision, task, Evidence(), tmp_path, enabled=True, approve=True, timeout=0)
+    result = execute_action(
+        decision, task, Evidence(), tmp_path, enabled=True, approve=True, timeout=0
+    )
     assert result["status"] == "verification_failed"
     assert result["execution"]["exit_code"] == 0
 
@@ -1394,13 +1442,13 @@ def test_delayed_readiness_is_verified_before_next_action(tmp_path: Path, monkey
     def delayed_checks(task, checks, cwd=None):
         nonlocal reads
         reads += 1
-        result = _checks(task, checks, cwd)
+        result = run_checks(task, checks, cwd)
         if reads == 2:
             result[0]["status"] = "unsatisfied"
         return result
 
     monkeypatch.setattr("pheragent.deployment.runtime.time.sleep", lambda _seconds: None)
-    monkeypatch.setattr("pheragent.deployment.runtime._checks", delayed_checks)
+    monkeypatch.setattr("pheragent.deployment.runtime.run_checks", delayed_checks)
     decision = _decision(
         "ACT",
         "execute",

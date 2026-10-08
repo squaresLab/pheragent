@@ -10,7 +10,7 @@ import time
 from pathlib import Path
 
 from .redaction import redact_secrets
-from .sources import SourceTools, _source_cwd, _source_grounded
+from .sources import SourceTools
 from .task import Check, Decision, DeploymentTask
 
 _READ_KUBECTL = {
@@ -142,7 +142,7 @@ def _without_target_context(command: list[str], task: DeploymentTask) -> list[st
     return [command[0], *arguments]
 
 
-def _target_command(command: list[str], task: DeploymentTask) -> list[str]:
+def target_command(command: list[str], task: DeploymentTask) -> list[str]:
     command = _without_target_context(command, task)
     if task.environment.type == "kubernetes" and command[0] in {"kubectl", "helm"}:
         flag = "--context" if command[0] == "kubectl" else "--kube-context"
@@ -231,7 +231,7 @@ def _read_only(command: list[str]) -> bool:
     }
 
 
-def _inspect(
+def inspect_target(
     decision: Decision,
     task: DeploymentTask,
     sources: SourceTools,
@@ -240,7 +240,7 @@ def _inspect(
     enabled: bool,
     approve: bool,
 ) -> dict:
-    policy = _policy(decision.command, task, mutating=False)
+    policy = classify_command(decision.command, task, mutating=False)
     if policy.startswith("denied"):
         return {"error": policy}
     if policy != "allowed":
@@ -255,7 +255,7 @@ def _inspect(
             confirmation = "approve" if high_risk else "y"
             print(
                 f"Approve {'HIGH-RISK ' if high_risk else ''}unclassified observation?\n"
-                f"Command: {shlex.join(_target_command(decision.command, task))}\n"
+                f"Command: {shlex.join(target_command(decision.command, task))}\n"
                 f"Reason: {decision.reason}\nPolicy: {policy}\n"
                 f"[{'type approve' if high_risk else 'y'}/N] ",
                 end="",
@@ -264,8 +264,8 @@ def _inspect(
             accepted = input().strip().casefold() == confirmation
         if not accepted:
             return {"status": "blocked", "reason": policy}
-    cwd = _source_cwd(decision, sources, workspace)
-    return _command(_target_command(decision.command, task), task, cwd=cwd)
+    cwd = sources.working_directory(decision, workspace) if decision.working_directory else None
+    return _command(target_command(decision.command, task), task, cwd=cwd)
 
 
 def _high_risk(command: list[str]) -> str | None:
@@ -296,7 +296,7 @@ def _infrastructure_change(command: list[str]) -> bool:
     return Path(command[0]).name in {"aws", "az", "gcloud", "terraform"} and not _read_only(command)
 
 
-def _policy(command: list[str], task: DeploymentTask, *, mutating: bool) -> str:
+def classify_command(command: list[str], task: DeploymentTask, *, mutating: bool) -> str:
     if not command or Path(command[0]).name in _DENIED:
         return "denied: forbidden command"
     if Path(command[0]).name in {"sh", "bash", "zsh", "python", "python3", "perl", "ruby"} and any(
@@ -352,7 +352,7 @@ def _policy(command: list[str], task: DeploymentTask, *, mutating: bool) -> str:
     return "approval_required: deployment changes require human review"
 
 
-def _observe(task: DeploymentTask) -> dict:
+def observe_target(task: DeploymentTask) -> dict:
     if task.environment.type == "shell":
         return {
             "host": _command(["uname", "-a"], task),
@@ -380,11 +380,11 @@ def _observe(task: DeploymentTask) -> dict:
     }
 
 
-def _checks(task: DeploymentTask, checks: list[Check], cwd: Path | None = None) -> list[dict]:
+def run_checks(task: DeploymentTask, checks: list[Check], cwd: Path | None = None) -> list[dict]:
     results = []
     for check in checks:
-        command = _target_command(check.command, task)
-        policy = _policy(check.command, task, mutating=False)
+        command = target_command(check.command, task)
+        policy = classify_command(check.command, task, mutating=False)
         result = (
             _command(command, task, cwd=cwd)
             if policy == "allowed"
@@ -408,7 +408,7 @@ def _checks(task: DeploymentTask, checks: list[Check], cwd: Path | None = None) 
     return results
 
 
-def _execute(
+def execute_action(
     decision: Decision,
     task: DeploymentTask,
     sources: SourceTools,
@@ -428,10 +428,10 @@ def _execute(
             "status": "needs_revision",
             "reason": "mutation needs an inventoried source file as evidence",
         }
-    policy = _policy(decision.command, task, mutating=True)
+    policy = classify_command(decision.command, task, mutating=True)
     if decision.command[0].startswith("./") and not decision.working_directory:
         return {"status": "needs_revision", "reason": "source script needs a working directory"}
-    if policy == "allowed" and not _source_grounded(decision, sources):
+    if policy == "allowed" and not sources.grounds(decision):
         policy = "approval_required: command is not shown by its cited source"
     if policy.startswith("denied"):
         return {"status": "policy_denied", "reason": policy}
@@ -449,14 +449,14 @@ def _execute(
                 "status": "blocked",
                 "reason": "source script would use a different Kubernetes context",
             }
-    cwd = _source_cwd(decision, sources, workspace)
-    before = _checks(task, decision.validation, cwd)
+    cwd = sources.working_directory(decision, workspace) if decision.working_directory else None
+    before = run_checks(task, decision.validation, cwd)
     if all(item["status"] == "satisfied" for item in before):
         return {
             "status": "already_satisfied",
             "reason": "the proposed outcome already passes; choose another gap or a stronger check",
             "before": before,
-            "command": _target_command(decision.command, task),
+            "command": target_command(decision.command, task),
         }
     if any(item["status"] == "unknown" for item in before):
         return {
@@ -466,7 +466,7 @@ def _execute(
                 "its unsatisfied exit codes"
             ),
             "before": before,
-            "command": _target_command(decision.command, task),
+            "command": target_command(decision.command, task),
         }
     needs_review = policy.startswith("high_risk_approval") or (
         policy.startswith("approval_required") and not approve
@@ -481,7 +481,7 @@ def _execute(
             f"{task.environment.context or task.environment.type}\n"
             f"Change: {decision.expected_change}\n"
             f"Source: {decision.working_directory or ', '.join(decision.evidence)}\n"
-            f"Command: {shlex.join(_target_command(decision.command, task))}\n"
+            f"Command: {shlex.join(target_command(decision.command, task))}\n"
             f"Check: {'; '.join(shlex.join(check.command) for check in decision.validation)}\n"
             f"Reason: {decision.reason}\nPolicy: {policy}\n"
             f"[{'type approve' if high_risk else 'y'}/N] ",
@@ -494,10 +494,10 @@ def _execute(
                 "reason": "human declined action",
                 "command": decision.command,
             }
-    command = _target_command(decision.command, task)
+    command = target_command(decision.command, task)
     deadline = time.monotonic() + timeout
     result = _command(command, task, cwd=cwd, timeout=timeout, output_limit=None)
-    after = _checks(task, decision.validation, cwd)
+    after = run_checks(task, decision.validation, cwd)
     deadline = min(deadline, time.monotonic() + 300)
     while result["exit_code"] == 0 and not all(
         item["status"] == "satisfied" for item in after
@@ -506,7 +506,7 @@ def _execute(
         if remaining <= 0:
             break
         time.sleep(min(5, remaining))
-        after = _checks(task, decision.validation, cwd)
+        after = run_checks(task, decision.validation, cwd)
     return {
         "status": (
             "command_failed"

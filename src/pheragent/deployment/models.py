@@ -1,13 +1,34 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+from enum import StrEnum
 from typing import Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from .enums import InventoryCategory, SourceKind
-
 IDENTIFIER_PATTERN = r"^[a-z0-9](?:[a-z0-9._-]*[a-z0-9])?$"
+
+
+class SourceKind(StrEnum):
+    GIT = "git"
+    LOCAL_DIRECTORY = "local_directory"
+    LOCAL_FILE = "local_file"
+
+
+class InventoryCategory(StrEnum):
+    DOCUMENTATION = "documentation"
+    BUILD = "build"
+    SHELL = "shell"
+    ANSIBLE = "ansible"
+    TERRAFORM = "terraform"
+    HELM = "helm"
+    HELMSMAN = "helmsman"
+    KUSTOMIZE = "kustomize"
+    KUBERNETES = "kubernetes"
+    COMPOSE = "compose"
+    CI_WORKFLOW = "ci_workflow"
+    CONFIGURATION = "configuration"
+    UNKNOWN = "unknown"
 
 
 class ContractModel(BaseModel):
