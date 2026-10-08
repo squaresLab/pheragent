@@ -434,7 +434,7 @@ def test_agent_requests_approval_for_a_linked_source(tmp_path: Path) -> None:
             "ACT",
             "add_source",
             source={"location": "https://github.com/example/deployment-infra"},
-            evidence=["repository-1:README.md lines 1-1 contains the repository link."],
+            evidence=["the model did not reproduce an exact source reference"],
             reason="the active deployment guide delegates infrastructure setup",
         ), {}
 
@@ -443,6 +443,7 @@ def test_agent_requests_approval_for_a_linked_source(tmp_path: Path) -> None:
     assert report["status"] == "WAITING_FOR_INPUT"
     assert request["kind"] == "source_approval"
     assert request["source"]["location"] == "https://github.com/example/deployment-infra"
+    assert request["evidence"] == ["repository-1:README.md"]
 
 
 def test_agent_acquires_an_approved_linked_source(tmp_path: Path, monkeypatch) -> None:

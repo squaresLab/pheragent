@@ -206,19 +206,23 @@ class SourceTools:
             )
         }
 
-    def supports_source(self, location: str, references: list[str]) -> bool:
+    def source_references(self, location: str) -> set[str]:
         parsed = urlsplit(location)
         if parsed.scheme != "https" or not parsed.netloc or parsed.username or parsed.password:
-            return False
+            return set()
         expected = location.removesuffix(".git").rstrip("/")
-        for reference in self.existing_refs(references):
+        references = set()
+        for reference in self.readable_paths:
             source_id, _, relative = reference.partition(":")
-            text = self.sources[source_id].resolve_path(relative).read_text(
-                encoding="utf-8", errors="replace"
-            )
+            try:
+                text = self.sources[source_id].resolve_path(relative).read_text(
+                    encoding="utf-8", errors="replace"
+                )
+            except OSError:
+                continue
             if expected in text.replace(".git", ""):
-                return True
-        return False
+                references.add(reference)
+        return references
 
     def read_file(
         self, reference: str, start_line: int | None = None, end_line: int | None = None

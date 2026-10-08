@@ -71,9 +71,9 @@ references before broadening the search. Do not reread recorded evidence unless 
 incomplete or a specific unresolved question requires another section.
 
 If an essential source references an unavailable HTTPS Git repository, propose add_source
-and cite the file containing the link. Stop retrieving once you know a grounded action, its
-required inputs and working directory, and a validation that distinguishes success from the
-current state.
+with its exact URL in source.location; source_path is only for files in the current inventory.
+The harness verifies the link. Stop retrieving once you know an action, its required inputs and
+working directory, and a validation that distinguishes success from the current state.
 
 # Decision kinds
 
@@ -587,13 +587,16 @@ def run_deployment_agent(
                 break
             if decision.tool == "add_source":
                 source = decision.source
-                evidence = sorted(sources.existing_refs(decision.evidence))
-                if source is None or not evidence or not sources.supports_source(
-                    source.location, decision.evidence
-                ):
+                evidence = sorted(sources.source_references(source.location)) if source else []
+                if source is None:
                     last_result = {
                         "status": "blocked",
-                        "reason": "source addition needs a cited HTTPS repository link",
+                        "reason": "source addition needs an HTTPS repository URL",
+                    }
+                elif not evidence:
+                    last_result = {
+                        "status": "blocked",
+                        "reason": "proposed HTTPS source URL is absent from configured sources",
                     }
                 elif any(
                     (item if isinstance(item, str) else item.location) == source.location
