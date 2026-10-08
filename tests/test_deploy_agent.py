@@ -434,7 +434,7 @@ def test_agent_requests_approval_for_a_linked_source(tmp_path: Path) -> None:
             "ACT",
             "add_source",
             source={"location": "https://github.com/example/deployment-infra"},
-            evidence=["repository-1:README.md"],
+            evidence=["repository-1:README.md lines 1-1 contains the repository link."],
             reason="the active deployment guide delegates infrastructure setup",
         ), {}
 

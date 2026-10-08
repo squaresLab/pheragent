@@ -200,7 +200,10 @@ class SourceTools:
         return {
             path
             for path in self.readable_paths
-            if any(ref == path or ref.startswith((path + ":", path + " —")) for ref in references)
+            if any(
+                ref == path or ref.startswith((path + ":", path + " —", path + " lines "))
+                for ref in references
+            )
         }
 
     def supports_source(self, location: str, references: list[str]) -> bool:
