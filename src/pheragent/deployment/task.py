@@ -80,6 +80,12 @@ class TaskInput(StrictModel):
         return self
 
 
+class InputRequest(StrictModel):
+    name: str = Field(pattern=r"^[A-Za-z][A-Za-z0-9_]*$")
+    prompt: str = Field(min_length=1)
+    sensitive: bool = False
+
+
 class DeploymentTask(StrictModel):
     task: TaskGoal
     sources: TaskSources
@@ -136,8 +142,8 @@ class Decision(StrictModel):
     source: SourceLocation | None = None
     selected_route: str | None = None
     step_id: str | None = None
-    required_inputs: list[str] = Field(default_factory=list)
-    sensitive_inputs: list[str] = Field(default_factory=list)
+    required_inputs: list[InputRequest] = Field(default_factory=list)
+    stdin_input: str | None = Field(default=None, pattern=r"^[A-Za-z][A-Za-z0-9_]*$")
     overview_change: OverviewChange | None = None
     completes_step: bool = False
     options: list[str] = Field(default_factory=list)
@@ -150,7 +156,10 @@ class Decision(StrictModel):
     resolve_questions: list[str]
 
     @model_validator(mode="after")
-    def require_sensitive_inputs(self) -> Decision:
-        if not set(self.sensitive_inputs) <= set(self.required_inputs):
-            raise ValueError("sensitive inputs must also be required inputs")
+    def require_valid_inputs(self) -> Decision:
+        names = [item.name for item in self.required_inputs]
+        if len(names) != len(set(names)):
+            raise ValueError("required input names must be distinct")
+        if self.stdin_input and self.stdin_input not in names:
+            raise ValueError("stdin_input must name a required input")
         return self

@@ -40,7 +40,7 @@ def _decision(kind: str, tool: str | None = None, **changes: object) -> Decision
         "working_directory": None,
         "evidence": [],
         "source": None,
-        "sensitive_inputs": [],
+        "required_inputs": [],
         "expected_change": None,
         "validation": [],
         "add_gaps": [],
@@ -264,13 +264,21 @@ def test_agent_waits_for_referenced_secret_and_resumes_same_run(
         return _decision(
             "WAITING_FOR_INPUT",
             reason="service token is required",
-            required_inputs=["service_token"],
+            required_inputs=[
+                {
+                    "name": "service_token",
+                    "prompt": "Service token",
+                    "sensitive": True,
+                }
+            ],
         ), {}
 
     first = run_deployment_agent(task, output, decide=wait)
     assert first["status"] == "WAITING_FOR_INPUT"
     request = yaml.safe_load((output / "human-request.yaml").read_text())
     assert request["required_inputs"]["service_token"]["available"] is False
+    assert request["required_inputs"]["service_token"]["prompt"] == "Service token"
+    assert request["required_inputs"]["service_token"]["sensitive"] is True
     assert "SAMPLE_SERVICE_TOKEN" not in (output / "human-request.yaml").read_text() or (
         request["required_inputs"]["service_token"]["source"] == "env:SAMPLE_SERVICE_TOKEN"
     )
@@ -331,7 +339,13 @@ def test_agent_collects_and_persists_interactive_configuration(
             _decision(
                 "WAITING_FOR_INPUT",
                 reason="IAM hostname is required",
-                required_inputs=["iam_hostname"],
+                required_inputs=[
+                    {
+                        "name": "iam_hostname",
+                        "prompt": "IAM hostname",
+                        "sensitive": False,
+                    }
+                ],
             ),
             _decision("BLOCKED", reason="input received"),
         ]
@@ -372,8 +386,13 @@ def test_agent_hides_and_never_persists_interactive_secrets(
             _decision(
                 "WAITING_FOR_INPUT",
                 reason="IAM password is required",
-                required_inputs=["IAM_ADMIN_PASSWORD"],
-                sensitive_inputs=["IAM_ADMIN_PASSWORD"],
+                required_inputs=[
+                    {
+                        "name": "IAM_ADMIN_PASSWORD",
+                        "prompt": "IAM administrator password",
+                        "sensitive": True,
+                    }
+                ],
             ),
             _decision("BLOCKED", reason="secret received"),
         ]
@@ -939,7 +958,43 @@ def test_reworded_denied_observations_stop_early(tmp_path: Path, monkeypatch) ->
     report = run_deployment_agent(task, output, decide=decide)
     assert report["status"] == "BLOCKED"
     assert calls == 3
-    assert "repeated denied observation" in report["reason"]
+    assert "same policy denial repeated three times" in report["reason"]
+
+
+def test_policy_denial_is_returned_to_the_agent_for_revision(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "README.md").write_text("Run the installer.\n")
+    task = tmp_path / "task.yaml"
+    output = tmp_path / "run"
+    _task(task, source, output)
+    decisions = iter(
+        [
+            _decision(
+                "ACT",
+                "execute",
+                command=["python3", "-c", "print('unsafe wrapper')"],
+                evidence=["repository-1:README.md"],
+                expected_change="application ready",
+                validation=[{"command": ["ls", str(source / "ready")]}],
+            ),
+            _decision("BLOCKED", reason="request a supported alternative"),
+        ]
+    )
+    calls = 0
+
+    def decide(_state, _observation, last_result, _sources, _cycle):
+        nonlocal calls
+        if calls:
+            assert last_result["status"] == "policy_denied"
+            assert "inline interpreter" in last_result["reason"]
+        calls += 1
+        return next(decisions), {}
+
+    report = run_deployment_agent(task, output, execute=True, decide=decide)
+    assert report["status"] == "BLOCKED"
+    assert report["reason"] == "request a supported alternative"
+    assert calls == 2
 
 
 def test_unfamiliar_mutation_requires_review_and_wrong_context_is_denied() -> None:
@@ -1055,6 +1110,7 @@ def test_kubernetes_change_waits_for_terminal_approval(
 
     monkeypatch.setattr("pheragent.deployment.runtime.sys.stdin", Terminal(answer))
     monkeypatch.setattr("pheragent.deployment.runtime._command", run_command)
+    monkeypatch.setattr("pheragent.deployment.runtime._stream_command", run_command)
     result = execute_action(
         decision, task, Evidence(), tmp_path, enabled=True, approve=False, timeout=10
     )
@@ -1295,6 +1351,121 @@ def test_unknown_preflight_does_not_execute(tmp_path: Path, monkeypatch) -> None
     )
     assert result["status"] == "needs_better_check"
     assert calls == [["ls", str(tmp_path / "ready")]]
+
+
+def test_execute_streams_output_and_supplies_referenced_stdin(tmp_path: Path, capsys) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    script = source / "install.sh"
+    script.write_text(
+        "#!/bin/sh\nread answer\nprintf 'received:%s\\n' \"$answer\"\ntouch ready\n"
+    )
+    script.chmod(0o755)
+    task = DeploymentTask.model_validate(
+        {
+            "task": {"objective": "sample"},
+            "sources": {"repositories": [str(source)]},
+            "environment": {"type": "shell", "sandbox": True},
+        }
+    )
+    decision = _decision(
+        "ACT",
+        "execute",
+        command=["./install.sh"],
+        working_directory="repository-1:.",
+        evidence=["repository-1:install.sh"],
+        expected_change="installer completes",
+        required_inputs=[
+            {
+                "name": "INSTALL_CONFIRMATION",
+                "prompt": "Confirm installation",
+                "sensitive": True,
+            }
+        ],
+        stdin_input="INSTALL_CONFIRMATION",
+        validation=[{"command": ["ls", "ready"], "unsatisfied_exit_codes": [2]}],
+    )
+
+    class Evidence:
+        def existing_refs(self, _references):
+            return {"repository-1:install.sh"}
+
+        def working_directory(self, _decision, _workspace):
+            return source
+
+        def grounds(self, _decision):
+            return True
+
+    log = tmp_path / "actions" / "0001.log"
+    secret = "super-secret-value\n"
+    result = execute_action(
+        decision,
+        task,
+        Evidence(),
+        tmp_path,
+        enabled=True,
+        approve=True,
+        timeout=10,
+        stdin_value=secret,
+        stdin_sensitive=True,
+        log_path=log,
+    )
+    assert result["status"] == "validated"
+    assert "[REDACTED INPUT]" in result["execution"]["stdout"]
+    assert "super-secret-value" not in result["execution"]["stdout"]
+    assert "[REDACTED INPUT]" in log.read_text()
+    assert "[REDACTED INPUT]" in capsys.readouterr().out
+
+
+def test_execute_retains_partial_output_when_it_times_out(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    script = source / "install.sh"
+    script.write_text("#!/bin/sh\nprintf 'started\\n'\nsleep 10\n")
+    script.chmod(0o755)
+    task = DeploymentTask.model_validate(
+        {
+            "task": {"objective": "sample"},
+            "sources": {"repositories": [str(source)]},
+            "environment": {"type": "shell", "sandbox": True},
+        }
+    )
+    decision = _decision(
+        "ACT",
+        "execute",
+        command=["./install.sh"],
+        working_directory="repository-1:.",
+        evidence=["repository-1:install.sh"],
+        expected_change="installer completes",
+        validation=[{"command": ["ls", "ready"], "unsatisfied_exit_codes": [2]}],
+    )
+
+    class Evidence:
+        def existing_refs(self, _references):
+            return {"repository-1:install.sh"}
+
+        def working_directory(self, _decision, _workspace):
+            return source
+
+        def grounds(self, _decision):
+            return True
+
+    log = tmp_path / "actions" / "0001.log"
+    result = execute_action(
+        decision,
+        task,
+        Evidence(),
+        tmp_path,
+        enabled=True,
+        approve=True,
+        timeout=1,
+        log_path=log,
+    )
+    assert result["status"] == "command_failed"
+    assert result["execution"]["timed_out"] is True
+    assert "started" in result["execution"]["stdout"]
+    assert "timed out" in result["execution"]["stderr"]
+    assert "started" in log.read_text()
 
 
 def test_checks_use_declared_generic_outcomes(tmp_path: Path, monkeypatch) -> None:

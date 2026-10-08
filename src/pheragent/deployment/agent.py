@@ -32,7 +32,7 @@ from .serialization import load_yaml, write_json, write_yaml
 from .source_manager import SourceManager
 from .sources import SourceTools, _source_spec
 from .state import apply_result, record_verified_outcome
-from .task import Check, Decision, DeploymentTask, TaskInput
+from .task import Check, Decision, DeploymentTask, InputRequest, TaskInput
 
 _INNER_LOOP_INSTRUCTIONS = """You are a senior DevOps engineer progressively deploying a system.
 
@@ -81,8 +81,9 @@ Use ACT for one tool call. Use source tools for evidence, observe for a read-onl
 command, execute for a state-changing command, and add_source for a repository directly
 referenced by existing evidence.
 
-Use WAITING_FOR_INPUT when an exact external value or secret is required. Put task-input
-names in required_inputs and secrets in sensitive_inputs.
+Use WAITING_FOR_INPUT when an exact external value or secret is required. Give every
+required input a stable name, concise human prompt, and sensitivity. When an installer reads
+one response from standard input, reference that input by name in stdin_input.
 
 Use ASK_HUMAN only when two or three source-supported routes remain viable and evidence
 cannot select between them. Use BLOCKED only when no safe, source-supported action remains;
@@ -156,8 +157,26 @@ def _input_state(task: DeploymentTask, base: Path) -> dict[str, dict]:
     return result
 
 
-def _missing_inputs(state: dict, names: list[str]) -> list[str]:
+def _missing_input_names(state: dict, names: list[str]) -> list[str]:
     return sorted(name for name in names if not state["inputs"].get(name, {}).get("available"))
+
+
+def _missing_inputs(state: dict, requests: list[InputRequest]) -> list[InputRequest]:
+    missing = set(_missing_input_names(state, [request.name for request in requests]))
+    return [request for request in requests if request.name in missing]
+
+
+def _input_value(task: DeploymentTask, name: str, base: Path) -> tuple[str, bool]:
+    item = task.inputs[name]
+    if item.value is not None:
+        value = item.value
+    elif item.from_env is not None:
+        value = os.environ[item.from_env]
+    else:
+        path = item.from_file or Path()
+        path = path if path.is_absolute() else base / path
+        value = path.read_text(encoding="utf-8")
+    return value if value.endswith("\n") else value + "\n", item.sensitive
 
 
 def _prompt_for_inputs(
@@ -169,11 +188,13 @@ def _prompt_for_inputs(
         return []
     provided = []
     print(decision.reason, flush=True)
-    for name in _missing_inputs(state, decision.required_inputs):
+    for request in _missing_inputs(state, decision.required_inputs):
+        name = request.name
         configured = task.inputs.get(name)
-        sensitive = name in decision.sensitive_inputs or bool(configured and configured.sensitive)
+        sensitive = request.sensitive or bool(configured and configured.sensitive)
         try:
-            value = getpass(f"{name} (hidden): ") if sensitive else input(f"{name}: ").strip()
+            prompt = f"{request.prompt} [{name}]"
+            value = getpass(f"{prompt} (hidden): ") if sensitive else input(f"{prompt}: ").strip()
         except (EOFError, KeyboardInterrupt):
             value = ""
         if not value:
@@ -378,7 +399,7 @@ def run_deployment_agent(
     )
     if resume and state.get("pending_input"):
         pending = state["pending_input"]
-        if not _missing_inputs(state, list(pending["required_inputs"])):
+        if not _missing_input_names(state, list(pending["required_inputs"])):
             state.pop("pending_input")
             if overview and pending.get("step_id"):
                 set_step_status(overview, pending["step_id"], "active")
@@ -392,7 +413,7 @@ def run_deployment_agent(
     invalid_actions = 0
     failed_actions: dict[tuple[str, ...], int] = {}
     seen_results: dict[str, int] = {}
-    denied_observations: dict[tuple[str, str], int] = {}
+    policy_denials: dict[tuple[str, str], int] = {}
     last_result: dict = {}
     observation: dict = {}
     refresh_environment = True
@@ -480,14 +501,20 @@ def run_deployment_agent(
                     "reason": decision.reason,
                     "step_id": decision.step_id,
                     "required_inputs": {
-                        name: state["inputs"].get(
-                            name,
-                            {
-                                "available": False,
-                                "configure": f"add inputs.{name}.from_env or from_file",
-                            },
-                        )
-                        for name in missing
+                        item.name: {
+                            **state["inputs"].get(
+                                item.name,
+                                {
+                                    "available": False,
+                                    "configure": (
+                                        f"add inputs.{item.name}.from_env or from_file"
+                                    ),
+                                },
+                            ),
+                            "prompt": item.prompt,
+                            "sensitive": item.sensitive,
+                        }
+                        for item in missing
                     },
                     "resume_command": [
                         "pheragent",
@@ -658,12 +685,8 @@ def run_deployment_agent(
                     )
                 except (OSError, ValueError) as exc:
                     last_result = {"error": str(exc)}
-                if last_result.get("status") in {"blocked", "policy_denied"}:
-                    status = (
-                        "POLICY_DENIED"
-                        if last_result["status"] == "policy_denied"
-                        else "BLOCKED"
-                    )
+                if last_result.get("status") == "blocked":
+                    status = "BLOCKED"
                     reason = last_result["reason"]
             elif decision.tool == "execute":
                 if mutations >= task.budgets.max_mutating_actions:
@@ -673,6 +696,12 @@ def run_deployment_agent(
                 if remaining <= 0:
                     status, reason = "BUDGET_EXHAUSTED", "runtime budget exhausted"
                     break
+                stdin_value = None
+                stdin_sensitive = False
+                if decision.stdin_input:
+                    stdin_value, stdin_sensitive = _input_value(
+                        task, decision.stdin_input, task_path.parent
+                    )
                 last_result = execute_action(
                     decision,
                     task,
@@ -681,6 +710,9 @@ def run_deployment_agent(
                     enabled=execute,
                     approve=approve,
                     timeout=max(1, min(1800, int(remaining))),
+                    stdin_value=stdin_value,
+                    stdin_sensitive=stdin_sensitive,
+                    log_path=output / "actions" / f"{cycle:04d}.log",
                 )
                 refresh_environment = "execution" in last_result
                 if last_result["status"] == "needs_revision":
@@ -690,10 +722,8 @@ def run_deployment_agent(
                         status, reason = "BLOCKED", "three incomplete action proposals"
                 else:
                     invalid_actions = 0
-                if last_result["status"] in {"blocked", "policy_denied"}:
-                    status = (
-                        "POLICY_DENIED" if last_result["status"] == "policy_denied" else "BLOCKED"
-                    )
+                if last_result["status"] == "blocked":
+                    status = "BLOCKED"
                     reason = last_result["reason"]
                 elif "execution" in last_result:
                     mutations += 1
@@ -732,16 +762,17 @@ def run_deployment_agent(
                 ).hexdigest()
                 last_result["repeated_result_count"] = seen_results.get(digest, 0)
                 seen_results[digest] = last_result["repeated_result_count"] + 1
-                error = last_result.get("error", "")
-                if decision.tool == "observe" and error.startswith("denied:"):
-                    key = ((state.get("active_step") or {}).get("id", "run"), error)
-                    denied_observations[key] = denied_observations.get(key, 0) + 1
-                    last_result["repeated_denial_count"] = denied_observations[key]
-                    if denied_observations[key] >= 3:
-                        status, reason = (
-                            "BLOCKED",
-                            "repeated denied observation; revise the command",
-                        )
+            if last_result.get("status") == "policy_denied":
+                denial = last_result["reason"]
+                key = ((state.get("active_step") or {}).get("id", "run"), denial)
+                policy_denials[key] = policy_denials.get(key, 0) + 1
+                last_result["repeated_denial_count"] = policy_denials[key]
+                if policy_denials[key] >= 3:
+                    status, reason = (
+                        "BLOCKED",
+                        "same policy denial repeated three times; propose a permitted "
+                        "alternative or ask for human input",
+                    )
             step_satisfied = (decision.tool == "observe" and last_result.get("exit_code") == 0) or (
                 decision.tool == "execute"
                 and last_result.get("status") in {"validated", "already_satisfied"}
@@ -777,7 +808,7 @@ def run_deployment_agent(
                 decision.tool == "execute"
                 or decision.completes_step
                 and step_satisfied
-                or status in {"BLOCKED", "POLICY_DENIED"}
+                or status == "BLOCKED"
             ):
                 break
         write_json(output / "state.json", state)
@@ -787,7 +818,6 @@ def run_deployment_agent(
             "FAILED",
             "BLOCKED",
             "WAITING_FOR_INPUT",
-            "POLICY_DENIED",
             "BUDGET_EXHAUSTED",
             "OSCILLATING",
         } and not (status == "BUDGET_EXHAUSTED" and reason == "decision budget exhausted"):
