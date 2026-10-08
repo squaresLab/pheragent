@@ -160,6 +160,4 @@ class Decision(StrictModel):
         names = [item.name for item in self.required_inputs]
         if len(names) != len(set(names)):
             raise ValueError("required input names must be distinct")
-        if self.stdin_input and self.stdin_input not in names:
-            raise ValueError("stdin_input must name a required input")
         return self

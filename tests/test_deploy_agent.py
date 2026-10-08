@@ -997,6 +997,42 @@ def test_policy_denial_is_returned_to_the_agent_for_revision(tmp_path: Path) -> 
     assert calls == 2
 
 
+def test_unavailable_stdin_reference_is_returned_for_revision(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "README.md").write_text("Run the installer.\n")
+    task = tmp_path / "task.yaml"
+    output = tmp_path / "run"
+    _task(task, source, output)
+    decisions = iter(
+        [
+            _decision(
+                "ACT",
+                "execute",
+                command=["./install.sh"],
+                stdin_input="INSTALL_CONFIRMATION",
+                evidence=["repository-1:README.md"],
+                expected_change="application ready",
+                validation=[{"command": ["ls", str(source / "ready")]}],
+            ),
+            _decision("BLOCKED", reason="ask for the missing input"),
+        ]
+    )
+    calls = 0
+
+    def decide(_state, _observation, last_result, _sources, _cycle):
+        nonlocal calls
+        if calls:
+            assert last_result["status"] == "needs_revision"
+            assert "structured required_inputs" in last_result["reason"]
+        calls += 1
+        return next(decisions), {}
+
+    report = run_deployment_agent(task, output, execute=True, decide=decide)
+    assert report["reason"] == "ask for the missing input"
+    assert calls == 2
+
+
 def test_unfamiliar_mutation_requires_review_and_wrong_context_is_denied() -> None:
     task = DeploymentTask.model_validate(
         {

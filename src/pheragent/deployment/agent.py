@@ -476,6 +476,21 @@ def run_deployment_agent(
                 value=decision.model_dump(),
                 usage=call_usage,
             )
+            if (
+                decision.stdin_input
+                and not state["inputs"].get(decision.stdin_input, {}).get("available")
+                and decision.stdin_input
+                not in {item.name for item in decision.required_inputs}
+            ):
+                last_result = {
+                    "status": "needs_revision",
+                    "reason": (
+                        "stdin_input must reference an available task input or include a "
+                        "structured required_inputs request"
+                    ),
+                }
+                history.append("tool", iteration=cycle, tool=decision.tool, result=last_result)
+                continue
             if decision.kind == "WAITING_FOR_INPUT" or _missing_inputs(
                 state, decision.required_inputs
             ):
@@ -701,6 +716,10 @@ def run_deployment_agent(
                 if decision.stdin_input:
                     stdin_value, stdin_sensitive = _input_value(
                         task, decision.stdin_input, task_path.parent
+                    )
+                    stdin_sensitive = stdin_sensitive or any(
+                        item.name == decision.stdin_input and item.sensitive
+                        for item in decision.required_inputs
                     )
                 last_result = execute_action(
                     decision,
