@@ -11,10 +11,12 @@ import yaml
 from pheragent.cli import main as pheragent_main
 from pheragent.deployment.agent import (
     _INNER_LOOP_INSTRUCTIONS,
+    _advance_verified_step,
     compact_context,
     run_deployment_agent,
 )
 from pheragent.deployment.models import SourceKind, SourcesConfig
+from pheragent.deployment.overview import DeploymentOverview, active_step
 from pheragent.deployment.runtime import (
     classify_command,
     execute_action,
@@ -534,6 +536,60 @@ def test_agent_prompt_requires_source_defined_validation_semantics() -> None:
     assert "do not retry a failed command" in " ".join(
         _INNER_LOOP_INSTRUCTIONS.split()
     ).casefold()
+
+
+def test_done_advances_only_matching_step_from_successful_evidence() -> None:
+    def overview() -> DeploymentOverview:
+        return DeploymentOverview.model_validate(
+            {
+                "route": "documented route",
+                "route_evidence": ["repository-1:README.md"],
+                "stages": [
+                    {
+                        "id": "deploy",
+                        "kind": "deploy",
+                        "goal": "deploy the system",
+                        "steps": [
+                            {
+                                "id": "infrastructure",
+                                "goal": "prepare infrastructure",
+                                "success_condition": "infrastructure is ready",
+                                "source_refs": ["repository-1:README.md"],
+                                "status": "active",
+                            },
+                            {
+                                "id": "application",
+                                "goal": "deploy application",
+                                "success_condition": "application is ready",
+                                "source_refs": ["repository-1:README.md"],
+                            },
+                        ],
+                    }
+                ],
+            }
+        )
+
+    decision = _decision(
+        "DONE",
+        step_id="infrastructure",
+        completes_step=True,
+    )
+    deployment = overview()
+    result = {"exit_code": 0, "step_id": "infrastructure"}
+
+    assert _advance_verified_step(deployment, decision, result)
+    assert active_step(deployment).id == "application"
+    assert result["overview_step_verified"] == "infrastructure"
+    assert not _advance_verified_step(
+        overview(),
+        decision.model_copy(update={"step_id": "wrong-step"}),
+        result,
+    )
+    assert not _advance_verified_step(
+        overview(),
+        decision,
+        {"exit_code": 1, "step_id": "infrastructure"},
+    )
 
 
 def test_agent_validates_prerequisite_then_resumes_original_goal(tmp_path: Path) -> None:

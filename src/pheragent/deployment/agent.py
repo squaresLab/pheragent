@@ -114,6 +114,11 @@ outcomes. Do not update it for a local command, transient failure, or implementa
 Set completes_step only when runtime evidence or post-action validation proves the active
 step's success condition.
 
+When the latest observation or validated action proves active_step.success_condition,
+return DONE with the matching step_id and completes_step=true. This completes only the
+active overview step. Return task-level DONE only when active_step is null and the full
+deployment objective is satisfied.
+
 Return one Decision matching the provided structured schema. Give a concise reason; do not
 output private chain-of-thought.
 """
@@ -289,6 +294,34 @@ def verify_completion(task: DeploymentTask, state: dict) -> tuple[bool, dict]:
     second = run_checks(task, checks)
     result = {"status": "completion_checked", "first": first, "second": second}
     return all(item["status"] == "satisfied" for item in first + second), result
+
+
+def _advance_verified_step(
+    overview: DeploymentOverview | None,
+    decision: Decision,
+    result: dict,
+) -> bool:
+    current = active_step(overview) if overview else None
+    if current is None or not decision.completes_step or decision.step_id != current.id:
+        return False
+
+    if decision.kind == "DONE":
+        satisfied = result.get("step_id") == current.id and (
+            result.get("exit_code") == 0
+            or result.get("status") in {"validated", "already_satisfied"}
+        )
+    else:
+        satisfied = (decision.tool == "observe" and result.get("exit_code") == 0) or (
+            decision.tool == "execute"
+            and result.get("status") in {"validated", "already_satisfied"}
+        )
+
+    if not satisfied:
+        return False
+
+    set_step_status(overview, current.id, "verified")
+    result["overview_step_verified"] = current.id
+    return True
 
 
 def run_deployment_agent(
@@ -580,12 +613,14 @@ def run_deployment_agent(
             if decision.kind == "BLOCKED":
                 status, reason = "BLOCKED", decision.reason
                 break
-            if decision.kind == "DONE":
+            if decision.kind == "DONE" and not state.get("active_step"):
                 complete, last_result = verify_completion(task, state)
                 if complete:
                     status, reason = "SUCCESS", "completion checks passed twice"
                 break
-            if decision.tool == "add_source":
+            if decision.kind == "DONE":
+                pass
+            elif decision.tool == "add_source":
                 source = decision.source
                 evidence = sorted(sources.source_references(source.location)) if source else []
                 if source is None:
@@ -795,22 +830,23 @@ def run_deployment_agent(
                         "same policy denial repeated three times; propose a permitted "
                         "alternative or ask for human input",
                     )
-            step_satisfied = (decision.tool == "observe" and last_result.get("exit_code") == 0) or (
-                decision.tool == "execute"
-                and last_result.get("status") in {"validated", "already_satisfied"}
-            )
-            if (
-                overview
-                and decision.completes_step
-                and decision.step_id == (state.get("active_step") or {}).get("id")
-                and step_satisfied
-            ):
-                set_step_status(overview, decision.step_id, "verified")
+            if decision.tool in {"observe", "execute"}:
+                last_result["step_id"] = decision.step_id
+            step_completed = _advance_verified_step(overview, decision, last_result)
+            if step_completed:
                 state["overview"] = overview.model_dump()
-                last_result["overview_step_verified"] = decision.step_id
                 refresh_environment = True
                 write_yaml(output / "overview.yaml", overview)
-            if overview and decision.overview_change:
+            elif decision.kind == "DONE" and state.get("active_step"):
+                last_result = {
+                    "status": "completion_rejected",
+                    "reason": (
+                        "the active step needs a matching successful observation "
+                        "or validated action"
+                    ),
+                    "step_id": state["active_step"]["id"],
+                }
+            if decision.kind != "DONE" and overview and decision.overview_change:
                 try:
                     apply_change(overview, decision.overview_change, sources)
                     history.append(
@@ -820,18 +856,14 @@ def run_deployment_agent(
                     )
                 except ValueError as exc:
                     last_result["overview_change_error"] = str(exc)
-            apply_result(state, decision, last_result, sources)
+            if decision.kind != "DONE":
+                apply_result(state, decision, last_result, sources)
             if overview:
                 set_discoveries(overview, state["gaps"] + state["unresolved"])
                 state["overview"] = overview.model_dump()
                 write_yaml(output / "overview.yaml", overview)
             history.append("tool", iteration=cycle, tool=decision.tool, result=last_result)
-            if (
-                decision.tool == "execute"
-                or decision.completes_step
-                and step_satisfied
-                or status == "BLOCKED"
-            ):
+            if decision.tool == "execute" or step_completed or status == "BLOCKED":
                 break
         write_json(output / "state.json", state)
         history.checkpoint(state)
