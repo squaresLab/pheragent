@@ -94,6 +94,12 @@ Use WAITING_FOR_INPUT when an exact external value or secret is required. Give e
 required input a stable name, concise human prompt, and sensitivity. When an installer reads
 one response from standard input, reference that input by name in stdin_input.
 
+Ask only for atomic values the human owns. When a source template and a few external values
+can produce a configuration, request those values separately and render the template in the
+source workspace; never ask the human to paste the completed generated file. Derive repeated
+values only when the source defines the rule. If a genuinely human-maintained multiline file
+is required, ask for one named input configured with from_file instead of terminal content.
+
 Use ASK_HUMAN only when two or three source-supported routes remain viable and evidence
 cannot select between them. Use BLOCKED only when no safe, source-supported action remains;
 name the exact missing capability, permission, evidence, or human decision. Use DONE only
