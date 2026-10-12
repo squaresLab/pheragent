@@ -5,8 +5,7 @@ import os
 import re
 from pathlib import Path
 
-from .enums import InventoryCategory
-from .models import InventoryEntry, RepositoryInventory
+from .models import InventoryCategory, InventoryEntry, RepositoryInventory
 from .source_manager import AcquiredSource
 
 _IGNORED_DIRECTORIES = {

@@ -8,6 +8,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from .agent import run_deployment_agent
+from .telemetry import flush, set_output, span
 
 
 def add_deployment_parser(subparsers) -> None:
@@ -26,14 +27,25 @@ def run_deployment_command(args: argparse.Namespace) -> int:
         Path(".pheragent/agent-runs") / datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     )
     try:
-        report = run_deployment_agent(
-            args.task,
-            output,
-            model=args.model,
-            execute=args.execute,
-            resume=args.resume,
-        )
+        with span(
+            "pheragent.deployment.run",
+            input={"task": str(args.task), "output": str(output)},
+            task=str(args.task),
+        ) as active_span:
+            report = run_deployment_agent(
+                args.task,
+                output,
+                model=args.model,
+                execute=args.execute,
+                resume=args.resume,
+            )
+            set_output(
+                active_span,
+                {"status": report["status"], "reason": report["reason"]},
+                report["usage"],
+            )
     except (OSError, RuntimeError, ValueError) as exc:
+        flush()
         print(f"deployment error: {exc}", file=sys.stderr)
         return 2
     print(f"run: {output.resolve()}")
@@ -51,4 +63,5 @@ def run_deployment_command(args: argparse.Namespace) -> int:
         "New verified outcomes: "
         f"{', '.join(item['id'] for item in report['state']['verified_outcomes']) or 'none'}"
     )
+    flush()
     return 0 if report["status"] == "SUCCESS" else 1

@@ -7,13 +7,9 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from pheragent.deployment.analysis_llm import (
-    AnalysisLLMConfig,
-    CachedStructuredClassifier,
-    ClassificationOutcome,
-    LLMRequestBudget,
-    strict_response_format,
-)
+from pheragent.deployment.llm import LLMClient
+
+from ._llm import EvaluationLLMClient, EvaluationResult
 
 _COMPONENT_PROMPT_VERSION = "phase1-evaluation-components-v2"
 _COMPLETENESS_PROMPT_VERSION = "phase1-evaluation-completeness-v2"
@@ -115,22 +111,21 @@ class PhaseOneJudgeConfig:
             if value < 1:
                 raise ValueError(f"{name} must be greater than zero")
 
-    def classifier(self) -> CachedStructuredClassifier:
-        return CachedStructuredClassifier(
-            AnalysisLLMConfig(
+    def client(self) -> EvaluationLLMClient:
+        return EvaluationLLMClient(
+            LLMClient(
                 model=self.model,
                 api_key_env=self.api_key_env,
                 base_url_env=self.base_url_env,
                 base_url=self.base_url,
                 timeout=self.timeout,
                 max_output_tokens=self.max_output_tokens,
-                max_requests=self.max_requests_per_run,
-                cache_dir=self.cache_dir,
-                retry_failed=self.retry_failed,
-                refresh_cache=self.refresh_cache,
                 reasoning_effort=self.reasoning_effort,
             ),
-            LLMRequestBudget(limit=self.max_requests_per_run),
+            max_requests=self.max_requests_per_run,
+            cache_dir=self.cache_dir,
+            retry_failed=self.retry_failed,
+            refresh_cache=self.refresh_cache,
         )
 
 
@@ -140,18 +135,14 @@ def judge_components(
     component_ids: set[str],
     evidence_ids: set[str],
     batch_number: int,
-    classifier: CachedStructuredClassifier,
-) -> ClassificationOutcome[ComponentJudgeResponse]:
-    return classifier.classify(
+    client: EvaluationLLMClient,
+) -> EvaluationResult[ComponentJudgeResponse]:
+    return client.complete(
+        ComponentJudgeResponse,
         stage=f"phase1_evaluation_components_{batch_number:02d}",
         prompt_version=_COMPONENT_PROMPT_VERSION,
         instructions=_COMPONENT_INSTRUCTIONS,
         payload=payload,
-        response_format=strict_response_format(
-            ComponentJudgeResponse,
-            name="phase1_component_evaluation",
-        ),
-        response_model=ComponentJudgeResponse,
         validate=lambda response: _validate_component_response(
             response,
             component_ids=component_ids,
@@ -167,18 +158,14 @@ def judge_completeness(
     component_ids: set[str],
     workflow_step_ids: set[str],
     evidence_ids: set[str],
-    classifier: CachedStructuredClassifier,
-) -> ClassificationOutcome[CompletenessJudgeResponse]:
-    return classifier.classify(
+    client: EvaluationLLMClient,
+) -> EvaluationResult[CompletenessJudgeResponse]:
+    return client.complete(
+        CompletenessJudgeResponse,
         stage="phase1_evaluation_completeness",
         prompt_version=_COMPLETENESS_PROMPT_VERSION,
         instructions=_COMPLETENESS_INSTRUCTIONS,
         payload=payload,
-        response_format=strict_response_format(
-            CompletenessJudgeResponse,
-            name="phase1_completeness_evaluation",
-        ),
-        response_model=CompletenessJudgeResponse,
         validate=lambda response: _validate_completeness_response(
             response,
             entity_ids=entity_ids,

@@ -3,14 +3,18 @@
 from __future__ import annotations
 
 import os
+import queue
 import shlex
+import signal
 import subprocess
 import sys
+import threading
 import time
+from contextlib import suppress
 from pathlib import Path
 
 from .redaction import redact_secrets
-from .sources import SourceTools, _source_cwd, _source_grounded
+from .sources import SourceTools
 from .task import Check, Decision, DeploymentTask
 
 _READ_KUBECTL = {
@@ -41,7 +45,7 @@ _READ_AWS = {
     ("eks", "list-nodegroups"),
     ("eks", "describe-nodegroup"),
 }
-_DENIED = {"rm", "sudo", "shutdown", "reboot", "mkfs", "dd", "terraform", "az", "gcloud"}
+_DENIED = {"rm", "shutdown", "reboot", "mkfs", "dd"}
 _COMPOSE_OPTIONS_WITH_VALUE = {
     "-f",
     "--file",
@@ -51,6 +55,18 @@ _COMPOSE_OPTIONS_WITH_VALUE = {
     "--profile",
     "--project-directory",
 }
+_KUBECTL_OPTIONS_WITH_VALUE = {"-n", "--namespace", "--request-timeout"}
+_HELM_OPTIONS_WITH_VALUE = {"-n", "--namespace"}
+
+
+def _subcommand(arguments: list[str], options_with_value: set[str]) -> tuple[str | None, int]:
+    index = 0
+    while index < len(arguments) and arguments[index].startswith("-"):
+        option = arguments[index].split("=", 1)[0]
+        if option not in options_with_value:
+            return None, index
+        index += 1 if "=" in arguments[index] else 2
+    return (arguments[index] if index < len(arguments) else None), index
 
 
 def _compose_subcommand(arguments: list[str]) -> str | None:
@@ -106,6 +122,100 @@ def _command(
         }
 
 
+def _stream_command(
+    command: list[str],
+    task: DeploymentTask,
+    *,
+    cwd: Path | None = None,
+    timeout: int,
+    stdin_value: str | None = None,
+    stdin_sensitive: bool = False,
+    log_path: Path | None = None,
+    output_limit: int = 20000,
+) -> dict:
+    env = os.environ.copy()
+    if task.environment.kubeconfig:
+        env["KUBECONFIG"] = str(task.environment.kubeconfig.resolve())
+    secret = stdin_value.rstrip("\n") if stdin_sensitive and stdin_value else ""
+
+    def safe(text: str) -> str:
+        text = redact_secrets(text)
+        return text.replace(secret, "[REDACTED INPUT]") if secret else text
+
+    started = time.monotonic()
+    try:
+        process = subprocess.Popen(
+            command,
+            cwd=cwd,
+            env=env,
+            stdin=subprocess.PIPE if stdin_value is not None else subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            errors="replace",
+            bufsize=1,
+            start_new_session=True,
+        )
+    except OSError as exc:
+        return {
+            "exit_code": None,
+            "stdout": "",
+            "stderr": safe(str(exc)),
+            "duration_seconds": round(time.monotonic() - started, 2),
+            "timed_out": False,
+        }
+    if process.stdin:
+        process.stdin.write(stdin_value or "")
+        process.stdin.close()
+
+    chunks: queue.Queue[str | None] = queue.Queue()
+
+    def read_output() -> None:
+        assert process.stdout is not None
+        for line in process.stdout:
+            chunks.put(line)
+        chunks.put(None)
+
+    threading.Thread(target=read_output, daemon=True).start()
+    if log_path:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+    tail = ""
+    finished = False
+    timed_out = False
+    while not finished:
+        try:
+            chunk = chunks.get(timeout=0.1)
+            if chunk is None:
+                finished = True
+                continue
+            chunk = safe(chunk)
+            print(chunk, end="", flush=True)
+            if log_path:
+                with log_path.open("a", encoding="utf-8") as log:
+                    log.write(chunk)
+            tail = (tail + chunk)[-output_limit:]
+        except queue.Empty:
+            pass
+        if process.poll() is None and time.monotonic() - started >= timeout:
+            timed_out = True
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+                process.wait(timeout=5)
+            except (ProcessLookupError, subprocess.TimeoutExpired):
+                with suppress(ProcessLookupError):
+                    os.killpg(process.pid, signal.SIGKILL)
+            process.wait()
+    process.wait()
+    return {
+        "exit_code": None if timed_out else process.returncode,
+        "stdout": tail,
+        "stderr": f"command timed out after {timeout} seconds" if timed_out else "",
+        "duration_seconds": round(time.monotonic() - started, 2),
+        "timed_out": timed_out,
+        **({"output_log": str(log_path)} if log_path else {}),
+    }
+
+
 def _without_target_context(command: list[str], task: DeploymentTask) -> list[str]:
     if task.environment.type != "kubernetes" or command[0] not in {"kubectl", "helm"}:
         return command
@@ -130,7 +240,7 @@ def _without_target_context(command: list[str], task: DeploymentTask) -> list[st
     return [command[0], *arguments]
 
 
-def _target_command(command: list[str], task: DeploymentTask) -> list[str]:
+def target_command(command: list[str], task: DeploymentTask) -> list[str]:
     command = _without_target_context(command, task)
     if task.environment.type == "kubernetes" and command[0] in {"kubectl", "helm"}:
         flag = "--context" if command[0] == "kubectl" else "--kube-context"
@@ -142,15 +252,19 @@ def _read_only(command: list[str]) -> bool:
     if not command:
         return False
     if command[0] == "kubectl":
-        verb = command[1] if len(command) > 1 else ""
+        verb, index = _subcommand(command[1:], _KUBECTL_OPTIONS_WITH_VALUE)
+        verb = verb or ""
+        offset = index + 1
         if verb == "auth":
-            return command[2:3] == ["can-i"]
+            return command[offset + 1 : offset + 2] == ["can-i"]
         if verb == "config":
-            return command[2:3] in (["current-context"], ["get-contexts"])
+            return command[offset + 1 : offset + 2] in (["current-context"], ["get-contexts"])
         return verb in _READ_KUBECTL and not (verb == "rollout" and "status" not in command)
     if command[0] == "helm":
-        verb = command[1] if len(command) > 1 else ""
-        return verb in _READ_HELM or command[1:3] in (
+        verb, index = _subcommand(command[1:], _HELM_OPTIONS_WITH_VALUE)
+        verb = verb or ""
+        offset = index + 1
+        return verb in _READ_HELM or command[offset : offset + 2] in (
             ["repo", "list"],
             ["search", "repo"],
             ["search", "hub"],
@@ -158,6 +272,10 @@ def _read_only(command: list[str]) -> bool:
         )
     if command[0] == "aws":
         return command[1:2] == ["--version"] or tuple(command[1:3]) in _READ_AWS
+    if command[0] == "terraform":
+        return command[1:2] in (["version"], ["validate"], ["show"], ["output"], ["plan"]) or (
+            command[1:2] == ["state"] and command[2:3] in (["list"], ["show"])
+        )
     if command[0] in {"ansible", "ansible-playbook"}:
         return command[1:] == ["--version"] or (
             command[0] == "ansible-playbook"
@@ -174,10 +292,25 @@ def _read_only(command: list[str]) -> bool:
             return False
         if command[1] in {"ps", "images", "inspect", "logs", "info", "version"}:
             return True
-        return command[1:2] == ["compose"] and _compose_subcommand(command[2:]) in {
-            "version",
-            "ps",
+        if command[1:3] in (["image", "ls"], ["image", "inspect"]):
+            return True
+        if command[1] == "events":
+            return any(part == "--until" or part.startswith("--until=") for part in command[2:])
+        if command[1:2] != ["compose"]:
+            return False
+        subcommand = _compose_subcommand(command[2:])
+        if subcommand == "config":
+            return any(
+                part in {"-q", "--quiet", "--images", "--profiles", "--services", "--volumes"}
+                for part in command[2:]
+            )
+        return subcommand in {
+            "images",
+            "logs",
             "ls",
+            "ps",
+            "top",
+            "version",
         }
     return command[0] in {
         "ls",
@@ -192,10 +325,76 @@ def _read_only(command: list[str]) -> bool:
         "lscpu",
         "whoami",
         "id",
+        "grep",
     }
 
 
-def _policy(command: list[str], task: DeploymentTask, *, mutating: bool) -> str:
+def inspect_target(
+    decision: Decision,
+    task: DeploymentTask,
+    sources: SourceTools,
+    workspace: Path,
+    *,
+    enabled: bool,
+    approve: bool,
+) -> dict:
+    policy = classify_command(decision.command, task, mutating=False)
+    if policy.startswith("denied"):
+        return {"status": "policy_denied", "reason": policy}
+    if policy != "allowed":
+        if not enabled:
+            return {
+                "status": "blocked",
+                "reason": "unclassified observation; pass --execute for human review",
+            }
+        high_risk = policy.startswith("high_risk_approval")
+        accepted = approve and not high_risk
+        if not accepted and sys.stdin.isatty():
+            confirmation = "approve" if high_risk else "y"
+            print(
+                f"Approve {'HIGH-RISK ' if high_risk else ''}unclassified observation?\n"
+                f"Command: {shlex.join(target_command(decision.command, task))}\n"
+                f"Reason: {decision.reason}\nPolicy: {policy}\n"
+                f"[{'type approve' if high_risk else 'y'}/N] ",
+                end="",
+                flush=True,
+            )
+            accepted = input().strip().casefold() == confirmation
+        if not accepted:
+            return {"status": "blocked", "reason": policy}
+    cwd = sources.working_directory(decision, workspace) if decision.working_directory else None
+    return _command(target_command(decision.command, task), task, cwd=cwd)
+
+
+def _high_risk(command: list[str]) -> str | None:
+    executable = Path(command[0]).name
+    if executable == "sudo":
+        return "privileged host change"
+    if executable == "kubectl" and any(
+        part in {"delete", "replace", "patch", "drain"} for part in command
+    ):
+        return "potentially destructive Kubernetes operation"
+    if executable == "helm" and any(part in {"uninstall", "rollback"} for part in command):
+        return "potentially destructive Helm operation"
+    if executable in {"aws", "az", "gcloud", "terraform"}:
+        return "cloud or infrastructure change"
+    if executable == "docker" and (
+        command[1:3] in (["system", "prune"], ["volume", "prune"], ["volume", "rm"])
+        or (
+            command[1:2] == ["compose"]
+            and _compose_subcommand(command[2:]) == "down"
+            and any(part in {"-v", "--volumes"} for part in command)
+        )
+    ):
+        return "potentially destructive container operation"
+    return None
+
+
+def _infrastructure_change(command: list[str]) -> bool:
+    return Path(command[0]).name in {"aws", "az", "gcloud", "terraform"} and not _read_only(command)
+
+
+def classify_command(command: list[str], task: DeploymentTask, *, mutating: bool) -> str:
     if not command or Path(command[0]).name in _DENIED:
         return "denied: forbidden command"
     if Path(command[0]).name in {"sh", "bash", "zsh", "python", "python3", "perl", "ruby"} and any(
@@ -211,26 +410,18 @@ def _policy(command: list[str], task: DeploymentTask, *, mutating: bool) -> str:
         command = _without_target_context(command, task)
     except ValueError as exc:
         return f"denied: {exc}"
-    if Path(command[0]).name == "aws":
-        if mutating:
-            return "denied: AWS changes are outside this agent's scope"
-        if any(
-            part.split("=", 1)[0] in {"--profile", "--endpoint-url", "--no-verify-ssl", "--debug"}
-            for part in command[1:]
-        ):
-            return "denied: AWS profile, endpoint, and debug overrides are not allowed"
-    if mutating and _read_only(command):
-        return "denied: execute must propose a mutating command"
-    if not mutating and not _read_only(command):
-        return "denied: observation and validation must be read-only"
-    if mutating and task.environment.type == "kubernetes" and command[0] not in {"kubectl", "helm"}:
-        return "approval_required: source script or host command can change the target"
-    if command[0] == "kubectl" and any(
-        part in {"delete", "replace", "patch", "drain"} for part in command
+    if Path(command[0]).name == "aws" and any(
+        part.split("=", 1)[0] in {"--profile", "--endpoint-url", "--no-verify-ssl", "--debug"}
+        for part in command[1:]
     ):
-        return "denied: potentially destructive Kubernetes operation"
-    if command[0] == "helm" and any(part in {"uninstall", "rollback"} for part in command):
-        return "denied: potentially destructive Helm operation"
+        return "denied: AWS profile, endpoint, and debug overrides are not allowed"
+    if command[:2] == ["kubectl", "config"] and command[2:3] not in (
+        ["current-context"],
+        ["get-contexts"],
+    ):
+        return "denied: Kubernetes context changes are not allowed"
+    if _read_only(command):
+        return "allowed"
     if mutating and (
         command[0] == "kubectl" or command[:2] in (["helm", "install"], ["helm", "upgrade"])
     ):
@@ -247,12 +438,19 @@ def _policy(command: list[str], task: DeploymentTask, *, mutating: bool) -> str:
             and namespace not in task.constraints.allowed_namespaces
         ):
             return "denied: namespace outside allowed scope or not explicit"
-    if not mutating or (task.environment.type == "shell" and task.environment.sandbox):
-        return "allowed"
+    risk = _high_risk(command)
+    if risk and "destructive" in risk and not task.constraints.allow_destructive_actions:
+        return "denied: destructive actions are outside task constraints"
+    if _infrastructure_change(command) and not task.constraints.allow_new_infrastructure:
+        return "denied: infrastructure changes are outside task constraints"
+    if risk:
+        return f"high_risk_approval: {risk}"
+    if not mutating:
+        return "approval_required: command is not known to be read-only; propose it as execute"
     return "approval_required: deployment changes require human review"
 
 
-def _observe(task: DeploymentTask) -> dict:
+def observe_target(task: DeploymentTask) -> dict:
     if task.environment.type == "shell":
         return {
             "host": _command(["uname", "-a"], task),
@@ -280,11 +478,11 @@ def _observe(task: DeploymentTask) -> dict:
     }
 
 
-def _checks(task: DeploymentTask, checks: list[Check], cwd: Path | None = None) -> list[dict]:
+def run_checks(task: DeploymentTask, checks: list[Check], cwd: Path | None = None) -> list[dict]:
     results = []
     for check in checks:
-        command = _target_command(check.command, task)
-        policy = _policy(check.command, task, mutating=False)
+        command = target_command(check.command, task)
+        policy = classify_command(check.command, task, mutating=False)
         result = (
             _command(command, task, cwd=cwd)
             if policy == "allowed"
@@ -293,31 +491,22 @@ def _checks(task: DeploymentTask, checks: list[Check], cwd: Path | None = None) 
         results.append(
             {
                 "command": command,
-                "passed": result["exit_code"] == 0
-                and (check.contains is None or check.contains in result.get("stdout", "")),
+                "status": (
+                    "satisfied"
+                    if result["exit_code"] == 0
+                    and (check.contains is None or check.contains in result.get("stdout", ""))
+                    else "unsatisfied"
+                    if result["exit_code"] == 0
+                    or result["exit_code"] in check.unsatisfied_exit_codes
+                    else "unknown"
+                ),
                 "result": result,
             }
         )
     return results
 
 
-def _absent(check: dict) -> bool:
-    """Only a completed read or a known not-found response proves absence."""
-    if check["passed"]:
-        return False
-    result = check["result"]
-    if result["exit_code"] == 0:
-        return True
-    command = check["command"]
-    error = result.get("stderr", "").casefold()
-    return (
-        (command[0] == "kubectl" and "(notfound)" in error)
-        or (command[0] == "helm" and "not found" in error)
-        or (command[0] == "ls" and "no such file or directory" in error)
-    )
-
-
-def _execute(
+def execute_action(
     decision: Decision,
     task: DeploymentTask,
     sources: SourceTools,
@@ -326,21 +515,24 @@ def _execute(
     enabled: bool,
     approve: bool,
     timeout: int,
+    stdin_value: str | None = None,
+    stdin_sensitive: bool = False,
+    log_path: Path | None = None,
 ) -> dict:
     if not decision.command or not decision.expected_change or not decision.validation:
         return {
-            "status": "blocked",
+            "status": "needs_revision",
             "reason": "mutation needs command, expected change, and validation",
         }
     if not sources.existing_refs(decision.evidence):
         return {
-            "status": "blocked",
+            "status": "needs_revision",
             "reason": "mutation needs an inventoried source file as evidence",
         }
-    policy = _policy(decision.command, task, mutating=True)
+    policy = classify_command(decision.command, task, mutating=True)
     if decision.command[0].startswith("./") and not decision.working_directory:
-        return {"status": "blocked", "reason": "source script needs a working directory"}
-    if policy == "allowed" and not _source_grounded(decision, sources):
+        return {"status": "needs_revision", "reason": "source script needs a working directory"}
+    if policy == "allowed" and not sources.grounds(decision):
         policy = "approval_required: command is not shown by its cited source"
     if policy.startswith("denied"):
         return {"status": "policy_denied", "reason": policy}
@@ -358,65 +550,87 @@ def _execute(
                 "status": "blocked",
                 "reason": "source script would use a different Kubernetes context",
             }
-    cwd = _source_cwd(decision, sources, workspace)
-    before = _checks(task, decision.validation, cwd)
-    if all(item["passed"] for item in before):
+    cwd = sources.working_directory(decision, workspace) if decision.working_directory else None
+    before = run_checks(task, decision.validation, cwd)
+    if all(item["status"] == "satisfied" for item in before):
         return {
             "status": "already_satisfied",
             "reason": "the proposed outcome already passes; choose another gap or a stronger check",
             "before": before,
-            "command": _target_command(decision.command, task),
+            "command": target_command(decision.command, task),
         }
-    if not any(_absent(item) for item in before):
+    if any(item["status"] == "unknown" for item in before):
         return {
             "status": "needs_better_check",
-            "reason": "checks could not prove absence; inspect and refine them",
+            "reason": (
+                "validation was inconclusive; use a source-defined check and declare "
+                "its unsatisfied exit codes"
+            ),
             "before": before,
-            "command": _target_command(decision.command, task),
+            "command": target_command(decision.command, task),
         }
-    if policy.startswith("approval_required") and not approve:
+    needs_review = policy.startswith("high_risk_approval") or (
+        policy.startswith("approval_required") and not approve
+    )
+    if needs_review:
         if not sys.stdin.isatty():
             return {"status": "blocked", "reason": policy, "command": decision.command}
+        high_risk = policy.startswith("high_risk_approval")
+        confirmation = "approve" if high_risk else "y"
         print(
-            f"Approve deployment action on {task.environment.context or task.environment.type}?\n"
+            f"Approve {'HIGH-RISK ' if high_risk else ''}deployment action on "
+            f"{task.environment.context or task.environment.type}\n"
             f"Change: {decision.expected_change}\n"
             f"Source: {decision.working_directory or ', '.join(decision.evidence)}\n"
-            f"Command: {shlex.join(_target_command(decision.command, task))}\n"
+            f"Command: {shlex.join(target_command(decision.command, task))}\n"
+            f"Input: {decision.stdin_input or 'none'}"
+            f"{' (hidden)' if stdin_sensitive else ''}\n"
             f"Check: {'; '.join(shlex.join(check.command) for check in decision.validation)}\n"
-            f"Reason: {decision.reason}\nPolicy: {policy}\n[y/N] ",
+            f"Reason: {decision.reason}\nPolicy: {policy}\n"
+            f"[{'type approve' if high_risk else 'y'}/N] ",
             end="",
             flush=True,
         )
-        if input().strip().casefold() != "y":
+        if input().strip().casefold() != confirmation:
             return {
                 "status": "blocked",
                 "reason": "human declined action",
                 "command": decision.command,
             }
-    command = _target_command(decision.command, task)
+    command = target_command(decision.command, task)
     deadline = time.monotonic() + timeout
-    result = _command(command, task, cwd=cwd, timeout=timeout, output_limit=None)
-    after = _checks(task, decision.validation, cwd)
+    result = _stream_command(
+        command,
+        task,
+        cwd=cwd,
+        timeout=timeout,
+        stdin_value=stdin_value,
+        stdin_sensitive=stdin_sensitive,
+        log_path=log_path,
+    )
+    after = run_checks(task, decision.validation, cwd)
     deadline = min(deadline, time.monotonic() + 300)
-    while result["exit_code"] == 0 and not all(item["passed"] for item in after):
+    while result["exit_code"] == 0 and not all(
+        item["status"] == "satisfied" for item in after
+    ):
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             break
         time.sleep(min(5, remaining))
-        after = _checks(task, decision.validation, cwd)
+        after = run_checks(task, decision.validation, cwd)
     return {
         "status": (
             "command_failed"
             if result["exit_code"] != 0
             else "validated"
-            if all(item["passed"] for item in after)
+            if all(item["status"] == "satisfied" for item in after)
             else "verification_failed"
         ),
         "expected_change": decision.expected_change,
         "policy": policy,
         "command": command,
         "before": before,
-        "before_absent": any(_absent(item) for item in before),
+        "before_unsatisfied": any(item["status"] == "unsatisfied" for item in before),
         "execution": result,
         "after": after,
     }

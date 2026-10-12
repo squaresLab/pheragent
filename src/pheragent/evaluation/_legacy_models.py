@@ -1,11 +1,11 @@
 from __future__ import annotations
 
+from collections.abc import Iterable, Mapping, Set
 from enum import StrEnum
 
 from pydantic import Field, model_validator
 
-from .graph import topological_order
-from .models import IDENTIFIER_PATTERN, ContractModel
+from pheragent.deployment.models import IDENTIFIER_PATTERN, ContractModel
 
 BLOCK_IDENTIFIER_PATTERN = rf"^(?:{IDENTIFIER_PATTERN[1:-1]}|B[0-9]+)$"
 COMPONENT_IDENTIFIER_PATTERN = r"^C[0-9]+_[a-z0-9](?:[a-z0-9._-]*[a-z0-9])?$"
@@ -170,7 +170,7 @@ class DeploymentContext(ContractModel):
             if block.id in block.after:
                 raise ValueError(f"provided block {block.id} cannot depend on itself")
         dependencies = {block.id: set(block.after) for block in self.provided_blocks}
-        topological_order(
+        _topological_order(
             ids,
             dependencies,
             cycle_label="provided block dependencies",
@@ -416,7 +416,7 @@ class DeploymentWorkflow(ContractModel):
             if step.kind == WorkflowStepKind.COMPONENT and step.action_id:
                 raise ValueError(f"component workflow step {step.id} cannot have an action ID")
         dependencies = {step.id: set(step.after) for step in self.steps}
-        topological_order(
+        _topological_order(
             step_ids,
             dependencies,
             cycle_label="deployment workflow step dependencies",
@@ -479,3 +479,28 @@ class FunctionalBlocksDocument(ContractModel):
     blocks: list[FunctionalBlock] = Field(default_factory=list)
     levels: list[list[str]] = Field(default_factory=list)
     unresolved: list[AnalysisQuestion] = Field(default_factory=list)
+
+
+def _topological_order(
+    node_ids: Iterable[str],
+    dependencies: Mapping[str, Set[str]],
+    *,
+    cycle_label: str,
+) -> tuple[str, ...]:
+    positions = {node_id: index for index, node_id in enumerate(node_ids)}
+    emitted: set[str] = set()
+    ordered: list[str] = []
+    while len(ordered) < len(positions):
+        ready = sorted(
+            (
+                node_id
+                for node_id in positions
+                if node_id not in emitted and dependencies.get(node_id, set()) <= emitted
+            ),
+            key=positions.__getitem__,
+        )
+        if not ready:
+            raise ValueError(f"{cycle_label} contains a cycle")
+        ordered.extend(ready)
+        emitted.update(ready)
+    return tuple(ordered)

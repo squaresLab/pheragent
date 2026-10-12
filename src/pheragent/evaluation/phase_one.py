@@ -14,26 +14,7 @@ from typing import Any
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from pheragent.deployment.analysis_llm import (
-    CachedStructuredClassifier,
-    ClassificationOutcome,
-    aggregate_usage,
-)
-from pheragent.deployment.analysis_models import (
-    AnalysisExecutor,
-    AnalysisSourceRef,
-    ComponentDisposition,
-    DeploymentContext,
-    DeploymentWorkflow,
-    DeploymentWorkflowStep,
-    FunctionalBlock,
-    FunctionalBlocksDocument,
-    FunctionalComponent,
-    WorkflowStepKind,
-    WorkflowStepStatus,
-)
 from pheragent.deployment.redaction import redact_secrets
-from pheragent.deployment.run_records import run_record_path
 
 from ._evidence import (
     DeploymentEntity,
@@ -52,6 +33,21 @@ from ._judge import (
     judge_completeness,
     judge_components,
 )
+from ._legacy_models import (
+    AnalysisExecutor,
+    AnalysisSourceRef,
+    ComponentDisposition,
+    DeploymentContext,
+    DeploymentWorkflow,
+    DeploymentWorkflowStep,
+    FunctionalBlock,
+    FunctionalBlocksDocument,
+    FunctionalComponent,
+    WorkflowStepKind,
+    WorkflowStepStatus,
+)
+from ._legacy_run import run_record_path
+from ._llm import EvaluationLLMClient, EvaluationResult, aggregate_usage
 
 _ARTIFACT_NAMES = ("functional-blocks.yaml", "deployment-workflow.yaml")
 _DOCUMENTATION_SUFFIXES = {".md", ".rst", ".txt"}
@@ -214,11 +210,11 @@ class _PhaseOneEvaluator:
         config = self.judge_config
         if config is None:
             raise RuntimeError("judge configuration is required")
-        classifier = config.classifier()
+        client = config.client()
         component_outcomes, component_evidence = self._judge_component_batches(
             run,
             config,
-            classifier,
+            client,
         )
         component_ids = {
             component.id for _, component in _discovered_components(run.document.blocks)
@@ -243,7 +239,7 @@ class _PhaseOneEvaluator:
                 component_ids=component_ids,
                 workflow_step_ids=workflow_step_ids,
                 evidence_ids=set(completeness_evidence),
-                classifier=classifier,
+                client=client,
             )
 
         component_judge_complete = all(outcome.value is not None for outcome in component_outcomes)
@@ -288,7 +284,7 @@ class _PhaseOneEvaluator:
             completeness_outcome is None or completeness_outcome.value is not None
         )
         warnings = tuple(outcome.warning for outcome in outcomes if outcome.warning)
-        usage = aggregate_usage(*outcomes)
+        usage = aggregate_usage(outcomes)
         usage["input_tokens_estimate"] = sum(outcome.input_tokens_estimate for outcome in outcomes)
         return (
             validity,
@@ -309,9 +305,9 @@ class _PhaseOneEvaluator:
         self,
         run: _RunArtifacts,
         config: PhaseOneJudgeConfig,
-        classifier: CachedStructuredClassifier,
+        client: EvaluationLLMClient,
     ) -> tuple[
-        tuple[ClassificationOutcome[ComponentJudgeResponse], ...],
+        tuple[EvaluationResult[ComponentJudgeResponse], ...],
         dict[str, dict[str, str]],
     ]:
         component_batches = _component_batches(
@@ -342,7 +338,7 @@ class _PhaseOneEvaluator:
                     component_ids={component.id for _, component in components},
                     evidence_ids=set(evidence),
                     batch_number=batch_number,
-                    classifier=classifier,
+                    client=client,
                 )
             )
             combined_evidence.update(evidence)

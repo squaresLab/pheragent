@@ -14,8 +14,7 @@ from urllib.parse import urlsplit
 from pheragent.models import CommandResult
 from pheragent.process import run_command
 
-from .enums import SourceKind
-from .models import SourceManifest, SourceManifestEntry, SourcesConfig, SourceSpec
+from .models import SourceKind, SourceManifest, SourceManifestEntry, SourcesConfig, SourceSpec
 
 CommandRunner = Callable[[list[str], Path | None], CommandResult]
 ProgressCallback = Callable[[str], None]
