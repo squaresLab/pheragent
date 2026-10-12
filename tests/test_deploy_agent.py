@@ -519,6 +519,9 @@ def test_sensitive_input_cannot_be_stored_inline() -> None:
 def test_agent_prompt_requires_route_choice_and_deployment_progress() -> None:
     assert "senior DevOps engineer" in _INNER_LOOP_INSTRUCTIONS
     assert "active_step" in _INNER_LOOP_INSTRUCTIONS
+    assert "authoritative ordered record" in _INNER_LOOP_INSTRUCTIONS
+    assert "verified step as complete and settled" in _INNER_LOOP_INSTRUCTIONS
+    assert "Do not investigate verified steps" in _INNER_LOOP_INSTRUCTIONS
     assert "complete replacement snapshot" in _INNER_LOOP_INSTRUCTIONS
     assert "never ask the human to paste the completed generated file" in " ".join(
         _INNER_LOOP_INSTRUCTIONS.split()
