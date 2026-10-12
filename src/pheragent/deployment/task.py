@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Literal
+from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -49,7 +49,7 @@ class Budgets(StrictModel):
 
 
 class ContextSettings(StrictModel):
-    mode: Literal["recent", "summary"] = "recent"
+    mode: Literal["recent", "memory"] = "memory"
     history_window: int = Field(default=8, gt=0, le=50)
 
 
@@ -154,6 +154,9 @@ class Decision(StrictModel):
     resolve_gaps: list[str]
     add_questions: list[str]
     resolve_questions: list[str]
+    memory: list[Annotated[str, Field(min_length=1, max_length=500)]] = Field(
+        default_factory=list, max_length=8
+    )
 
     @model_validator(mode="after")
     def require_valid_inputs(self) -> Decision:

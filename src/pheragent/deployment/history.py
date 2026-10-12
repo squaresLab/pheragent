@@ -44,7 +44,7 @@ class RunHistory:
     def events(self) -> list[dict]:
         return list(self._events())
 
-    def context(self, *, mode: str, window: int) -> list[dict] | dict:
+    def context(self, *, mode: str, window: int, step_id: str | None = None) -> list[dict] | dict:
         useful = [
             event
             for event in self._events()
@@ -52,28 +52,29 @@ class RunHistory:
         ]
         if mode == "recent":
             return useful[-window:]
+
+        decisions = [
+            event["value"]
+            for event in useful
+            if event["event"] == "decision"
+            and event.get("value", {}).get("step_id") == step_id
+            and event.get("value", {}).get("memory")
+        ]
         sources = {}
         for event in useful:
             result = event.get("result", {})
             if event.get("tool") == "read_file" and result.get("source"):
-                text = result.get("text", "")
                 sources[result["source"]] = {
                     "source": result["source"],
                     "total_lines": result.get("total_lines"),
-                    "text": text if len(text) <= 3000 else text[:1500] + "\n[…]\n" + text[-1500:],
+                    "complete": result.get("complete"),
                 }
         return {
-            "decisions": sum(event["event"] == "decision" for event in useful),
-            "tools": sum(event["event"] == "tool" for event in useful),
-            "source_notes": list(sources.values())[-window:],
+            "active_step": step_id,
+            "notes": decisions[-1]["memory"] if decisions else [],
+            "sources_read": list(sources.values())[-window:],
             "recent": [
-                {
-                    "event": event["event"],
-                    "tool": event.get("tool"),
-                    "focus": event.get("value", {}).get("focus"),
-                    "status": event.get("result", {}).get("status"),
-                    "reason": event.get("result", {}).get("reason"),
-                }
+                _event_summary(event)
                 for event in useful[-min(window, 4) :]
             ],
         }
@@ -108,3 +109,17 @@ class RunHistory:
             for line in handle:
                 if line.strip():
                     yield json.loads(line)
+
+
+def _event_summary(event: dict) -> dict:
+    if event["event"] == "decision":
+        value = event.get("value", {})
+        fields = ("kind", "tool", "focus", "reason", "step_id", "source_path", "command")
+        return {"event": "decision", **{key: value[key] for key in fields if value.get(key)}}
+    result = event.get("result", {})
+    fields = ("status", "reason", "source", "error", "repeated_result_count")
+    return {
+        "event": event["event"],
+        **({"tool": event["tool"]} if event.get("tool") else {}),
+        **{key: result[key] for key in fields if result.get(key) is not None},
+    }

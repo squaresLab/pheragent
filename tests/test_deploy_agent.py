@@ -519,6 +519,7 @@ def test_sensitive_input_cannot_be_stored_inline() -> None:
 def test_agent_prompt_requires_route_choice_and_deployment_progress() -> None:
     assert "senior DevOps engineer" in _INNER_LOOP_INSTRUCTIONS
     assert "active_step" in _INNER_LOOP_INSTRUCTIONS
+    assert "complete replacement snapshot" in _INNER_LOOP_INSTRUCTIONS
     assert "private chain-of-thought" in _INNER_LOOP_INSTRUCTIONS
 
 
