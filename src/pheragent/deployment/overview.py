@@ -41,6 +41,7 @@ class DeploymentOverview(StrictModel):
     route_evidence: list[str] = Field(min_length=1)
     stages: list[OverviewStage] = Field(min_length=1, max_length=6)
     discoveries: list[str] = Field(default_factory=list)
+    removed_sources: list[str] = Field(default_factory=list)
     revision: int = 1
 
 
@@ -64,6 +65,8 @@ For every step, cite primary selected files in source_refs and list named system
 only when useful. related_sources may contain relevant exact paths from the supplied neighboring
 files; they are navigation hints, not evidence. Keep both lists small. Primary files are the
 starting point for resolving that step, not proof that it is already complete.
+The harness removes paths that are absent from the repository and records them in
+removed_sources. Do not rely on those removed paths.
 """
 
 
@@ -101,12 +104,12 @@ def create_overview(
             "related_sources": related_sources,
         },
     )
-    _validate_overview(plan, sources)
     overview = plan.model_copy(
         update={
             "route": selection.route,
             "route_evidence": selection.files,
             "discoveries": [],
+            "removed_sources": [],
             "stages": [
                 stage.model_copy(
                     update={
@@ -119,6 +122,8 @@ def create_overview(
             ],
         }
     )
+    _remove_missing_sources(overview, sources)
+    _validate_overview(overview, sources)
     usage: dict[str, int] = {}
     _usage(usage, selection_usage)
     _usage(usage, plan_usage)
@@ -151,9 +156,12 @@ def set_discoveries(overview: DeploymentOverview, discoveries: list[str]) -> Non
 def apply_change(
     overview: DeploymentOverview, change: OverviewChange, sources: SourceTools
 ) -> None:
-    missing = set(change.source_refs + change.related_sources) - sources.readable_paths
-    if missing:
-        raise ValueError(f"overview evidence is absent from inventory: {sorted(missing)}")
+    removed: set[str] = set()
+    source_refs = _existing_sources(change.source_refs, sources, removed)
+    related_sources = _existing_sources(change.related_sources, sources, removed)
+    if not source_refs:
+        source_refs = _existing_sources(overview.route_evidence, sources, removed)
+    overview.removed_sources = sorted(set(overview.removed_sources) | removed)
     existing = [
         step for stage in overview.stages for step in stage.steps if step.id == change.step_id
     ]
@@ -163,8 +171,8 @@ def apply_change(
         existing[0].goal = change.goal
         existing[0].success_condition = change.success_condition
         existing[0].components = change.components
-        existing[0].source_refs = change.source_refs
-        existing[0].related_sources = change.related_sources
+        existing[0].source_refs = source_refs
+        existing[0].related_sources = related_sources
     else:
         if existing or not change.before_step_id:
             raise ValueError("inserted steps need a new ID and before_step_id")
@@ -178,8 +186,8 @@ def apply_change(
                             goal=change.goal,
                             success_condition=change.success_condition,
                             components=change.components,
-                            source_refs=change.source_refs,
-                            related_sources=change.related_sources,
+                            source_refs=source_refs,
+                            related_sources=related_sources,
                         ),
                     )
                     overview.revision += 1
@@ -210,3 +218,26 @@ def _validate_overview(overview: DeploymentOverview, sources: SourceTools | None
         }
         if missing:
             raise ValueError(f"overview evidence is absent from inventory: {sorted(missing)}")
+
+
+def _remove_missing_sources(overview: DeploymentOverview, sources: SourceTools) -> None:
+    removed: set[str] = set()
+    for stage in overview.stages:
+        for step in stage.steps:
+            step.source_refs = _existing_sources(step.source_refs, sources, removed)
+            step.related_sources = _existing_sources(step.related_sources, sources, removed)
+            if not step.source_refs:
+                step.source_refs = list(overview.route_evidence)
+    overview.removed_sources = sorted(removed)
+
+
+def _existing_sources(
+    references: list[str], sources: SourceTools, removed: set[str]
+) -> list[str]:
+    existing = []
+    for reference in references:
+        if reference in sources.readable_paths:
+            existing.append(reference)
+        else:
+            removed.add(reference)
+    return existing

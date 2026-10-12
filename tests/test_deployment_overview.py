@@ -74,9 +74,13 @@ def test_model_selects_route_then_builds_overview_from_complete_files(tmp_path: 
                                         "goal": "start services",
                                         "success_condition": "services are healthy",
                                         "components": ["frontend"],
-                                        "source_refs": ["repository-1:docs/run.md"],
+                                        "source_refs": [
+                                            "repository-1:docs/run.md",
+                                            "repository-1:docs/missing.md",
+                                        ],
                                         "related_sources": [
-                                            "repository-1:docs/details.md"
+                                            "repository-1:docs/details.md",
+                                            "repository-1:docs/also-missing.md",
                                         ],
                                     }
                                 ],
@@ -99,6 +103,10 @@ def test_model_selects_route_then_builds_overview_from_complete_files(tmp_path: 
     assert active_step(overview).source_refs == ["repository-1:docs/run.md"]
     assert active_step(overview).components == ["frontend"]
     assert active_step(overview).related_sources == ["repository-1:docs/details.md"]
+    assert overview.removed_sources == [
+        "repository-1:docs/also-missing.md",
+        "repository-1:docs/missing.md",
+    ]
     assert usage == {"requests": 2}
     set_discoveries(overview, ["database endpoint missing", "database endpoint missing"])
     assert overview.discoveries == ["database endpoint missing"]
@@ -139,10 +147,16 @@ def test_grounded_prerequisite_is_inserted_before_its_consumer(tmp_path: Path) -
             before_step_id="service",
             goal="provide storage",
             success_condition="a dynamic provisioner is ready",
-            source_refs=["repository-1:README.md"],
+            source_refs=["repository-1:missing.md"],
+            related_sources=["repository-1:also-missing.md"],
         ),
         sources,
     )
 
     assert active_step(overview).id == "storage"
+    assert active_step(overview).source_refs == ["repository-1:README.md"]
+    assert overview.removed_sources == [
+        "repository-1:also-missing.md",
+        "repository-1:missing.md",
+    ]
     assert [step.id for step in overview.stages[0].steps] == ["storage", "service"]
