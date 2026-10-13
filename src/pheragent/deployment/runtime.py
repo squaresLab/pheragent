@@ -368,7 +368,23 @@ def inspect_target(
 
 def _high_risk(command: list[str]) -> str | None:
     executable = Path(command[0]).name
-    if executable == "sudo":
+    script_name = executable.casefold().removesuffix(".sh").replace("_", "-")
+    if any(
+        word in script_name.split("-")
+        for word in {"cleanup", "delete", "destroy", "purge", "reset", "uninstall"}
+    ):
+        return "potentially destructive source script"
+    if executable in {
+        "sudo",
+        "apt",
+        "apt-get",
+        "dnf",
+        "yum",
+        "zypper",
+        "snap",
+        "systemctl",
+        "service",
+    }:
         return "privileged host change"
     if executable == "kubectl" and any(
         part in {"delete", "replace", "patch", "drain"} for part in command
@@ -633,4 +649,69 @@ def execute_action(
         "before_unsatisfied": any(item["status"] == "unsatisfied" for item in before),
         "execution": result,
         "after": after,
+    }
+
+
+def execute_command(
+    decision,
+    task: DeploymentTask,
+    sources: SourceTools,
+    workspace: Path,
+    *,
+    enabled: bool,
+    timeout: int,
+    stdin_value: str | None = None,
+    stdin_sensitive: bool = False,
+    log_path: Path | None = None,
+) -> dict:
+    """Run one policy-checked command for the autonomous research loop."""
+    policy = classify_command(decision.command, task, mutating=True)
+    if policy.startswith("denied"):
+        return {"status": "policy_denied", "reason": policy}
+    if not enabled:
+        return {
+            "status": "dry_run",
+            "reason": "pass --execute to run commands",
+            "command": decision.command,
+            "policy": policy,
+        }
+
+    cwd = sources.working_directory(decision, workspace) if decision.working_directory else None
+    high_risk = policy.startswith("high_risk_approval")
+    if high_risk:
+        if not sys.stdin.isatty():
+            return {"status": "approval_required", "reason": policy}
+        print(
+            f"Approve HIGH-RISK action on {task.environment.context or task.environment.type}?\n"
+            f"Command: {shlex.join(target_command(decision.command, task))}\n"
+            f"Reason: {decision.reason}\nPolicy: {policy}\n[type approve/N] ",
+            end="",
+            flush=True,
+        )
+        if input().strip().casefold() != "approve":
+            return {"status": "declined", "reason": "human declined action"}
+
+    if task.environment.type == "kubernetes" and decision.command[0] not in {"kubectl", "helm"}:
+        current = _command(["kubectl", "config", "current-context"], task)
+        if current["exit_code"] != 0 or current["stdout"].strip() != task.environment.context:
+            return {
+                "status": "policy_denied",
+                "reason": "source command would use a different Kubernetes context",
+            }
+
+    command = target_command(decision.command, task)
+    execution = _stream_command(
+        command,
+        task,
+        cwd=cwd,
+        timeout=timeout,
+        stdin_value=stdin_value,
+        stdin_sensitive=stdin_sensitive,
+        log_path=log_path,
+    )
+    return {
+        "status": "succeeded" if execution["exit_code"] == 0 else "command_failed",
+        "policy": policy,
+        "command": command,
+        "execution": execution,
     }

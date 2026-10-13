@@ -1,0 +1,83 @@
+task:
+  objective: >-
+    Deploy as much of the source-defined system as possible on the declared target.
+    Install and verify managed core components. Diagnose local failures and missing
+    prerequisites. Defer unavailable external integrations without blocking independent
+    work, and record every placeholder and human follow-up.
+
+sources:
+  repositories:
+    - location: https://github.com/mosip/mosip-infra
+
+environment:
+  type: kubernetes
+  context: mosip
+
+constraints:
+  allow_new_infrastructure: false
+  allow_destructive_actions: true
+  allowed_namespaces:
+    - default
+    - abis
+    - activemq
+    - admin
+    - artifactory
+    - apitestrig
+    - biosdk
+    - bqatsdk
+    - captcha
+    - clamav
+    - conf-secrets
+    - config-server
+    - converters
+    - credentialfeeder
+    - data-archive
+    - datashare
+    - digitalcard
+    - dslrig
+    - gc-util
+    - ida
+    - idrepo
+    - infra-admin
+    - istio-system
+    - kafka
+    - keycloak
+    - keymanager
+    - key-migration-utility
+    - kernel
+    - landing-page
+    - masterdata-loader
+    - minio
+    - minio-client-util
+    - mock-smtp
+    - mosip-file-server
+    - msg-gateways
+    - oauth2-proxy
+    - packetcreator
+    - packetmanager
+    - pms
+    - pms-migration-utility
+    - postgres
+    - prereg
+    - print
+    - regclient
+    - regproc
+    - resident
+    - s3
+    - softhsm
+    - softhsm-backup
+    - status-check
+    - tusd
+    - uitestrig
+    - util
+    - websub
+
+budgets:
+  max_cycles: 120
+  max_mutating_actions: 80
+  max_runtime_minutes: 720
+  max_read_actions_per_cycle: 20
+
+inputs:
+  INSTALL_CONFIRMATION:
+    value: "yes"
