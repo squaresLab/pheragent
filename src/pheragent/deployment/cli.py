@@ -29,6 +29,7 @@ def add_deployment_parser(subparsers) -> None:
     oneshot.add_argument("--model", default="gpt-6-astra")
     oneshot.add_argument("--reasoning-effort", default="max")
     oneshot.add_argument("--execute", action="store_true", help="Run policy-permitted commands.")
+    oneshot.add_argument("--resume", action="store_true", help="Continue an existing run.")
 
 
 def run_deployment_command(args: argparse.Namespace) -> int:
@@ -48,6 +49,7 @@ def run_deployment_command(args: argparse.Namespace) -> int:
                     model=args.model,
                     reasoning_effort=args.reasoning_effort,
                     execute=args.execute,
+                    resume=args.resume,
                 )
             else:
                 report = run_deployment_agent(

@@ -37,7 +37,7 @@ def test_oneshot_continues_after_denial_and_records_partial_success(
 ) -> None:
     source = tmp_path / "source"
     source.mkdir()
-    (source / "install.sh").write_text("#!/bin/sh\ntouch ready\n")
+    (source / "install.sh").write_text("#!/bin/sh\ntouch ready\necho installed\n")
     (source / "install.sh").chmod(0o755)
     task_path = tmp_path / "task.yaml"
     _task(task_path, source)
@@ -59,7 +59,7 @@ def test_oneshot_continues_after_denial_and_records_partial_success(
             _decision(
                 "command",
                 "verify installed file",
-                command=["test", "-f", "ready"],
+                command=["ls", "ready"],
                 working_directory="repository-1:.",
                 component="sample",
             ),
@@ -110,3 +110,74 @@ def test_host_package_changes_need_high_risk_approval() -> None:
     assert classify_command(["./uninstall.sh"], task, mutating=True).startswith(
         "high_risk_approval"
     )
+
+
+def test_oneshot_resumes_without_overwriting_history(tmp_path: Path, monkeypatch) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "install.sh").write_text("#!/bin/sh\ntouch ready\necho installed\n")
+    (source / "install.sh").chmod(0o755)
+    task_path = tmp_path / "task.yaml"
+    _task(task_path, source)
+    task = yaml.safe_load(task_path.read_text())
+    task["budgets"]["max_cycles"] = 1
+    task_path.write_text(yaml.safe_dump(task))
+    output = tmp_path / "run"
+    monkeypatch.setattr(
+        "pheragent.deployment.oneshot.observe_target",
+        lambda _task: {"host": {"exit_code": 0, "stdout": "ready", "stderr": ""}},
+    )
+
+    first = run_oneshot_agent(
+        task_path,
+        output,
+        execute=True,
+        decide=lambda _payload, _iteration: (
+            _decision(
+                "command",
+                "install sample",
+                command=["./install.sh"],
+                working_directory="repository-1:.",
+                component="sample",
+            ),
+            {},
+        ),
+    )
+    assert first["status"] == "BUDGET_EXHAUSTED"
+
+    task["budgets"]["max_cycles"] = 5
+    task_path.write_text(yaml.safe_dump(task))
+    resumed_decisions = iter(
+        [
+            _decision(
+                "command",
+                "verify sample",
+                command=["ls", "ready"],
+                working_directory="repository-1:.",
+                component="sample",
+            ),
+            _decision("record", "sample is healthy", component="sample", status="verified"),
+            _decision("finish", "no work remains"),
+            _decision("finish", "audit complete"),
+        ]
+    )
+    resumed = run_oneshot_agent(
+        task_path,
+        output,
+        execute=True,
+        resume=True,
+        decide=lambda _payload, _iteration: (next(resumed_decisions), {}),
+    )
+
+    assert resumed["status"] == "SUCCESS"
+    assert resumed["cycles"] == 5
+    assert (output / "actions/0001.log").is_file()
+    assert (output / "actions/0002.log").is_file()
+    decisions = [
+        event
+        for event in (
+            json.loads(line) for line in (output / "events.jsonl").read_text().splitlines()
+        )
+        if event["event"] == "decision"
+    ]
+    assert [event["iteration"] for event in decisions] == [1, 2, 3, 4, 5]

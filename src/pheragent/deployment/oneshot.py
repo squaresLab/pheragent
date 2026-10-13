@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import time
 from pathlib import Path
@@ -138,6 +139,7 @@ def run_oneshot_agent(
     model: str = "gpt-6-astra",
     reasoning_effort: str | None = "max",
     execute: bool = False,
+    resume: bool = False,
     decide=None,
 ) -> dict:
     task_path = task_path.resolve()
@@ -149,7 +151,11 @@ def run_oneshot_agent(
         if not task.environment.kubeconfig.is_file():
             raise ValueError("environment.kubeconfig does not exist")
 
-    output.mkdir(parents=True, exist_ok=False)
+    if resume:
+        if not (output / "events.jsonl").is_file():
+            raise ValueError("--resume requires an existing one-shot run")
+    else:
+        output.mkdir(parents=True, exist_ok=False)
     write_json(output / "task.json", task)
     specs = [
         _source_spec(item, purpose, index, task_path.parent)
@@ -168,20 +174,36 @@ def run_oneshot_agent(
     history = RunHistory(output)
     client = LLMClient(model=model, reasoning_effort=reasoning_effort)
     components: dict[str, dict] = {}
+    actions = 0
+    start_iteration = 0
+    last_result: dict = {}
+    if resume:
+        component_path = output / "component-status.json"
+        if component_path.is_file():
+            components = {
+                item["name"]: item for item in json.loads(component_path.read_text())
+            }
+        report_path = output / "final-report.json"
+        if report_path.is_file():
+            previous_report = json.loads(report_path.read_text())
+            actions = previous_report.get("mutating_actions", 0)
+            start_iteration = previous_report.get("cycles", 0)
+        for event in reversed(history.events()):
+            if event.get("event") == "tool":
+                last_result = event.get("result", {})
+                break
     inputs = _input_state(task, task_path.parent)
     inventory = sources.inventory()
     observation = observe_target(task)
     history.append("observe", iteration=0, result=observation)
-    last_result: dict = {}
     repeated_failures: dict[tuple[str, ...], int] = {}
-    actions = 0
     audit_pending = False
     started = time.monotonic()
     reason = "decision budget exhausted"
     status = "BUDGET_EXHAUSTED"
-    iteration = 0
+    iteration = start_iteration
 
-    for iteration in range(1, task.budgets.max_cycles + 1):
+    for iteration in range(start_iteration + 1, task.budgets.max_cycles + 1):
         remaining = task.budgets.max_runtime_minutes * 60 - (time.monotonic() - started)
         if remaining <= 0:
             reason = "runtime budget exhausted"
@@ -191,7 +213,7 @@ def run_oneshot_agent(
             "target": task.environment.model_dump(exclude={"kubeconfig"}),
             "constraints": task.constraints.model_dump(),
             "available_inputs": inputs,
-            "source_inventory": inventory if iteration == 1 else None,
+            "source_inventory": inventory if iteration == start_iteration + 1 else None,
             "source_workspaces": {
                 source_id: str((output / "workspace" / source_id).resolve())
                 for source_id in sources.sources

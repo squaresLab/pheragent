@@ -73,10 +73,10 @@ constraints:
     - websub
 
 budgets:
-  max_cycles: 120
-  max_mutating_actions: 80
-  max_runtime_minutes: 720
-  max_read_actions_per_cycle: 20
+  max_cycles: 360
+  max_mutating_actions: 240
+  max_runtime_minutes: 2160
+  max_read_actions_per_cycle: 60
 
 inputs:
   INSTALL_CONFIRMATION:
