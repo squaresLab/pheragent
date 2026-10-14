@@ -14,7 +14,7 @@ from .agent import _input_state, _input_value, compact_context
 from .history import RunHistory
 from .llm import LLMClient
 from .models import SourcesConfig
-from .runtime import classify_command, execute_command, observe_target
+from .runtime import execute_command, observe_target
 from .serialization import load_yaml, write_json
 from .source_manager import SourceManager
 from .sources import SourceTools, _source_spec
@@ -37,6 +37,15 @@ Shell operators and inline interpreter programs are unavailable. Use repository 
 cp, and sed -i for simple source-workspace changes. A command failure is feedback: inspect
 it, repair the local cause or install an in-scope prerequisite, then retry only after
 something has changed. If policy rejects a command, propose a safer command and continue.
+Ordinary non-destructive commands run without review in this research mode. Destructive
+actions still require approval. Declared target, namespace, and infrastructure boundaries
+remain enforced.
+
+Return memory as a complete replacement for the compact facts needed to continue the active
+component. Keep at most 12 short notes covering the current goal, established source facts,
+exact relevant paths and commands, known runtime state, failures already explained, and the
+next intended action. Consult memory before reading. Do not reread unchanged files merely to
+recover a fact already in memory. Remove facts that are no longer useful.
 
 For an interactive source command, stdin_input may name an available task input. Never put
 secrets in the command or reason.
@@ -74,6 +83,7 @@ class OneShotDecision(StrictModel):
     human_action: str | None = None
     placeholder: str | None = None
     stdin_input: str | None = Field(default=None, pattern=r"^[A-Za-z][A-Za-z0-9_]*$")
+    memory: list[str] = Field(default_factory=list, max_length=12)
 
     @model_validator(mode="after")
     def validate_action(self) -> OneShotDecision:
@@ -177,12 +187,11 @@ def run_oneshot_agent(
     actions = 0
     start_iteration = 0
     last_result: dict = {}
+    working_memory: list[str] = []
     if resume:
         component_path = output / "component-status.json"
         if component_path.is_file():
-            components = {
-                item["name"]: item for item in json.loads(component_path.read_text())
-            }
+            components = {item["name"]: item for item in json.loads(component_path.read_text())}
         report_path = output / "final-report.json"
         if report_path.is_file():
             previous_report = json.loads(report_path.read_text())
@@ -191,6 +200,10 @@ def run_oneshot_agent(
         for event in reversed(history.events()):
             if event.get("event") == "tool":
                 last_result = event.get("result", {})
+                break
+        for event in reversed(history.events()):
+            if event.get("event") == "decision":
+                working_memory = event.get("value", {}).get("memory", [])
                 break
     inputs = _input_state(task, task_path.parent)
     inventory = sources.inventory()
@@ -220,7 +233,8 @@ def run_oneshot_agent(
             },
             "runtime_state": _runtime_summary(observation),
             "components": list(components.values()),
-            "recent_history": history.context(mode="recent", window=6),
+            "working_memory": working_memory,
+            "recent_history": history.context(mode="recent", window=2),
             "last_result": compact_context(last_result),
             "final_audit_requested": audit_pending,
             "iteration": iteration,
@@ -232,6 +246,7 @@ def run_oneshot_agent(
         )
         print(f"oneshot: {decision.action}: {decision.reason}", flush=True)
         history.append("decision", iteration=iteration, value=decision.model_dump(), usage=usage)
+        working_memory = decision.memory
 
         if decision.action == "finish":
             if audit_pending:
@@ -289,10 +304,10 @@ def run_oneshot_agent(
             stdin_value=stdin_value,
             stdin_sensitive=stdin_sensitive,
             log_path=output / "actions" / f"{iteration:04d}.log",
+            allow_non_destructive=True,
         )
         result["component"] = decision.component
-        policy = result.get("policy", classify_command(decision.command, task, mutating=True))
-        if policy != "allowed" and result.get("execution"):
+        if result.get("state_changing") and result.get("execution"):
             actions += 1
         if decision.component:
             _update_component(components, decision, "attempted")

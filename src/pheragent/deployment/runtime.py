@@ -312,7 +312,12 @@ def _read_only(command: list[str]) -> bool:
             "top",
             "version",
         }
+    if command[0] == "sed":
+        return not any(part == "-i" or part.startswith("-i") for part in command[1:])
     return command[0] in {
+        "cat",
+        "find",
+        "head",
         "ls",
         "pwd",
         "uname",
@@ -326,6 +331,9 @@ def _read_only(command: list[str]) -> bool:
         "whoami",
         "id",
         "grep",
+        "rg",
+        "tail",
+        "wc",
     }
 
 
@@ -374,6 +382,32 @@ def _high_risk(command: list[str]) -> str | None:
         for word in {"cleanup", "delete", "destroy", "purge", "reset", "uninstall"}
     ):
         return "potentially destructive source script"
+    destructive = {
+        "delete",
+        "destroy",
+        "disable",
+        "drop",
+        "erase",
+        "kill",
+        "mkfs",
+        "purge",
+        "reboot",
+        "remove",
+        "reset",
+        "rm",
+        "shutdown",
+        "stop",
+        "truncate",
+        "uninstall",
+        "wipe",
+    }
+    if any(
+        token == word or token.startswith(word + "-")
+        for part in command[1:]
+        for token in [part.casefold().lstrip("-").split("=", 1)[0].replace("_", "-")]
+        for word in destructive
+    ):
+        return "potentially destructive operation"
     if executable in {
         "sudo",
         "apt",
@@ -417,10 +451,7 @@ def classify_command(command: list[str], task: DeploymentTask, *, mutating: bool
         part in {"-c", "-e"} for part in command[1:]
     ):
         return "denied: inline interpreter commands are not allowed"
-    if any(
-        any(mark in part for mark in (";", "&&", "||", "|", "$(", "`", ">", "<"))
-        for part in command
-    ):
+    if any(part in {";", "&&", "||", "|", ">", "<"} for part in command):
         return "denied: shell operators are not allowed"
     try:
         command = _without_target_context(command, task)
@@ -663,11 +694,19 @@ def execute_command(
     stdin_value: str | None = None,
     stdin_sensitive: bool = False,
     log_path: Path | None = None,
+    allow_non_destructive: bool = False,
 ) -> dict:
     """Run one policy-checked command for the autonomous research loop."""
     policy = classify_command(decision.command, task, mutating=True)
+    state_changing = policy != "allowed"
     if policy.startswith("denied"):
         return {"status": "policy_denied", "reason": policy}
+    if allow_non_destructive and (
+        policy.startswith("approval_required")
+        or policy.startswith("high_risk_approval")
+        and "destructive" not in policy
+    ):
+        policy = "allowed"
     if not enabled:
         return {
             "status": "dry_run",
@@ -712,6 +751,7 @@ def execute_command(
     return {
         "status": "succeeded" if execution["exit_code"] == 0 else "command_failed",
         "policy": policy,
+        "state_changing": state_changing,
         "command": command,
         "execution": execution,
     }

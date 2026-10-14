@@ -55,6 +55,7 @@ def test_oneshot_continues_after_denial_and_records_partial_success(
                 command=["./install.sh"],
                 working_directory="repository-1:.",
                 component="sample",
+                memory=["The documented installer is repository-1:install.sh."],
             ),
             _decision(
                 "command",
@@ -89,9 +90,11 @@ def test_oneshot_continues_after_denial_and_records_partial_success(
     statuses = {item["name"]: item["status"] for item in report["components"]}
     assert statuses == {"sample": "verified", "vendor-api": "deferred"}
     events = [json.loads(line) for line in (output / "events.jsonl").read_text().splitlines()]
-    assert any(
-        event.get("result", {}).get("status") == "policy_denied" for event in events
+    assert any(event.get("result", {}).get("status") == "policy_denied" for event in events)
+    installer = next(
+        event for event in events if event.get("result", {}).get("command") == ["./install.sh"]
     )
+    assert installer["result"]["policy"] == "allowed"
 
 
 def test_host_package_changes_need_high_risk_approval() -> None:
@@ -109,6 +112,9 @@ def test_host_package_changes_need_high_risk_approval() -> None:
     )
     assert classify_command(["./uninstall.sh"], task, mutating=True).startswith(
         "high_risk_approval"
+    )
+    assert not classify_command(["rg", "-n", "delete|drop", "."], task, mutating=True).startswith(
+        "denied"
     )
 
 
@@ -139,6 +145,7 @@ def test_oneshot_resumes_without_overwriting_history(tmp_path: Path, monkeypatch
                 command=["./install.sh"],
                 working_directory="repository-1:.",
                 component="sample",
+                memory=["The sample installer created the ready file."],
             ),
             {},
         ),
@@ -161,12 +168,23 @@ def test_oneshot_resumes_without_overwriting_history(tmp_path: Path, monkeypatch
             _decision("finish", "audit complete"),
         ]
     )
+
+    resumed_calls = 0
+
+    def resume_decide(payload, _iteration):
+        nonlocal resumed_calls
+        if resumed_calls == 0:
+            assert payload["working_memory"] == ["The sample installer created the ready file."]
+        assert len(payload["recent_history"]) <= 2
+        resumed_calls += 1
+        return next(resumed_decisions), {}
+
     resumed = run_oneshot_agent(
         task_path,
         output,
         execute=True,
         resume=True,
-        decide=lambda _payload, _iteration: (next(resumed_decisions), {}),
+        decide=resume_decide,
     )
 
     assert resumed["status"] == "SUCCESS"
