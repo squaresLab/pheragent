@@ -80,7 +80,7 @@ def record_event(event: str, data: dict) -> None:
     }
     with span(
         f"agent.{event}",
-        span_type="TOOL" if event == "tool" else "DEFAULT",
+        span_type="TOOL" if event in {"tool", "action_finished"} else "DEFAULT",
         input=data,
         **attributes,
     ):

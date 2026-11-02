@@ -27,6 +27,7 @@ from .runtime import (
     inspect_target,
     observe_target,
     run_checks,
+    target_command,
 )
 from .serialization import load_yaml, write_json, write_yaml
 from .source_manager import SourceManager
@@ -809,6 +810,14 @@ def run_deployment_agent(
                         item.name == decision.stdin_input and item.sensitive
                         for item in decision.required_inputs
                     )
+                started_event = {
+                    "iteration": cycle,
+                    "tool": "execute",
+                    "command": target_command(decision.command, task),
+                    "working_directory": decision.working_directory,
+                    "step_id": decision.step_id,
+                    "expected_change": decision.expected_change,
+                }
                 last_result = execute_action(
                     decision,
                     task,
@@ -820,6 +829,9 @@ def run_deployment_agent(
                     stdin_value=stdin_value,
                     stdin_sensitive=stdin_sensitive,
                     log_path=output / "actions" / f"{cycle:04d}.log",
+                    on_start=lambda event=started_event: history.append(
+                        "action_started", **event
+                    ),
                 )
                 refresh_environment = "execution" in last_result
                 if last_result["status"] == "needs_revision":
@@ -913,7 +925,12 @@ def run_deployment_agent(
                 set_discoveries(overview, state["gaps"] + state["unresolved"])
                 state["overview"] = overview.model_dump()
                 write_yaml(output / "overview.yaml", overview)
-            history.append("tool", iteration=cycle, tool=decision.tool, result=last_result)
+            event = (
+                "action_finished"
+                if decision.tool == "execute" and "execution" in last_result
+                else "tool"
+            )
+            history.append(event, iteration=cycle, tool=decision.tool, result=last_result)
             if decision.tool == "execute" or step_completed or status == "BLOCKED":
                 break
         write_json(output / "state.json", state)

@@ -57,7 +57,13 @@ def _decision(kind: str, tool: str | None = None, **changes: object) -> Decision
 
 def _execution_events(output: Path) -> list[dict]:
     events = [json.loads(line) for line in (output / "events.jsonl").read_text().splitlines()]
-    return [event for event in events if event["event"] == "tool" and event["tool"] == "execute"]
+    return [
+        event
+        for event in events
+        if event["event"] == "action_finished"
+        or event["event"] == "tool"
+        and event.get("tool") == "execute"
+    ]
 
 
 def _task(path: Path, source: Path, output: Path) -> None:
@@ -122,9 +128,11 @@ def test_agent_previews_then_validates_a_source_installer(tmp_path: Path) -> Non
     assert (output / "run-summary.json").is_file()
 
     events = [json.loads(line) for line in (output / "events.jsonl").read_text().splitlines()]
-    action = next(event for event in events if event.get("tool") == "execute")
+    started = next(event for event in events if event["event"] == "action_started")
+    action = next(event for event in events if event["event"] == "action_finished")
     assert action["result"]["status"] == "validated"
     assert action["result"]["after"][0]["status"] == "satisfied"
+    assert started["sequence"] < action["sequence"]
     assert any(
         event["event"] == "checkpoint" and event["sequence"] > action["sequence"]
         for event in events

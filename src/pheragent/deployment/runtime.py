@@ -623,6 +623,7 @@ def execute_action(
     stdin_value: str | None = None,
     stdin_sensitive: bool = False,
     log_path: Path | None = None,
+    on_start=None,
 ) -> dict:
     if not decision.command or not decision.expected_change or not decision.validation:
         return {
@@ -704,6 +705,8 @@ def execute_action(
             }
     command = target_command(decision.command, task)
     deadline = time.monotonic() + timeout
+    if on_start:
+        on_start()
     result = _stream_command(
         command,
         task,

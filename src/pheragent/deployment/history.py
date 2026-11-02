@@ -53,6 +53,8 @@ class RunHistory:
             if event["event"] not in {
                 "decision",
                 "tool",
+                "action_started",
+                "action_finished",
                 "human_choice",
                 "human_input",
                 "overview_revised",
@@ -100,6 +102,9 @@ def _event_summary(event: dict) -> dict:
         value = event.get("value", {})
         fields = ("kind", "tool", "focus", "reason", "step_id", "source_path", "command")
         return {"event": "decision", **{key: value[key] for key in fields if value.get(key)}}
+    if event["event"] == "action_started":
+        fields = ("tool", "command", "working_directory", "step_id", "expected_change")
+        return {"event": "action_started", **{key: event[key] for key in fields if event.get(key)}}
     result = event.get("result", {})
     fields = ("status", "reason", "source", "error", "repeated_result_count")
     return {
