@@ -337,10 +337,5 @@ def run_oneshot_agent(
     )
     write_json(output / "component-status.json", list(components.values()))
     write_json(output / "final-report.json", report)
-    history.summary(
-        {
-            **report,
-            "state": {"verified_outcomes": []},
-        }
-    )
+    history.append("stop", result=report)
     return report

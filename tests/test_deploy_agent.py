@@ -125,7 +125,9 @@ def test_agent_previews_then_validates_a_source_installer(tmp_path: Path) -> Non
     assert (output / "workspace/repository-1/ready").is_file()
     assert json.loads((output / "final-report.json").read_text())["status"] == "SUCCESS"
     assert (output / "events.jsonl").is_file()
-    assert (output / "run-summary.json").is_file()
+    assert not (output / "state.json").exists()
+    assert not (output / "run-summary.json").exists()
+    assert "./install.sh" in (output / "runbook.sh").read_text()
 
     events = [json.loads(line) for line in (output / "events.jsonl").read_text().splitlines()]
     started = next(event for event in events if event["event"] == "action_started")
@@ -225,9 +227,9 @@ def test_three_incomplete_actions_stop_the_agent(tmp_path: Path) -> None:
 
     report = run_deployment_agent(task, output, execute=True, approve=True, decide=decide)
     assert report["status"] == "BLOCKED"
-    assert report["reason"] == "three incomplete action proposals"
+    assert "same action produced no progress three times" in report["reason"]
     assert calls[1]["status"] == "needs_revision"
-    assert calls[1]["revision_attempt"] == 1
+    assert calls[1]["repeated_action_count"] == 0
     assert len(calls) == 3
 
 
@@ -263,7 +265,7 @@ def test_route_choice_and_repeated_read_reach_next_decision(tmp_path: Path) -> N
         "evidence": ["repository-1:README.md"],
     }
     assert seen[2][1]["text"] == seen[1][1]["text"]
-    assert seen[2][1]["repeated_result_count"] == 1
+    assert seen[2][1]["repeated_action_count"] == 1
 
 
 def test_agent_waits_for_referenced_secret_and_resumes_same_run(
@@ -538,13 +540,11 @@ def test_agent_prompt_requires_route_choice_and_deployment_progress() -> None:
     assert "senior DevOps engineer" in _INNER_LOOP_INSTRUCTIONS
     assert "active_step" in _INNER_LOOP_INSTRUCTIONS
     assert "authoritative ordered record" in _INNER_LOOP_INSTRUCTIONS
-    assert "verified step as complete and settled" in _INNER_LOOP_INSTRUCTIONS
-    assert "Do not investigate verified steps" in _INNER_LOOP_INSTRUCTIONS
-    assert "use the event history before reading a file again" in _INNER_LOOP_INSTRUCTIONS
-    assert "never ask the human to paste the completed generated file" in " ".join(
-        _INNER_LOOP_INSTRUCTIONS.split()
-    )
-    assert "configured with from_file" in " ".join(_INNER_LOOP_INSTRUCTIONS.split())
+    assert "verified step as complete" in _INNER_LOOP_INSTRUCTIONS
+    prompt = " ".join(_INNER_LOOP_INSTRUCTIONS.split()).casefold()
+    assert "use event history before reading a file again" in prompt
+    assert "never ask for a completed generated file" in prompt
+    assert "use from_file" in prompt
     assert "private chain-of-thought" in _INNER_LOOP_INSTRUCTIONS
 
 
@@ -559,7 +559,7 @@ def test_agent_prompt_requires_source_defined_validation_semantics() -> None:
     assert "zero exit code does not prove success" in " ".join(
         _INNER_LOOP_INSTRUCTIONS.split()
     ).casefold()
-    assert "do not retry a failed command" in " ".join(
+    assert "do not retry without new evidence" in " ".join(
         _INNER_LOOP_INSTRUCTIONS.split()
     ).casefold()
 
@@ -703,19 +703,18 @@ def test_agent_validates_prerequisite_then_resumes_original_goal(tmp_path: Path)
             _decision("DONE"),
         ]
     )
-    states = []
+    gaps = []
 
     def decide(state, _observation, _last_result, _sources, _cycle):
-        states.append((state["gaps"].copy(), state["milestones"].copy()))
+        gaps.append(state["gaps"].copy())
         return next(decisions), {}
 
     report = run_deployment_agent(task, output, execute=True, approve=True, decide=decide)
     assert report["status"] == "SUCCESS"
     assert report["mutating_actions"] == 2
-    assert states[1] == (["storage missing"], ["storage ready"])
+    assert gaps[1] == ["storage missing"]
     assert report["state"]["gaps"] == []
     assert report["state"]["goal_stack"] == []
-    assert report["state"]["milestones"] == ["storage ready", "application ready"]
 
 
 def test_brief_retains_a_long_result_start_and_end() -> None:
@@ -1071,7 +1070,7 @@ def test_reworded_denied_observations_stop_early(tmp_path: Path, monkeypatch) ->
     report = run_deployment_agent(task, output, decide=decide)
     assert report["status"] == "BLOCKED"
     assert calls == 3
-    assert "same policy denial repeated three times" in report["reason"]
+    assert "same action produced no progress three times" in report["reason"]
 
 
 def test_policy_denial_is_returned_to_the_agent_for_revision(tmp_path: Path) -> None:
@@ -1296,7 +1295,7 @@ def test_cli_reports_usage_and_verified_changes(tmp_path: Path, monkeypatch, cap
             },
             "mutating_actions": 2,
             "state": {
-                "milestones": ["storage ready"],
+                "components": {"storage": {"deployed": True}},
                 "verified_outcomes": [{"id": "storage"}],
             },
         },
@@ -1307,7 +1306,7 @@ def test_cli_reports_usage_and_verified_changes(tmp_path: Path, monkeypatch, cap
     summary = capsys.readouterr().out
     assert "3 requests; 120 tokens (input 100, output 20)" in summary
     assert "Actions attempted: 2" in summary
-    assert "Validated changes: storage ready" in summary
+    assert "Deployed components: storage" in summary
     assert "New verified outcomes: storage" in summary
 
 

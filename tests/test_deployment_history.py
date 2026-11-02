@@ -58,3 +58,43 @@ def test_history_returns_only_relevant_step_events(tmp_path: Path) -> None:
     assert context[1]["source"] == "repository-1:README.md"
     assert context[2]["focus"] == "check runtime"
     assert all("text" not in event for event in context)
+
+
+def test_history_renders_an_observed_runbook(tmp_path: Path) -> None:
+    history = RunHistory(tmp_path)
+    history.append(
+        "sources_acquired",
+        sources={
+            "sources": [
+                {
+                    "id": "repository-1",
+                    "location": "https://example.invalid/repo.git",
+                    "resolved_revision": "a" * 40,
+                    "content_hash": "b" * 64,
+                }
+            ]
+        },
+    )
+    history.append(
+        "action_started",
+        iteration=2,
+        command=["./install.sh"],
+        working_directory="repository-1:deploy",
+        step_id="database",
+        stdin_input="INSTALL_CONFIRMATION",
+    )
+    history.append(
+        "action_finished",
+        iteration=2,
+        result={
+            "status": "validated",
+            "after": [{"command": ["appctl", "status"]}],
+        },
+    )
+
+    runbook = history.runbook()
+
+    assert "https://example.invalid/repo.git @ " + "a" * 40 in runbook
+    assert 'printf "%s\\n" "${INSTALL_CONFIRMATION:?set INSTALL_CONFIRMATION}"' in runbook
+    assert "./install.sh" in runbook
+    assert "# verify: appctl status" in runbook

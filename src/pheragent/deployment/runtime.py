@@ -437,74 +437,29 @@ def _high_risk(command: list[str]) -> str | None:
     return None
 
 
-def _infrastructure_change(command: list[str]) -> bool:
-    return Path(command[0]).name in {"aws", "az", "gcloud", "terraform"} and not _read_only(command)
-
-
-def _opaque(command: list[str]) -> bool:
-    executable = Path(command[0]).name
-    return (
-        command[0].startswith("./")
-        or executable.endswith(".sh")
-        or executable in {"make", "ansible-playbook"}
-        or executable in {"sh", "bash", "zsh", "python", "python3", "perl", "ruby"}
-    )
-
-
-def _namespace(command: list[str]) -> str | None:
-    return next(
-        (
-            command[index + 1]
-            for index, part in enumerate(command[:-1])
-            if part in {"-n", "--namespace"}
-        ),
-        None,
-    )
-
-
 def _exposes_secret(command: list[str]) -> bool:
-    if Path(command[0]).name in {"env", "printenv"}:
-        return True
-    return (
-        Path(command[0]).name == "kubectl"
-        and any(part.casefold() in {"secret", "secrets"} for part in command)
-        and any(
-            part in {"yaml", "json", "jsonpath", "go-template"}
-            or part.startswith(("jsonpath=", "go-template="))
-            for part in command
-        )
+    output = {"yaml", "json", "jsonpath", "go-template"}
+    return Path(command[0]).name in {"env", "printenv"} or (
+        command[0] == "kubectl"
+        and {part.casefold() for part in command} & {"secret", "secrets"}
+        and any(part in output or part.split("=", 1)[0] in output for part in command)
     )
 
 
-def _changes_host(command: list[str]) -> bool:
+def _approval_reason(command: list[str]) -> str | None:
     executable = Path(command[0]).name
-    if executable in {
-        "sudo",
-        "apt",
-        "apt-get",
-        "dnf",
-        "yum",
-        "zypper",
-        "snap",
-        "systemctl",
-        "service",
-    }:
-        return True
-    return executable in {
-        "chmod",
-        "chown",
-        "cp",
-        "install",
-        "ln",
-        "mkdir",
-        "mv",
-        "sed",
-        "tee",
-        "touch",
-    } and any(
+    opaque = {"make", "ansible-playbook", "sh", "bash", "zsh", "python", "python3", "perl", "ruby"}
+    if command[0].startswith("./") or executable.endswith(".sh") or executable in opaque:
+        return "opaque command requires human review"
+    host = {"sudo", "apt", "apt-get", "dnf", "yum", "zypper", "snap", "systemctl", "service"}
+    system_path = any(
         part.startswith(("/boot/", "/dev/", "/etc/", "/opt/", "/usr/", "/var/"))
         for part in command[1:]
     )
+    editors = {"chmod", "chown", "cp", "install", "ln", "mkdir", "mv", "sed", "tee", "touch"}
+    if executable in host or executable in editors and system_path:
+        return "host-level change"
+    return None
 
 
 def classify_command(command: list[str], task: DeploymentTask, *, mutating: bool) -> str:
@@ -531,7 +486,14 @@ def classify_command(command: list[str], task: DeploymentTask, *, mutating: bool
     if _read_only(command):
         return "allowed"
     if mutating and command[0] in {"kubectl", "helm"}:
-        namespace = _namespace(command)
+        namespace = next(
+            (
+                command[index + 1]
+                for index, part in enumerate(command[:-1])
+                if part in {"-n", "--namespace"}
+            ),
+            None,
+        )
         if (
             "*" not in task.constraints.allowed_namespaces
             and namespace not in task.constraints.allowed_namespaces
@@ -542,16 +504,15 @@ def classify_command(command: list[str], task: DeploymentTask, *, mutating: bool
     risk = _high_risk(command)
     if risk and "destructive" in risk and not task.constraints.allow_destructive_actions:
         return "denied: destructive actions are outside task constraints"
-    if _infrastructure_change(command) and not task.constraints.allow_new_infrastructure:
+    if risk == "cloud or infrastructure change" and not task.constraints.allow_new_infrastructure:
         return "denied: infrastructure changes are outside task constraints"
-    if _changes_host(command):
-        return "high_risk_approval: host-level change"
     if risk:
         return f"high_risk_approval: {risk}"
     if not mutating:
         return "approval_required: command is not known to be read-only; propose it as execute"
-    if _opaque(command):
-        return "approval_required: opaque command requires human review"
+    if approval := _approval_reason(command):
+        prefix = "high_risk_approval" if approval == "host-level change" else "approval_required"
+        return f"{prefix}: {approval}"
     return "allowed"
 
 

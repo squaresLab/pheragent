@@ -9,6 +9,7 @@ from pheragent.deployment.overview import (
     active_step,
     apply_change,
     create_overview,
+    retry_blocked_steps,
     set_discoveries,
     set_step_status,
 )
@@ -195,3 +196,8 @@ def test_blocked_step_yields_to_independent_work() -> None:
     set_step_status(overview, "database", "blocked")
 
     assert active_step(overview).id == "cache"
+
+    set_step_status(overview, "cache", "verified")
+    assert active_step(overview) is None
+    assert retry_blocked_steps(overview)
+    assert active_step(overview).id == "database"

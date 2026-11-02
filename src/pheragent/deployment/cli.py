@@ -84,7 +84,11 @@ def run_deployment_command(args: argparse.Namespace) -> int:
         print(f"Verified components: {', '.join(verified) or 'none'}")
         print(f"Deferred components: {', '.join(deferred) or 'none'}")
     else:
-        print(f"Validated changes: {', '.join(report['state']['milestones']) or 'none'}")
+        components = report["state"].get("components", {})
+        deployed = [name for name, result in components.items() if result["deployed"]]
+        missing = [name for name, result in components.items() if not result["deployed"]]
+        print(f"Deployed components: {', '.join(deployed) or 'none'}")
+        print(f"Not deployed: {', '.join(missing) or 'none'}")
         print(
             "New verified outcomes: "
             f"{', '.join(item['id'] for item in report['state']['verified_outcomes']) or 'none'}"

@@ -146,6 +146,17 @@ def set_step_status(overview: DeploymentOverview, step_id: str, status: StepStat
     overview.revision += 1
 
 
+def retry_blocked_steps(overview: DeploymentOverview) -> bool:
+    blocked = [
+        step for stage in overview.stages for step in stage.steps if step.status == "blocked"
+    ]
+    for step in blocked:
+        step.status = "pending"
+    if blocked:
+        overview.revision += 1
+    return bool(blocked)
+
+
 def set_discoveries(overview: DeploymentOverview, discoveries: list[str]) -> None:
     discoveries = sorted(set(discoveries))
     if overview.discoveries != discoveries:

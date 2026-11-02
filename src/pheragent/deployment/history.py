@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -72,21 +73,43 @@ class RunHistory:
                 total[key] = total.get(key, 0) + value
         return total
 
-    def summary(self, report: dict) -> dict:
+    def runbook(self) -> str:
         events = self.events()
-        summary = {
-            "status": report["status"],
-            "reason": report["reason"],
-            "iterations": report["cycles"],
-            "mutating_actions": report["mutating_actions"],
-            "usage": report["usage"],
-            "verified_outcomes": [
-                item["id"] for item in report["state"].get("verified_outcomes", [])
-            ],
-            "events": len(events) + 1,
+        finished = {
+            event.get("iteration"): event.get("result", {})
+            for event in events
+            if event["event"] == "action_finished"
         }
-        self.append("stop", result=summary)
-        return summary
+        lines = [
+            "#!/bin/sh",
+            "# Observed commands. Replay assumes the same initial state and source revisions.",
+            "set -u",
+        ]
+        for event in events:
+            if event["event"] == "sources_acquired":
+                for source in event["sources"]["sources"]:
+                    revision = source.get("resolved_revision") or source["content_hash"]
+                    lines.append(f"# source {source['id']}: {source['location']} @ {revision}")
+            if event["event"] != "action_started":
+                continue
+            result = finished.get(event.get("iteration"), {})
+            lines.extend(
+                [
+                    "",
+                    f"# step: {event.get('step_id') or 'unassigned'}",
+                    f"# result: {result.get('status', 'unfinished')}",
+                ]
+            )
+            if event.get("working_directory"):
+                lines.append(f"# working directory: {event['working_directory']}")
+            command = shlex.join(event["command"])
+            if event.get("stdin_input"):
+                name = event["stdin_input"]
+                command = f'printf "%s\\n" "${{{name}:?set {name}}}" | {command}'
+            lines.append(command)
+            for check in result.get("after", []):
+                lines.append(f"# verify: {shlex.join(check['command'])}")
+        return "\n".join(lines) + "\n"
 
     def _events(self):
         if not self.path.is_file():
