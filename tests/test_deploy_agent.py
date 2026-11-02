@@ -885,7 +885,7 @@ def test_commands_not_known_to_be_read_only_require_review(command: list[str]) -
         assert classify_command(command, task, mutating=True).startswith("denied")
 
 
-def test_policy_uses_review_as_the_default_for_unknown_mutations() -> None:
+def test_policy_allows_direct_mutations_but_reviews_opaque_commands() -> None:
     task = DeploymentTask.model_validate(
         {
             "task": {"objective": "sample"},
@@ -893,6 +893,7 @@ def test_policy_uses_review_as_the_default_for_unknown_mutations() -> None:
             "environment": {"type": "shell"},
         }
     )
+    assert classify_command(["projectctl", "deploy"], task, mutating=True) == "allowed"
     assert classify_command(["make", "start"], task, mutating=True).startswith(
         "approval_required"
     )
@@ -1004,9 +1005,7 @@ def test_observation_uses_selected_source_directory(tmp_path: Path, monkeypatch)
     assert (working_directories[0] / "compose.yaml").is_file()
 
 
-def test_unknown_observation_can_receive_one_time_human_approval(
-    tmp_path: Path, monkeypatch, capsys
-) -> None:
+def test_generic_read_only_verb_is_allowed_without_approval(tmp_path: Path, monkeypatch) -> None:
     task = DeploymentTask.model_validate(
         {
             "task": {"objective": "sample"},
@@ -1021,12 +1020,7 @@ def test_unknown_observation_can_receive_one_time_human_approval(
         reason="inspect the project without changing it",
     )
 
-    class Terminal(io.StringIO):
-        def isatty(self):
-            return True
-
     commands = []
-    monkeypatch.setattr("pheragent.deployment.runtime.sys.stdin", Terminal("y\n"))
     monkeypatch.setattr(
         "pheragent.deployment.runtime._command",
         lambda command, _task, **_kwargs: commands.append(command)
@@ -1042,7 +1036,6 @@ def test_unknown_observation_can_receive_one_time_human_approval(
     )
     assert result["exit_code"] == 0
     assert commands == [["projectctl", "inspect"]]
-    assert "Approve unclassified observation?" in capsys.readouterr().out
 
 
 def test_reworded_denied_observations_stop_early(tmp_path: Path, monkeypatch) -> None:
@@ -1085,7 +1078,7 @@ def test_policy_denial_is_returned_to_the_agent_for_revision(tmp_path: Path) -> 
             _decision(
                 "ACT",
                 "execute",
-                command=["python3", "-c", "print('unsafe wrapper')"],
+                command=["kubectl", "config", "use-context", "other"],
                 evidence=["repository-1:README.md"],
                 expected_change="application ready",
                 validation=[{"command": ["ls", str(source / "ready")]}],
@@ -1099,7 +1092,7 @@ def test_policy_denial_is_returned_to_the_agent_for_revision(tmp_path: Path) -> 
         nonlocal calls
         if calls:
             assert last_result["status"] == "policy_denied"
-            assert "inline interpreter" in last_result["reason"]
+            assert "context changes" in last_result["reason"]
         calls += 1
         return next(decisions), {}
 
@@ -1154,9 +1147,12 @@ def test_unfamiliar_mutation_requires_review_and_wrong_context_is_denied() -> No
             "constraints": {"allowed_namespaces": ["postgres"]},
         }
     )
-    assert classify_command(
-        ["kubectl", "label", "pod", "db", "tested=yes", "-n", "postgres"], task, mutating=True
-    ).startswith("approval_required")
+    assert (
+        classify_command(
+            ["kubectl", "label", "pod", "db", "tested=yes", "-n", "postgres"], task, mutating=True
+        )
+        == "allowed"
+    )
     assert classify_command(
         ["kubectl", "--context", "other-cluster", "get", "pods"], task, mutating=False
     ).startswith("denied")
@@ -1165,18 +1161,6 @@ def test_unfamiliar_mutation_requires_review_and_wrong_context_is_denied() -> No
 @pytest.mark.parametrize(
     ("command", "answer", "prompt_text", "should_run"),
     [
-        (
-            ["kubectl", "label", "pod", "db", "tested=yes", "-n", "postgres"],
-            "n\n",
-            "Approve deployment action",
-            False,
-        ),
-        (
-            ["kubectl", "label", "pod", "db", "tested=yes", "-n", "postgres"],
-            "y\n",
-            "Approve deployment action",
-            True,
-        ),
         (
             ["kubectl", "delete", "pod", "db", "-n", "postgres"],
             "y\n",
@@ -1191,7 +1175,7 @@ def test_unfamiliar_mutation_requires_review_and_wrong_context_is_denied() -> No
         ),
     ],
 )
-def test_kubernetes_change_waits_for_terminal_approval(
+def test_destructive_kubernetes_change_waits_for_terminal_approval(
     tmp_path: Path,
     monkeypatch,
     capsys,
@@ -1269,6 +1253,24 @@ def test_kubernetes_change_waits_for_terminal_approval(
     assert "Source: repository-1:README.md" in prompt
     assert "Check: kubectl get pod db -n postgres" in prompt
     assert any(item[3] == command[1] for item in commands if len(item) > 3) is should_run
+
+
+def test_policy_blocks_secret_output_and_reviews_host_changes() -> None:
+    task = DeploymentTask.model_validate(
+        {
+            "task": {"objective": "sample"},
+            "sources": {"repositories": ["/tmp/sample"]},
+            "environment": {"type": "kubernetes", "context": "target-cluster"},
+            "constraints": {"allowed_namespaces": ["*"]},
+        }
+    )
+
+    assert classify_command(
+        ["kubectl", "get", "secret", "database", "-o", "yaml"], task, mutating=False
+    ).startswith("denied")
+    assert classify_command(
+        ["sed", "-i", "s/a/b/", "/etc/app.conf"], task, mutating=True
+    ).startswith("high_risk_approval")
 
 
 def test_cli_reports_usage_and_verified_changes(tmp_path: Path, monkeypatch, capsys) -> None:

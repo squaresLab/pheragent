@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import queue
+import re
 import shlex
 import signal
 import subprocess
@@ -45,7 +46,6 @@ _READ_AWS = {
     ("eks", "list-nodegroups"),
     ("eks", "describe-nodegroup"),
 }
-_DENIED = {"rm", "shutdown", "reboot", "mkfs", "dd"}
 _COMPOSE_OPTIONS_WITH_VALUE = {
     "-f",
     "--file",
@@ -314,7 +314,7 @@ def _read_only(command: list[str]) -> bool:
         }
     if command[0] == "sed":
         return not any(part == "-i" or part.startswith("-i") for part in command[1:])
-    return command[0] in {
+    if command[0] in {
         "cat",
         "find",
         "head",
@@ -334,6 +334,18 @@ def _read_only(command: list[str]) -> bool:
         "rg",
         "tail",
         "wc",
+    }:
+        return True
+    return len(command) > 1 and command[1].casefold().replace("_", "-") in {
+        "check",
+        "describe",
+        "diff",
+        "get",
+        "inspect",
+        "list",
+        "show",
+        "status",
+        "version",
     }
 
 
@@ -401,28 +413,13 @@ def _high_risk(command: list[str]) -> str | None:
         "uninstall",
         "wipe",
     }
-    if any(
-        token == word or token.startswith(word + "-")
-        for part in command[1:]
-        for token in [part.casefold().lstrip("-").split("=", 1)[0].replace("_", "-")]
-        for word in destructive
-    ):
+    tokens = {
+        token.replace("_", "-")
+        for token in re.findall(r"[a-z0-9_-]+", " ".join(command).casefold())
+    }
+    if tokens & destructive:
         return "potentially destructive operation"
-    if executable in {
-        "sudo",
-        "apt",
-        "apt-get",
-        "dnf",
-        "yum",
-        "zypper",
-        "snap",
-        "systemctl",
-        "service",
-    }:
-        return "privileged host change"
-    if executable == "kubectl" and any(
-        part in {"delete", "replace", "patch", "drain"} for part in command
-    ):
+    if executable == "kubectl" and any(part in {"delete", "drain"} for part in command):
         return "potentially destructive Kubernetes operation"
     if executable == "helm" and any(part in {"uninstall", "rollback"} for part in command):
         return "potentially destructive Helm operation"
@@ -444,13 +441,75 @@ def _infrastructure_change(command: list[str]) -> bool:
     return Path(command[0]).name in {"aws", "az", "gcloud", "terraform"} and not _read_only(command)
 
 
+def _opaque(command: list[str]) -> bool:
+    executable = Path(command[0]).name
+    return (
+        command[0].startswith("./")
+        or executable.endswith(".sh")
+        or executable in {"make", "ansible-playbook"}
+        or executable in {"sh", "bash", "zsh", "python", "python3", "perl", "ruby"}
+    )
+
+
+def _namespace(command: list[str]) -> str | None:
+    return next(
+        (
+            command[index + 1]
+            for index, part in enumerate(command[:-1])
+            if part in {"-n", "--namespace"}
+        ),
+        None,
+    )
+
+
+def _exposes_secret(command: list[str]) -> bool:
+    if Path(command[0]).name in {"env", "printenv"}:
+        return True
+    return (
+        Path(command[0]).name == "kubectl"
+        and any(part.casefold() in {"secret", "secrets"} for part in command)
+        and any(
+            part in {"yaml", "json", "jsonpath", "go-template"}
+            or part.startswith(("jsonpath=", "go-template="))
+            for part in command
+        )
+    )
+
+
+def _changes_host(command: list[str]) -> bool:
+    executable = Path(command[0]).name
+    if executable in {
+        "sudo",
+        "apt",
+        "apt-get",
+        "dnf",
+        "yum",
+        "zypper",
+        "snap",
+        "systemctl",
+        "service",
+    }:
+        return True
+    return executable in {
+        "chmod",
+        "chown",
+        "cp",
+        "install",
+        "ln",
+        "mkdir",
+        "mv",
+        "sed",
+        "tee",
+        "touch",
+    } and any(
+        part.startswith(("/boot/", "/dev/", "/etc/", "/opt/", "/usr/", "/var/"))
+        for part in command[1:]
+    )
+
+
 def classify_command(command: list[str], task: DeploymentTask, *, mutating: bool) -> str:
-    if not command or Path(command[0]).name in _DENIED:
-        return "denied: forbidden command"
-    if Path(command[0]).name in {"sh", "bash", "zsh", "python", "python3", "perl", "ruby"} and any(
-        part in {"-c", "-e"} for part in command[1:]
-    ):
-        return "denied: inline interpreter commands are not allowed"
+    if not command:
+        return "denied: command is empty"
     if any(part in {";", "&&", "||", "|", ">", "<"} for part in command):
         return "denied: shell operators are not allowed"
     try:
@@ -467,34 +526,33 @@ def classify_command(command: list[str], task: DeploymentTask, *, mutating: bool
         ["get-contexts"],
     ):
         return "denied: Kubernetes context changes are not allowed"
+    if _exposes_secret(command):
+        return "denied: command can expose secrets"
     if _read_only(command):
         return "allowed"
-    if mutating and (
-        command[0] == "kubectl" or command[:2] in (["helm", "install"], ["helm", "upgrade"])
-    ):
-        namespace = next(
-            (
-                command[i + 1]
-                for i, part in enumerate(command[:-1])
-                if part in {"-n", "--namespace"}
-            ),
-            None,
-        )
+    if mutating and command[0] in {"kubectl", "helm"}:
+        namespace = _namespace(command)
         if (
             "*" not in task.constraints.allowed_namespaces
             and namespace not in task.constraints.allowed_namespaces
         ):
-            return "denied: namespace outside allowed scope or not explicit"
+            return "high_risk_approval: namespace outside declared scope or not explicit"
+        if command[:3] == ["kubectl", "create", "namespace"]:
+            return "high_risk_approval: namespace boundary change"
     risk = _high_risk(command)
     if risk and "destructive" in risk and not task.constraints.allow_destructive_actions:
         return "denied: destructive actions are outside task constraints"
     if _infrastructure_change(command) and not task.constraints.allow_new_infrastructure:
         return "denied: infrastructure changes are outside task constraints"
+    if _changes_host(command):
+        return "high_risk_approval: host-level change"
     if risk:
         return f"high_risk_approval: {risk}"
     if not mutating:
         return "approval_required: command is not known to be read-only; propose it as execute"
-    return "approval_required: deployment changes require human review"
+    if _opaque(command):
+        return "approval_required: opaque command requires human review"
+    return "allowed"
 
 
 def observe_target(task: DeploymentTask) -> dict:
