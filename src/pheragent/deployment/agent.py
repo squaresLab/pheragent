@@ -107,9 +107,10 @@ values only when the source defines the rule. If a genuinely human-maintained mu
 is required, ask for one named input configured with from_file instead of terminal content.
 
 Use ASK_HUMAN only when two or three source-supported routes remain viable and evidence
-cannot select between them. Use BLOCKED only when no safe, source-supported action remains;
-name the exact missing capability, permission, evidence, or human decision. Use DONE only
-when observed validation supports the deployment objective.
+cannot select between them. Use BLOCKED when this step has no safe, source-supported action;
+name the exact missing capability, permission, evidence, or human decision. The harness can
+then continue independent work. Use DONE only when observed validation supports the
+deployment objective.
 
 # Missing prerequisites
 
@@ -345,6 +346,14 @@ def _advance_verified_step(
     return True
 
 
+def _record_step_result(state: dict, step, *, deployed: bool, reason: str | None = None) -> None:
+    for component in step.components or [step.id]:
+        result = {"deployed": deployed}
+        if reason:
+            result["reason"] = reason
+        state["components"][component] = result
+
+
 def run_deployment_agent(
     task_path: Path,
     output: Path,
@@ -432,10 +441,12 @@ def run_deployment_agent(
             ),
             "milestones": [],
             "verified_outcomes": [],
+            "components": {},
             "evidence": [],
             "last_action": None,
         }
     state.setdefault("goal_stack", state.get("gaps", []))
+    state.setdefault("components", {})
     state.update(
         {
             "objective": task.task.objective,
@@ -478,6 +489,7 @@ def run_deployment_agent(
         if time.monotonic() - started >= task.budgets.max_runtime_minutes * 60:
             reason = "runtime budget exhausted"
             break
+        current = None
         if overview:
             current = active_step(overview)
             if current and current.status == "pending":
@@ -632,6 +644,23 @@ def run_deployment_agent(
                 last_result = {"status": "blocked", "reason": reason, "options": options}
                 break
             if decision.kind == "BLOCKED":
+                if overview and current:
+                    set_step_status(overview, current.id, "blocked")
+                    _record_step_result(state, current, deployed=False, reason=decision.reason)
+                    last_result = {
+                        "status": "blocked",
+                        "reason": decision.reason,
+                        "step_id": current.id,
+                        "components": current.components or [current.id],
+                    }
+                    state["overview"] = overview.model_dump()
+                    write_yaml(output / "overview.yaml", overview)
+                    history.append("tool", iteration=cycle, tool=None, result=last_result)
+                    if active_step(overview) is None:
+                        deployed = any(item["deployed"] for item in state["components"].values())
+                        status = "PARTIAL" if deployed else "BLOCKED"
+                        reason = "no remaining deployment step can make progress"
+                    continue
                 status, reason = "BLOCKED", decision.reason
                 break
             if decision.kind == "DONE" and not state.get("active_step"):
@@ -855,6 +884,7 @@ def run_deployment_agent(
                 last_result["step_id"] = decision.step_id
             step_completed = _advance_verified_step(overview, decision, last_result)
             if step_completed:
+                _record_step_result(state, current, deployed=True)
                 state["overview"] = overview.model_dump()
                 refresh_environment = True
                 write_yaml(output / "overview.yaml", overview)
@@ -895,6 +925,7 @@ def run_deployment_agent(
             "WAITING_FOR_INPUT",
             "BUDGET_EXHAUSTED",
             "OSCILLATING",
+            "PARTIAL",
         } and not (status == "BUDGET_EXHAUSTED" and reason == "decision budget exhausted"):
             break
         unchanged = unchanged + 1 if last_result.get("repeated_result_count", 0) else 0

@@ -12,6 +12,7 @@ from pheragent.cli import main as pheragent_main
 from pheragent.deployment.agent import (
     _INNER_LOOP_INSTRUCTIONS,
     _advance_verified_step,
+    _record_step_result,
     compact_context,
     run_deployment_agent,
 )
@@ -607,6 +608,43 @@ def test_done_advances_only_matching_step_from_successful_evidence() -> None:
         decision,
         {"exit_code": 1, "step_id": "infrastructure"},
     )
+
+
+def test_step_result_is_binary_and_keeps_the_exact_failure_reason() -> None:
+    deployment = DeploymentOverview.model_validate(
+        {
+            "route": "documented route",
+            "route_evidence": ["repository-1:README.md"],
+            "stages": [
+                {
+                    "id": "deploy",
+                    "kind": "deploy",
+                    "goal": "deploy",
+                    "steps": [
+                        {
+                            "id": "database",
+                            "goal": "deploy database",
+                            "success_condition": "database is ready",
+                            "components": ["PostgreSQL"],
+                            "source_refs": ["repository-1:README.md"],
+                        }
+                    ],
+                }
+            ],
+        }
+    )
+    state = {"components": {}}
+
+    _record_step_result(
+        state,
+        active_step(deployment),
+        deployed=False,
+        reason="storage class is absent",
+    )
+
+    assert state["components"] == {
+        "PostgreSQL": {"deployed": False, "reason": "storage class is absent"}
+    }
 
 
 def test_agent_validates_prerequisite_then_resumes_original_goal(tmp_path: Path) -> None:
