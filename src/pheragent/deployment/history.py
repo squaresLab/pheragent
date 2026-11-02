@@ -44,40 +44,24 @@ class RunHistory:
     def events(self) -> list[dict]:
         return list(self._events())
 
-    def context(self, *, mode: str, window: int, step_id: str | None = None) -> list[dict] | dict:
-        useful = [
-            event
-            for event in self._events()
-            if event["event"] in {"decision", "tool", "human_choice", "overview_revised"}
-        ]
-        if mode == "recent":
-            return useful[-window:]
-
-        decisions = [
-            event["value"]
-            for event in useful
-            if event["event"] == "decision"
-            and event.get("value", {}).get("step_id") == step_id
-            and event.get("value", {}).get("memory")
-        ]
-        sources = {}
-        for event in useful:
-            result = event.get("result", {})
-            if event.get("tool") == "read_file" and result.get("source"):
-                sources[result["source"]] = {
-                    "source": result["source"],
-                    "total_lines": result.get("total_lines"),
-                    "complete": result.get("complete"),
-                }
-        return {
-            "active_step": step_id,
-            "notes": decisions[-1]["memory"] if decisions else [],
-            "sources_read": list(sources.values())[-window:],
-            "recent": [
-                _event_summary(event)
-                for event in useful[-min(window, 4) :]
-            ],
-        }
+    def context(self, *, window: int, step_id: str | None = None) -> list[dict]:
+        context = []
+        decision_step = None
+        for event in self._events():
+            if event["event"] == "decision":
+                decision_step = event.get("value", {}).get("step_id")
+            if event["event"] not in {
+                "decision",
+                "tool",
+                "human_choice",
+                "human_input",
+                "overview_revised",
+            }:
+                continue
+            if step_id and decision_step != step_id:
+                continue
+            context.append(_event_summary(event))
+        return context[-window:]
 
     def usage(self) -> dict[str, int]:
         total: dict[str, int] = {}

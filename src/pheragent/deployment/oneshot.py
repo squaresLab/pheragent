@@ -234,7 +234,7 @@ def run_oneshot_agent(
             "runtime_state": _runtime_summary(observation),
             "components": list(components.values()),
             "working_memory": working_memory,
-            "recent_history": history.context(mode="recent", window=2),
+            "recent_history": history.context(window=2),
             "last_result": compact_context(last_result),
             "final_audit_requested": audit_pending,
             "iteration": iteration,

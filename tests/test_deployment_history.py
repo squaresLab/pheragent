@@ -18,7 +18,7 @@ def test_history_restores_checkpoint_and_accumulates_usage(tmp_path: Path) -> No
     assert [event["sequence"] for event in restored.events()] == [1, 2, 3]
 
 
-def test_history_supports_recent_and_working_memory_context(tmp_path: Path) -> None:
+def test_history_returns_only_relevant_step_events(tmp_path: Path) -> None:
     history = RunHistory(tmp_path)
     history.append(
         "decision",
@@ -27,7 +27,6 @@ def test_history_supports_recent_and_working_memory_context(tmp_path: Path) -> N
             "tool": "read_file",
             "focus": "find command",
             "step_id": "deploy",
-            "memory": ["repository-1:README.md documents make start"],
         },
         usage={},
     )
@@ -48,23 +47,14 @@ def test_history_supports_recent_and_working_memory_context(tmp_path: Path) -> N
             "tool": "observe",
             "focus": "check runtime",
             "step_id": "deploy",
-            "memory": [
-                "repository-1:README.md documents make start",
-                "Docker must be available before deployment",
-            ],
         },
         usage={},
     )
 
-    recent = history.context(mode="recent", window=1)
-    memory = history.context(mode="memory", window=8, step_id="deploy")
+    context = history.context(window=8, step_id="deploy")
 
-    assert recent[0]["value"]["focus"] == "check runtime"
-    assert memory["notes"] == [
-        "repository-1:README.md documents make start",
-        "Docker must be available before deployment",
-    ]
-    assert memory["sources_read"] == [
-        {"source": "repository-1:README.md", "total_lines": 200, "complete": True}
-    ]
-    assert "text" not in memory["recent"][1]
+    assert [event["event"] for event in context] == ["decision", "tool", "decision"]
+    assert context[0]["focus"] == "find command"
+    assert context[1]["source"] == "repository-1:README.md"
+    assert context[2]["focus"] == "check runtime"
+    assert all("text" not in event for event in context)

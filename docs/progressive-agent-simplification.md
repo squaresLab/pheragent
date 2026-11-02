@@ -1,7 +1,7 @@
 # Progressive agent simplification
 
 - [x] 1. Characterize continuation, context, policy, and action recording.
-- [ ] 2. Derive active-step context from `events.jsonl`; remove model-written memory.
+- [x] 2. Derive active-step context from `events.jsonl`; remove model-written memory.
 - [ ] 3. Continue after blocked steps and report binary component outcomes.
 - [ ] 4. Allow in-scope commands; review only boundary crossings and opaque scripts.
 - [ ] 5. Record each started action, result, validation, and checkpoint atomically.
