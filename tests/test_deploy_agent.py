@@ -120,6 +120,15 @@ def test_agent_previews_then_validates_a_source_installer(tmp_path: Path) -> Non
     assert (output / "events.jsonl").is_file()
     assert (output / "run-summary.json").is_file()
 
+    events = [json.loads(line) for line in (output / "events.jsonl").read_text().splitlines()]
+    action = next(event for event in events if event.get("tool") == "execute")
+    assert action["result"]["status"] == "validated"
+    assert action["result"]["after"][0]["status"] == "satisfied"
+    assert any(
+        event["event"] == "checkpoint" and event["sequence"] > action["sequence"]
+        for event in events
+    )
+
 
 def test_preview_does_not_run_a_source_installer(tmp_path: Path) -> None:
     source = tmp_path / "source"

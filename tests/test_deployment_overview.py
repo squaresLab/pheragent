@@ -160,3 +160,38 @@ def test_grounded_prerequisite_is_inserted_before_its_consumer(tmp_path: Path) -
         "repository-1:missing.md",
     ]
     assert [step.id for step in overview.stages[0].steps] == ["storage", "service"]
+
+
+def test_blocked_step_yields_to_independent_work() -> None:
+    overview = DeploymentOverview.model_validate(
+        {
+            "route": "documented route",
+            "route_evidence": ["repository-1:README.md"],
+            "stages": [
+                {
+                    "id": "deploy",
+                    "kind": "deploy",
+                    "goal": "deploy available components",
+                    "steps": [
+                        {
+                            "id": "database",
+                            "goal": "deploy database",
+                            "success_condition": "database is ready",
+                            "source_refs": ["repository-1:README.md"],
+                            "status": "active",
+                        },
+                        {
+                            "id": "cache",
+                            "goal": "deploy cache",
+                            "success_condition": "cache is ready",
+                            "source_refs": ["repository-1:README.md"],
+                        },
+                    ],
+                }
+            ],
+        }
+    )
+
+    set_step_status(overview, "database", "blocked")
+
+    assert active_step(overview).id == "cache"
