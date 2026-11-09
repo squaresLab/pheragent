@@ -94,9 +94,7 @@ def compact_context(value):
         return [compact_context(item) for item in value[:20]]
     if isinstance(value, dict):
         return {
-            key: item
-            if key == "text" and value.get("complete") is True
-            else compact_context(item)
+            key: item if key == "text" and value.get("complete") is True else compact_context(item)
             for key, item in value.items()
         }
     return value
@@ -105,7 +103,7 @@ def compact_context(value):
 def request_decision(
     client: LLMClient,
     state: dict,
-    last_result: dict,
+    latest_feedback: dict,
     sources: SourceTools,
     history: RunHistory,
     task: DeploymentTask,
@@ -137,7 +135,7 @@ def request_decision(
                 step_id=(state.get("active_step") or {}).get("id"),
             )
         ),
-        "last_tool_result": compact_context(last_result),
+        "latest_feedback": compact_context(latest_feedback),
         "source_count": len(sources.paths),
         "cycle": cycle,
     }
@@ -165,8 +163,10 @@ def verify_completion(task: DeploymentTask, state: dict) -> tuple[bool, dict]:
             for stage in (state.get("overview") or {}).get("stages", [])
             for step in stage["steps"]
         ]
-        if state["gaps"] or state["unresolved"] or any(
-            step["status"] != "verified" for step in steps
+        if (
+            state["gaps"]
+            or state["unresolved"]
+            or any(step["status"] != "verified" for step in steps)
         ):
             return False, {
                 "status": "completion_rejected",
@@ -183,9 +183,13 @@ def verify_completion(task: DeploymentTask, state: dict) -> tuple[bool, dict]:
 
 def _repeat_key(decision: Decision, result: dict) -> str:
     status = result.get("status")
-    action = result.get("reason") if status == "policy_denied" else (
-        decision.command
-        or [decision.tool, decision.source_path, decision.start_line, decision.end_line]
+    action = (
+        result.get("reason")
+        if status == "policy_denied"
+        else (
+            decision.command
+            or [decision.tool, decision.source_path, decision.start_line, decision.end_line]
+        )
     )
     outcome = [
         status,
@@ -295,8 +299,7 @@ def run_deployment_agent(
     if resume:
         previous = DeploymentTask.model_validate(json.loads((output / "task.json").read_text()))
         locations = {
-            item if isinstance(item, str) else item.location
-            for item in task.sources.repositories
+            item if isinstance(item, str) else item.location for item in task.sources.repositories
         }
         task.sources.repositories.extend(
             item
@@ -390,7 +393,7 @@ def run_deployment_agent(
     mutations = state.get("mutating_actions", 0)
     repeats: dict[str, int] = {}
     pass_progress = False
-    last_result: dict = {}
+    latest_feedback: dict = {}
     observation: dict = {}
     refresh_environment = True
     status = "BUDGET_EXHAUSTED"
@@ -442,10 +445,10 @@ def run_deployment_agent(
                 break
             try:
                 decision, call_usage = (
-                    decide(state, observation, last_result, sources, cycle)
+                    decide(state, observation, latest_feedback, sources, cycle)
                     if decide
                     else request_decision(
-                        client, state, last_result, sources, history, task, cycle
+                        client, state, latest_feedback, sources, history, task, cycle
                     )
                 )
             except Exception as exc:
@@ -469,24 +472,23 @@ def run_deployment_agent(
             if (
                 decision.stdin_input
                 and not state["inputs"].get(decision.stdin_input, {}).get("available")
-                and decision.stdin_input
-                not in {item.name for item in decision.required_inputs}
+                and decision.stdin_input not in {item.name for item in decision.required_inputs}
             ):
-                last_result = {
+                latest_feedback = {
                     "status": "needs_revision",
                     "reason": (
                         "stdin_input must reference an available task input or include a "
                         "structured required_inputs request"
                     ),
                 }
-                history.append("tool", iteration=cycle, tool=decision.tool, result=last_result)
+                history.append("tool", iteration=cycle, tool=decision.tool, result=latest_feedback)
                 continue
             if decision.kind == "WAITING_FOR_INPUT" or missing_inputs(
                 state, decision.required_inputs
             ):
                 missing = missing_inputs(state, decision.required_inputs)
                 if not missing:
-                    last_result = {"status": "inputs_available"}
+                    latest_feedback = {"status": "inputs_available"}
                     continue
                 provided = prompt_for_inputs(task, state, decision)
                 if provided:
@@ -498,7 +500,7 @@ def run_deployment_agent(
                         sensitive=[name for name in provided if state["inputs"][name]["sensitive"]],
                     )
                     missing = missing_inputs(state, decision.required_inputs)
-                    last_result = {"status": "inputs_provided", "inputs": provided}
+                    latest_feedback = {"status": "inputs_provided", "inputs": provided}
                     pass_progress = True
                     if not missing:
                         continue
@@ -512,9 +514,7 @@ def run_deployment_agent(
                                 item.name,
                                 {
                                     "available": False,
-                                    "configure": (
-                                        f"add inputs.{item.name}.from_env or from_file"
-                                    ),
+                                    "configure": (f"add inputs.{item.name}.from_env or from_file"),
                                 },
                             ),
                             "prompt": item.prompt,
@@ -540,7 +540,7 @@ def run_deployment_agent(
                     write_yaml(output / "overview.yaml", overview)
                 write_yaml(output / "human-request.yaml", request)
                 status, reason = "WAITING_FOR_INPUT", decision.reason
-                last_result = request
+                latest_feedback = request
                 break
             if decision.kind == "ASK_HUMAN":
                 options = decision.options
@@ -553,18 +553,18 @@ def run_deployment_agent(
                     choice = choose_option(decision.reason, options)
                     if choice:
                         state["selected_route"] = {"choice": choice, "evidence": evidence}
-                        last_result = {"status": "human_selected", "choice": choice}
-                        history.append("human_choice", iteration=cycle, result=last_result)
+                        latest_feedback = {"status": "human_selected", "choice": choice}
+                        history.append("human_choice", iteration=cycle, result=latest_feedback)
                         continue
                     reason = "human did not select a route"
                 status = "BLOCKED"
-                last_result = {"status": "blocked", "reason": reason, "options": options}
+                latest_feedback = {"status": "blocked", "reason": reason, "options": options}
                 break
             if decision.kind == "BLOCKED":
                 if overview and current:
                     set_step_status(overview, current.id, "blocked")
                     record_step_result(state, current, deployed=False, reason=decision.reason)
-                    last_result = {
+                    latest_feedback = {
                         "status": "blocked",
                         "reason": decision.reason,
                         "step_id": current.id,
@@ -572,12 +572,12 @@ def run_deployment_agent(
                     }
                     state["overview"] = overview.model_dump()
                     write_yaml(output / "overview.yaml", overview)
-                    history.append("tool", iteration=cycle, tool=None, result=last_result)
+                    history.append("tool", iteration=cycle, tool=None, result=latest_feedback)
                     continue
                 status, reason = "BLOCKED", decision.reason
                 break
             if decision.kind == "DONE" and not state.get("active_step"):
-                complete, last_result = verify_completion(task, state)
+                complete, latest_feedback = verify_completion(task, state)
                 if complete:
                     status, reason = "SUCCESS", "completion checks passed twice"
                     break
@@ -588,12 +588,12 @@ def run_deployment_agent(
                 source = decision.source
                 evidence = sorted(sources.source_references(source.location)) if source else []
                 if source is None:
-                    last_result = {
+                    latest_feedback = {
                         "status": "blocked",
                         "reason": "source addition needs an HTTPS repository URL",
                     }
                 elif not evidence:
-                    last_result = {
+                    latest_feedback = {
                         "status": "blocked",
                         "reason": "proposed HTTPS source URL is absent from configured sources",
                     }
@@ -601,7 +601,7 @@ def run_deployment_agent(
                     (item if isinstance(item, str) else item.location) == source.location
                     for item in task.sources.repositories
                 ):
-                    last_result = {"status": "already_available", "source": source.location}
+                    latest_feedback = {"status": "already_available", "source": source.location}
                 elif not approve and not sys.stdin.isatty():
                     request = {
                         "status": "WAITING_FOR_INPUT",
@@ -611,15 +611,13 @@ def run_deployment_agent(
                         "evidence": evidence,
                     }
                     write_yaml(output / "human-request.yaml", request)
-                    status, reason, last_result = "WAITING_FOR_INPUT", decision.reason, request
+                    status, reason, latest_feedback = "WAITING_FOR_INPUT", decision.reason, request
                     break
                 else:
-                    accepted = approve or confirm_source(
-                        source.location, evidence, decision.reason
-                    )
+                    accepted = approve or confirm_source(source.location, evidence, decision.reason)
                     if not accepted:
                         status, reason = "BLOCKED", "human declined deployment source"
-                        last_result = {"status": "blocked", "reason": reason}
+                        latest_feedback = {"status": "blocked", "reason": reason}
                         break
                     resolved_revision = deployment_sources.add_repository(source)
                     write_json(output / "task.json", task)
@@ -630,7 +628,7 @@ def run_deployment_agent(
                         source_id: str((output / "workspace" / source_id).resolve())
                         for source_id in sources.sources
                     }
-                    last_result = {
+                    latest_feedback = {
                         "status": "source_acquired",
                         "source": source.location,
                         "resolved_revision": resolved_revision,
@@ -644,10 +642,10 @@ def run_deployment_agent(
                         evidence=evidence,
                     )
             elif decision.tool == "observe":
-                last_result = tools.call(decision)
-                if last_result.get("status") == "blocked":
+                latest_feedback = tools.call(decision)
+                if latest_feedback.get("status") == "blocked":
                     status = "BLOCKED"
-                    reason = last_result["reason"]
+                    reason = latest_feedback["reason"]
             elif decision.tool == "execute":
                 if mutations >= task.budgets.max_mutating_actions:
                     status, reason = "BUDGET_EXHAUSTED", "mutation budget exhausted"
@@ -675,22 +673,20 @@ def run_deployment_agent(
                     "expected_change": decision.expected_change,
                     "stdin_input": decision.stdin_input,
                 }
-                last_result = tools.call(
+                latest_feedback = tools.call(
                     decision,
                     timeout=max(1, min(1800, int(remaining))),
                     stdin_value=stdin_value,
                     stdin_sensitive=stdin_sensitive,
                     log_path=output / "actions" / f"{cycle:04d}.log",
-                    on_start=lambda event=started_event: history.append(
-                        "action_started", **event
-                    ),
+                    on_start=lambda event=started_event: history.append("action_started", **event),
                 )
-                refresh_environment = "execution" in last_result
-                if "execution" in last_result:
+                refresh_environment = "execution" in latest_feedback
+                if "execution" in latest_feedback:
                     mutations += 1
                     state["mutating_actions"] = mutations
-                    if last_result["status"] == "validated":
-                        record_verified_outcome(state, decision, last_result)
+                    if latest_feedback["status"] == "validated":
+                        record_verified_outcome(state, decision, latest_feedback)
                         pass_progress = True
                 if (
                     task.task.stop_after_verified_outcomes
@@ -700,15 +696,19 @@ def run_deployment_agent(
                     if complete:
                         status, reason = "SUCCESS", "new outcomes passed validation twice"
                     else:
-                        last_result = check_result
+                        latest_feedback = check_result
             else:
-                last_result = tools.call(decision)
-            repeat_key = _repeat_key(decision, last_result)
+                latest_feedback = tools.call(decision)
+            repeat_key = _repeat_key(decision, latest_feedback)
             repeats[repeat_key] = repeats.get(repeat_key, 0) + 1
-            last_result["repeated_action_count"] = repeats[repeat_key] - 1
+            latest_feedback["repeated_action_count"] = repeats[repeat_key] - 1
             stalled = repeats[repeat_key] >= 3
             if stalled:
-                detail = last_result.get("reason") or last_result.get("status") or "no state change"
+                detail = (
+                    latest_feedback.get("reason")
+                    or latest_feedback.get("status")
+                    or "no state change"
+                )
                 blocked_reason = f"same action produced no progress three times: {detail}"
                 if overview and current:
                     set_step_status(overview, current.id, "blocked")
@@ -716,8 +716,8 @@ def run_deployment_agent(
                 else:
                     status, reason = "BLOCKED", blocked_reason
             if decision.tool in {"observe", "execute"}:
-                last_result["step_id"] = decision.step_id
-            step_completed = advance_verified_step(overview, decision, last_result)
+                latest_feedback["step_id"] = decision.step_id
+            step_completed = advance_verified_step(overview, decision, latest_feedback)
             if step_completed:
                 record_step_result(state, current, deployed=True)
                 pass_progress = True
@@ -726,7 +726,7 @@ def run_deployment_agent(
                 refresh_environment = True
                 write_yaml(output / "overview.yaml", overview)
             elif decision.kind == "DONE" and state.get("active_step"):
-                last_result = {
+                latest_feedback = {
                     "status": "completion_rejected",
                     "reason": (
                         "the active step needs a matching successful observation "
@@ -744,7 +744,7 @@ def run_deployment_agent(
                     )
                     pass_progress = True
                 except ValueError as exc:
-                    last_result["overview_change_error"] = str(exc)
+                    latest_feedback["overview_change_error"] = str(exc)
             if decision.kind != "DONE":
                 apply_result(state, decision, sources)
             if overview:
@@ -753,14 +753,14 @@ def run_deployment_agent(
                 write_yaml(output / "overview.yaml", overview)
             event = (
                 "action_finished"
-                if decision.tool == "execute" and "execution" in last_result
+                if decision.tool == "execute" and "execution" in latest_feedback
                 else "tool"
             )
             history.append(
                 event,
                 iteration=cycle,
                 tool=decision.tool,
-                result=last_result,
+                result=latest_feedback,
                 **(
                     {
                         "source_signature": sources.signature,
@@ -797,7 +797,7 @@ def run_deployment_agent(
         "usage": usage,
         "model": model,
         "state": state,
-        "last_result": last_result,
+        "latest_feedback": latest_feedback,
     }
     write_json(output / "final-report.json", report)
     history.append(
