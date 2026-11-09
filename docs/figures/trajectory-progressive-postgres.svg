@@ -1,0 +1,97 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="900" viewBox="0 0 1600 900" role="img" aria-labelledby="title desc">
+  <title id="title">Progressive deployment trajectory: PostgreSQL recovery</title>
+  <desc id="desc">An exact, slide-ready trace of HerAgent observing a MOSIP cluster, attempting PostgreSQL installation, repairing a missing Helm repository, retrying, and validating success.</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#64748b"/>
+    </marker>
+    <style>
+      .title { font: 700 36px Inter, Arial, sans-serif; fill: #0f172a; }
+      .subtitle { font: 18px Inter, Arial, sans-serif; fill: #475569; }
+      .card-title { font: 700 21px Inter, Arial, sans-serif; fill: #0f172a; }
+      .label { font: 700 16px Inter, Arial, sans-serif; fill: #334155; }
+      .body { font: 17px Inter, Arial, sans-serif; fill: #1e293b; }
+      .mono { font: 16px "DejaVu Sans Mono", Consolas, monospace; fill: #0f172a; }
+      .small { font: 15px Inter, Arial, sans-serif; fill: #475569; }
+      .footer { font: 14px Inter, Arial, sans-serif; fill: #64748b; }
+    </style>
+  </defs>
+
+  <rect width="1600" height="900" fill="#f8fafc"/>
+  <text class="title" x="70" y="62">Progressive deployment recovers from a missing prerequisite</text>
+  <text class="subtitle" x="70" y="94">MOSIP on AWS · rationale is taken from <tspan font-family="monospace">events/trajectory.jsonl</tspan> · observations are command results</text>
+
+  <!-- Phase 1 -->
+  <rect x="60" y="135" width="460" height="230" rx="16" fill="#ffffff" stroke="#94a3b8" stroke-width="2"/>
+  <rect x="60" y="135" width="460" height="42" rx="16" fill="#dbeafe"/>
+  <path d="M60 161 h460 v16 h-460z" fill="#dbeafe"/>
+  <text class="card-title" x="82" y="164">1 · Observe → choose next gap</text>
+  <text class="label" x="82" y="205">Observed state</text>
+  <text class="body" x="82" y="231">Kubernetes API reachable; Longhorn is the default</text>
+  <text class="body" x="82" y="255">StorageClass; PostgreSQL Helm release is absent.</text>
+  <text class="label" x="82" y="287">Recorded rationale</text>
+  <text class="small" x="82" y="312">“The documented PostgreSQL Helm release is absent …</text>
+  <text class="small" x="82" y="334">while the cluster has a default dynamic Longhorn storage class.”</text>
+
+  <line x1="520" y1="250" x2="565" y2="250" stroke="#64748b" stroke-width="3" marker-end="url(#arrow)"/>
+
+  <rect x="575" y="135" width="450" height="230" rx="16" fill="#ffffff" stroke="#94a3b8" stroke-width="2"/>
+  <rect x="575" y="135" width="450" height="42" rx="16" fill="#fef3c7"/>
+  <path d="M575 161 h450 v16 h-450z" fill="#fef3c7"/>
+  <text class="card-title" x="597" y="164">2 · Act</text>
+  <text class="label" x="597" y="207">Command</text>
+  <rect x="597" y="222" width="255" height="36" rx="7" fill="#f1f5f9"/>
+  <text class="mono" x="611" y="246">./install.sh</text>
+  <text class="label" x="597" y="290">Working directory</text>
+  <text class="mono" x="597" y="316">deployment/v3/external/postgres</text>
+  <text class="small" x="597" y="343">Human approval required before mutation.</text>
+
+  <line x1="1025" y1="250" x2="1070" y2="250" stroke="#64748b" stroke-width="3" marker-end="url(#arrow)"/>
+
+  <rect x="1080" y="135" width="460" height="230" rx="16" fill="#fff1f2" stroke="#dc2626" stroke-width="3"/>
+  <rect x="1080" y="135" width="460" height="42" rx="16" fill="#fee2e2"/>
+  <path d="M1080 161 h460 v16 h-460z" fill="#fee2e2"/>
+  <text class="card-title" x="1102" y="164">3 · Observe failure</text>
+  <text class="label" x="1102" y="207">Result</text>
+  <text class="mono" x="1102" y="236">INSTALLATION FAILED:</text>
+  <text class="mono" x="1102" y="263" fill="#b91c1c">repo bitnami not found</text>
+  <text class="body" x="1102" y="301">The action failed, but the error identified one concrete,</text>
+  <text class="body" x="1102" y="326">local prerequisite. The agent did not abandon the goal.</text>
+  <path d="M1492 315 l22 22 m0-22 l-22 22" stroke="#dc2626" stroke-width="6" stroke-linecap="round"/>
+
+  <!-- Phase 2 -->
+  <path d="M1310 365 V405 H290 V430" fill="none" stroke="#64748b" stroke-width="3" marker-end="url(#arrow)"/>
+
+  <rect x="60" y="440" width="720" height="240" rx="16" fill="#ffffff" stroke="#d97706" stroke-width="3"/>
+  <rect x="60" y="440" width="720" height="42" rx="16" fill="#fef3c7"/>
+  <path d="M60 466 h720 v16 h-720z" fill="#fef3c7"/>
+  <text class="card-title" x="82" y="469">4 · Reason → repair prerequisite</text>
+  <text class="label" x="82" y="511">Recorded rationale</text>
+  <text class="body" x="82" y="539">“The supplied installers explicitly add the Bitnami repository before</text>
+  <text class="body" x="82" y="565">installing dependent charts. The target Helm client lacks that repository,</text>
+  <text class="body" x="82" y="591">so adding it is the next safe prerequisite …”</text>
+  <text class="label" x="82" y="626">Action</text>
+  <rect x="155" y="607" width="557" height="38" rx="7" fill="#f1f5f9"/>
+  <text x="170" y="632" font-family="DejaVu Sans Mono, Consolas, monospace" font-size="14" fill="#0f172a">helm repo add bitnami https://charts.bitnami.com/bitnami</text>
+  <text class="small" x="82" y="664">Validation: <tspan font-family="monospace">helm repo list</tspan> contains <tspan font-family="monospace">bitnami</tspan> ✓</text>
+
+  <line x1="780" y1="560" x2="825" y2="560" stroke="#64748b" stroke-width="3" marker-end="url(#arrow)"/>
+
+  <rect x="835" y="440" width="705" height="240" rx="16" fill="#ecfdf5" stroke="#16a34a" stroke-width="3"/>
+  <rect x="835" y="440" width="705" height="42" rx="16" fill="#dcfce7"/>
+  <path d="M835 466 h705 v16 h-705z" fill="#dcfce7"/>
+  <text class="card-title" x="857" y="469">5 · Retry → validate state change</text>
+  <text class="label" x="857" y="511">Recorded rationale</text>
+  <text class="body" x="857" y="539">“Its required Helm repositories are confirmed configured, and no PostgreSQL</text>
+  <text class="body" x="857" y="565">workload or Helm release is present. Running it closes the next missing</text>
+  <text class="body" x="857" y="591">MOSIP dependency …”</text>
+  <text class="label" x="857" y="626">After execution</text>
+  <text class="mono" x="1000" y="626" fill="#15803d">postgres-postgresql-0   2/2   Running</text>
+  <text class="small" x="857" y="660">New verified outcome: <tspan font-family="monospace" font-weight="700">external-postgresql</tspan></text>
+  <path d="M1484 622 l14 15 l29-34" fill="none" stroke="#16a34a" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"/>
+
+  <rect x="60" y="727" width="1480" height="105" rx="14" fill="#0f172a"/>
+  <text x="86" y="764" font-family="Inter, Arial, sans-serif" font-size="19" font-weight="700" fill="#ffffff">Why this trajectory matters</text>
+  <text x="86" y="794" font-family="Inter, Arial, sans-serif" font-size="18" fill="#e2e8f0">The agent used a runtime gap, source evidence, an execution error, and post-action checks to make measurable progress—without rebuilding a complete plan.</text>
+  <text class="footer" x="70" y="872">Source: mosip-policy-20260929T133639Z/run/{trajectory.jsonl,actions.jsonl,state.json} · Exact rationale is line-wrapped; ellipsis marks omitted text.</text>
+</svg>

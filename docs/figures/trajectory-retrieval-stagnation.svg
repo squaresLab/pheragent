@@ -1,0 +1,84 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="900" viewBox="0 0 1600 900" role="img" aria-labelledby="title desc">
+  <title id="title">Retrieval stagnation after PostgreSQL deployment</title>
+  <desc id="desc">A slide-ready diagram showing HerAgent repeatedly searching for the producer of a Kafka global ConfigMap with changing wording but no information-state progress.</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10z" fill="#64748b"/></marker>
+    <style>
+      .title { font:700 36px Inter, Arial, sans-serif; fill:#0f172a; }
+      .subtitle { font:18px Inter, Arial, sans-serif; fill:#475569; }
+      .head { font:700 21px Inter, Arial, sans-serif; fill:#0f172a; }
+      .label { font:700 16px Inter, Arial, sans-serif; fill:#334155; }
+      .body { font:16px Inter, Arial, sans-serif; fill:#1e293b; }
+      .mono { font:15px "DejaVu Sans Mono", Consolas, monospace; fill:#0f172a; }
+      .big { font:700 38px Inter, Arial, sans-serif; fill:#b91c1c; }
+      .small { font:14px Inter, Arial, sans-serif; fill:#64748b; }
+    </style>
+  </defs>
+  <rect width="1600" height="900" fill="#f8fafc"/>
+  <text class="title" x="70" y="62">When new wording hides the same unresolved search</text>
+  <text class="subtitle" x="70" y="94">After PostgreSQL succeeded, the agent tried to ground Kafka’s missing <tspan font-family="monospace">ConfigMap/global</tspan> prerequisite</text>
+
+  <rect x="60" y="135" width="410" height="175" rx="16" fill="#ecfdf5" stroke="#16a34a" stroke-width="3"/>
+  <text class="head" x="84" y="170">Known progress</text>
+  <text class="body" x="84" y="202">Verified outcome:</text>
+  <text class="mono" x="84" y="230" fill="#15803d">external-postgresql</text>
+  <text class="body" x="84" y="263">Next documented component: Kafka</text>
+  <text class="body" x="84" y="289">Observed gap: <tspan font-family="monospace">ConfigMap/global</tspan> absent</text>
+
+  <line x1="470" y1="222" x2="520" y2="222" stroke="#64748b" stroke-width="3" marker-end="url(#arrow)"/>
+
+  <rect x="530" y="135" width="1010" height="175" rx="16" fill="#fff7ed" stroke="#d97706" stroke-width="3"/>
+  <text class="head" x="554" y="170">Unresolved information need</text>
+  <text class="body" x="554" y="202">Which source-supported manifest or installer creates <tspan font-family="monospace">ConfigMap/global</tspan></text>
+  <text class="body" x="554" y="228">with <tspan font-family="monospace">data.mosip-kafka-host</tspan> in the Kafka namespace?</text>
+  <text class="body" x="554" y="270">The underlying evidence did not change, but the agent kept restating the question.</text>
+
+  <!-- Repeated calls -->
+  <rect x="60" y="355" width="455" height="245" rx="14" fill="#ffffff" stroke="#94a3b8" stroke-width="2"/>
+  <rect x="60" y="355" width="455" height="40" rx="14" fill="#e2e8f0"/>
+  <path d="M60 379 h455 v16 h-455z" fill="#e2e8f0"/>
+  <text class="head" x="82" y="383">Search A · cycle 5</text>
+  <text class="label" x="82" y="426">Recorded rationale</text>
+  <text class="body" x="82" y="453">“The required global ConfigMap is absent, so Kafka</text>
+  <text class="body" x="82" y="477">cannot be installed safely. Find the source-supported</text>
+  <text class="body" x="82" y="501">component or manifest that creates it …”</text>
+  <text class="label" x="82" y="540">Result</text>
+  <text class="body" x="82" y="566">Consumers found; producer still unidentified.</text>
+
+  <line x1="515" y1="477" x2="560" y2="477" stroke="#64748b" stroke-width="3" marker-end="url(#arrow)"/>
+
+  <rect x="570" y="355" width="455" height="245" rx="14" fill="#ffffff" stroke="#94a3b8" stroke-width="2"/>
+  <rect x="570" y="355" width="455" height="40" rx="14" fill="#e2e8f0"/>
+  <path d="M570 379 h455 v16 h-455z" fill="#e2e8f0"/>
+  <text class="head" x="592" y="383">Search B · cycle 9</text>
+  <text class="label" x="592" y="426">Recorded rationale</text>
+  <text class="body" x="592" y="453">“Kafka’s documented installer reads ConfigMap/global</text>
+  <text class="body" x="592" y="477">for mosip-kafka-host … locate a source-supported</text>
+  <text class="body" x="592" y="501">producer … before deploying Kafka.”</text>
+  <text class="label" x="592" y="540">Result</text>
+  <text class="body" x="592" y="566">Same installer excerpt returned again.</text>
+
+  <line x1="1025" y1="477" x2="1070" y2="477" stroke="#64748b" stroke-width="3" marker-end="url(#arrow)"/>
+
+  <rect x="1080" y="355" width="460" height="245" rx="14" fill="#fff1f2" stroke="#dc2626" stroke-width="3"/>
+  <rect x="1080" y="355" width="460" height="40" rx="14" fill="#fee2e2"/>
+  <path d="M1080 379 h460 v16 h-460z" fill="#fee2e2"/>
+  <text class="head" x="1102" y="383">Search C · cycle 10</text>
+  <text class="label" x="1102" y="426">Recorded rationale</text>
+  <text class="body" x="1102" y="453">“The documented Kafka installer requires</text>
+  <text class="body" x="1102" y="477">ConfigMap/global, but its producer remains unresolved.</text>
+  <text class="body" x="1102" y="501">Search specifically for creation of that ConfigMap …”</text>
+  <text class="label" x="1102" y="540">Result</text>
+  <text class="body" x="1102" y="566">Same evidence; no action or human escalation.</text>
+
+  <path d="M1305 600 C1305 660 800 660 800 614" fill="none" stroke="#dc2626" stroke-width="4" stroke-dasharray="10 8" marker-end="url(#arrow)"/>
+  <text class="body" x="921" y="678" fill="#b91c1c">new phrasing reset the investigation</text>
+
+  <rect x="60" y="690" width="1480" height="135" rx="16" fill="#0f172a"/>
+  <text x="90" y="733" font-family="Inter, Arial, sans-serif" font-size="18" font-weight="700" fill="#cbd5e1">Observed cost before cancellation</text>
+  <text class="big" x="90" y="785" fill="#f87171">214 / 239</text>
+  <text x="290" y="782" font-family="Inter, Arial, sans-serif" font-size="20" fill="#f8fafc">decisions concerned Kafka / the global ConfigMap</text>
+  <text x="775" y="782" font-family="Inter, Arial, sans-serif" font-size="20" fill="#f8fafc">183 source searches overall</text>
+  <text x="1120" y="782" font-family="Inter, Arial, sans-serif" font-size="20" fill="#f8fafc">1,208,434 tokens</text>
+  <text class="small" x="70" y="872">Source: mosip-policy-20260929T133639Z/run/trajectory.jsonl · The run was manually stopped; no second verified outcome followed PostgreSQL.</text>
+</svg>

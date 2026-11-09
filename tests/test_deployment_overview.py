@@ -9,6 +9,7 @@ from pheragent.deployment.overview import (
     active_step,
     apply_change,
     create_overview,
+    retry_blocked_steps,
     set_discoveries,
     set_step_status,
 )
@@ -74,9 +75,13 @@ def test_model_selects_route_then_builds_overview_from_complete_files(tmp_path: 
                                         "goal": "start services",
                                         "success_condition": "services are healthy",
                                         "components": ["frontend"],
-                                        "source_refs": ["repository-1:docs/run.md"],
+                                        "source_refs": [
+                                            "repository-1:docs/run.md",
+                                            "repository-1:docs/missing.md",
+                                        ],
                                         "related_sources": [
-                                            "repository-1:docs/details.md"
+                                            "repository-1:docs/details.md",
+                                            "repository-1:docs/also-missing.md",
                                         ],
                                     }
                                 ],
@@ -99,6 +104,10 @@ def test_model_selects_route_then_builds_overview_from_complete_files(tmp_path: 
     assert active_step(overview).source_refs == ["repository-1:docs/run.md"]
     assert active_step(overview).components == ["frontend"]
     assert active_step(overview).related_sources == ["repository-1:docs/details.md"]
+    assert overview.removed_sources == [
+        "repository-1:docs/also-missing.md",
+        "repository-1:docs/missing.md",
+    ]
     assert usage == {"requests": 2}
     set_discoveries(overview, ["database endpoint missing", "database endpoint missing"])
     assert overview.discoveries == ["database endpoint missing"]
@@ -139,10 +148,56 @@ def test_grounded_prerequisite_is_inserted_before_its_consumer(tmp_path: Path) -
             before_step_id="service",
             goal="provide storage",
             success_condition="a dynamic provisioner is ready",
-            source_refs=["repository-1:README.md"],
+            source_refs=["repository-1:missing.md"],
+            related_sources=["repository-1:also-missing.md"],
         ),
         sources,
     )
 
     assert active_step(overview).id == "storage"
+    assert active_step(overview).source_refs == ["repository-1:README.md"]
+    assert overview.removed_sources == [
+        "repository-1:also-missing.md",
+        "repository-1:missing.md",
+    ]
     assert [step.id for step in overview.stages[0].steps] == ["storage", "service"]
+
+
+def test_blocked_step_yields_to_independent_work() -> None:
+    overview = DeploymentOverview.model_validate(
+        {
+            "route": "documented route",
+            "route_evidence": ["repository-1:README.md"],
+            "stages": [
+                {
+                    "id": "deploy",
+                    "kind": "deploy",
+                    "goal": "deploy available components",
+                    "steps": [
+                        {
+                            "id": "database",
+                            "goal": "deploy database",
+                            "success_condition": "database is ready",
+                            "source_refs": ["repository-1:README.md"],
+                            "status": "active",
+                        },
+                        {
+                            "id": "cache",
+                            "goal": "deploy cache",
+                            "success_condition": "cache is ready",
+                            "source_refs": ["repository-1:README.md"],
+                        },
+                    ],
+                }
+            ],
+        }
+    )
+
+    set_step_status(overview, "database", "blocked")
+
+    assert active_step(overview).id == "cache"
+
+    set_step_status(overview, "cache", "verified")
+    assert active_step(overview) is None
+    assert retry_blocked_steps(overview)
+    assert active_step(overview).id == "database"

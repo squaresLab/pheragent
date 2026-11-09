@@ -1,0 +1,97 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="780" viewBox="0 0 1600 780" role="img" aria-labelledby="title desc">
+  <title id="title">HerAgent progressive deployment loop</title>
+  <desc id="desc">A minimal diagram showing initialization from task and sources, followed by a progressive deployment loop connected to a deployment node and human approval.</desc>
+  <defs>
+    <marker id="blue-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10z" fill="#2563eb"/></marker>
+    <marker id="orange-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10z" fill="#ea580c"/></marker>
+    <marker id="green-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10z" fill="#16a34a"/></marker>
+    <style>
+      .title{font:700 40px Inter,Arial,sans-serif;fill:#111827}.subtitle{font:20px Inter,Arial,sans-serif;fill:#475569}
+      .section{font:700 24px Inter,Arial,sans-serif;fill:#111827}.box-title{font:700 21px Inter,Arial,sans-serif;fill:#111827}
+      .body{font:18px Inter,Arial,sans-serif;fill:#334155}.small{font:16px Inter,Arial,sans-serif;fill:#475569}
+      .mono{font:17px "DejaVu Sans Mono",Consolas,monospace;fill:#0f172a}.arrow-label{font:700 16px Inter,Arial,sans-serif}
+    </style>
+  </defs>
+
+  <rect width="1600" height="780" fill="#ffffff"/>
+  <text class="title" x="56" y="60">HerAgent progressive deployment loop</text>
+  <text class="subtitle" x="56" y="96">Maintain a high-level guide, close one observed deployment gap, record the result, and repeat.</text>
+
+  <!-- Initialization -->
+  <rect x="55" y="125" width="1490" height="105" rx="17" fill="#f8fafc" stroke="#cbd5e1" stroke-width="2"/>
+  <text class="section" x="78" y="158">Initialize once</text>
+  <rect x="250" y="145" width="230" height="62" rx="12" fill="#e0f2fe" stroke="#0284c7" stroke-width="2"/>
+  <text class="box-title" x="275" y="174">Task</text><text class="small" x="275" y="197">goal, target, constraints</text>
+  <text x="500" y="184" font-family="Inter,Arial,sans-serif" font-size="29" fill="#64748b">+</text>
+  <rect x="535" y="145" width="230" height="62" rx="12" fill="#e0f2fe" stroke="#0284c7" stroke-width="2"/>
+  <text class="box-title" x="560" y="174">Sources</text><text class="small" x="560" y="197">repositories and documents</text>
+  <line x1="790" y1="176" x2="855" y2="176" stroke="#2563eb" stroke-width="3" marker-end="url(#blue-arrow)"/>
+  <rect x="875" y="145" width="280" height="62" rx="12" fill="#ede9fe" stroke="#7c3aed" stroke-width="2"/>
+  <text class="box-title" x="900" y="174">High-level overview</text><text class="small" x="900" y="197">ordered deployment steps</text>
+  <text x="1175" y="184" font-family="Inter,Arial,sans-serif" font-size="29" fill="#64748b">+</text>
+  <rect x="1210" y="145" width="275" height="62" rx="12" fill="#fef3c7" stroke="#d97706" stroke-width="2"/>
+  <text class="box-title" x="1235" y="174">Append-only history</text><text class="small" x="1235" y="197">resume state and prior results</text>
+
+  <!-- Core loop -->
+  <rect x="55" y="260" width="1190" height="440" rx="22" fill="#f8fafc" stroke="#2563eb" stroke-width="3"/>
+  <text class="section" x="80" y="301">Core loop</text>
+
+  <rect x="90" y="335" width="240" height="110" rx="15" fill="#ede9fe" stroke="#7c3aed" stroke-width="2"/>
+  <text class="box-title" x="115" y="369">1 · Select step</text>
+  <text class="body" x="115" y="399">Choose the next</text><text class="body" x="115" y="426">unfinished overview step.</text>
+  <line x1="330" y1="390" x2="385" y2="390" stroke="#2563eb" stroke-width="3" marker-end="url(#blue-arrow)"/>
+
+  <rect x="405" y="335" width="240" height="110" rx="15" fill="#dcfce7" stroke="#16a34a" stroke-width="2"/>
+  <text class="box-title" x="430" y="369">2 · Observe</text>
+  <text class="body" x="430" y="399">Read the current</text><text class="body" x="430" y="426">deployment environment.</text>
+  <line x1="645" y1="390" x2="700" y2="390" stroke="#2563eb" stroke-width="3" marker-end="url(#blue-arrow)"/>
+
+  <rect x="720" y="318" width="250" height="145" rx="15" fill="#eff6ff" stroke="#2563eb" stroke-width="2"/>
+  <text class="box-title" x="745" y="352">3 · Build context</text>
+  <text class="small" x="745" y="380">task + overview + active step</text>
+  <text class="small" x="745" y="404">runtime state + recent history</text>
+  <text class="small" x="745" y="428">+ last result</text>
+  <text class="mono" x="745" y="452">step-focused view</text>
+  <line x1="970" y1="390" x2="1025" y2="390" stroke="#2563eb" stroke-width="3" marker-end="url(#blue-arrow)"/>
+
+  <rect x="1045" y="335" width="165" height="110" rx="28" fill="#dbeafe" stroke="#2563eb" stroke-width="3"/>
+  <text class="box-title" x="1075" y="375">4 · LLM</text>
+  <text class="body" x="1080" y="405">decides the</text><text class="body" x="1090" y="431">next action</text>
+
+  <!-- LLM to router -->
+  <line x1="1060" y1="445" x2="930" y2="490" stroke="#2563eb" stroke-width="3" marker-end="url(#blue-arrow)"/>
+
+  <rect x="700" y="490" width="250" height="105" rx="15" fill="#ffedd5" stroke="#ea580c" stroke-width="2"/>
+  <text class="box-title" x="725" y="524">5 · Route decision</text>
+  <text class="small" x="725" y="551">read · observe · execute</text>
+  <text class="small" x="725" y="576">ask human · wait · finish</text>
+
+  <line x1="700" y1="542" x2="645" y2="542" stroke="#ea580c" stroke-width="3" marker-end="url(#orange-arrow)"/>
+  <rect x="355" y="490" width="270" height="105" rx="15" fill="#fef3c7" stroke="#d97706" stroke-width="2"/>
+  <text class="box-title" x="380" y="524">6 · Record result</text>
+  <text class="small" x="380" y="551">update overview state</text><text class="small" x="380" y="576">append decision + result</text>
+
+  <!-- Deployment node -->
+  <rect x="1290" y="270" width="255" height="245" rx="22" fill="#fff7ed" stroke="#ea580c" stroke-width="3"/>
+  <text class="section" x="1320" y="301">Deployment node</text>
+  <rect x="1315" y="325" width="205" height="52" rx="10" fill="#ffffff" stroke="#fdba74"/>
+  <text class="box-title" x="1343" y="359">Source files</text>
+  <rect x="1315" y="390" width="205" height="52" rx="10" fill="#ffffff" stroke="#fdba74"/>
+  <text class="box-title" x="1342" y="424">Runtime state</text>
+  <rect x="1315" y="455" width="205" height="52" rx="10" fill="#ffffff" stroke="#fdba74"/>
+  <text class="box-title" x="1330" y="489">Approved actions</text>
+
+  <!-- One clear bidirectional tool channel -->
+  <path d="M960 520 C1080 520 1170 500 1280 480" fill="none" stroke="#ea580c" stroke-width="3" marker-start="url(#orange-arrow)" marker-end="url(#orange-arrow)"/>
+
+  <!-- Human interaction uses a separate lower channel -->
+  <rect x="1290" y="545" width="255" height="100" rx="28" fill="#ecfdf5" stroke="#16a34a" stroke-width="3"/>
+  <text class="section" x="1371" y="584">Human</text>
+  <text class="small" x="1321" y="615">approval or required input</text>
+  <path d="M960 570 C1080 650 1170 650 1280 595" fill="none" stroke="#16a34a" stroke-width="3" marker-start="url(#green-arrow)" marker-end="url(#green-arrow)"/>
+
+  <!-- Feedback loop around empty left margin -->
+  <path d="M355 555 H210 V455 H210 V445" fill="none" stroke="#ea580c" stroke-width="3" marker-end="url(#orange-arrow)"/>
+  <rect x="78" y="592" width="200" height="29" rx="8" fill="#f8fafc"/>
+  <text class="arrow-label" x="178" y="612" text-anchor="middle" fill="#c2410c">continue until finished</text>
+</svg>

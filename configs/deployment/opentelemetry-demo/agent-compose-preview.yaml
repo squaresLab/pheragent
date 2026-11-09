@@ -18,8 +18,12 @@ constraints:
   allow_new_infrastructure: true
   allow_destructive_actions: false
 
+context:
+  mode: recent
+  history_window: 8
+
 budgets:
-  max_cycles: 3
-  max_mutating_actions: 1
-  max_runtime_minutes: 30
-  max_read_actions_per_cycle: 20
+  max_cycles: 10
+  max_mutating_actions: 10
+  max_runtime_minutes: 45
+  max_read_actions_per_cycle: 40

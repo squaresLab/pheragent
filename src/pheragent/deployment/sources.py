@@ -11,11 +11,11 @@ from pathlib import Path, PurePosixPath
 from urllib.parse import urlsplit
 
 from .inventory import RepositoryInventoryBuilder
-from .models import SourceKind, SourceSpec
+from .models import SourceKind, SourcesConfig, SourceSpec
 from .redaction import redact_secrets
 from .retrieval import DeploymentRetrievalEngine, RetrievalQuery
-from .source_manager import AcquiredSource
-from .task import Decision, SourceLocation
+from .source_manager import AcquiredSource, SourceManager
+from .task import Decision, DeploymentTask, SourceLocation
 
 _ENTRYPOINT_CATEGORIES = {
     "ansible",
@@ -47,6 +47,60 @@ def _source_spec(item: str | SourceLocation, purpose: str, index: int, base: Pat
         purpose=purpose,
         revision=revision,
     )
+
+
+class DeploymentSources:
+    """Acquire and extend the pinned sources for one deployment run."""
+
+    def __init__(
+        self,
+        task: DeploymentTask,
+        base: Path,
+        manager: SourceManager,
+        specs: list[SourceSpec],
+    ):
+        self.task = task
+        self.base = base
+        self.manager = manager
+        self.specs = specs
+        self._acquire()
+
+    @classmethod
+    def acquire(
+        cls,
+        task: DeploymentTask,
+        *,
+        base: Path,
+        cache_dir: Path,
+    ) -> DeploymentSources:
+        specs = [
+            _source_spec(item, purpose, index, base)
+            for purpose, items in (
+                ("repository", task.sources.repositories),
+                ("documentation", task.sources.documentation),
+            )
+            for index, item in enumerate(items, start=1)
+        ]
+        manager = SourceManager(cache_dir=cache_dir, config_dir=base, strict=False)
+        return cls(task, base, manager, specs)
+
+    def add_repository(self, source: SourceLocation) -> str:
+        self.task.sources.repositories.append(source)
+        index = len(self.task.sources.repositories)
+        self.specs.append(_source_spec(source, "repository", index, self.base))
+        self._acquire()
+        revision = self.manifest.sources[-1].resolved_revision
+        pinned = source.model_copy(update={"revision": revision})
+        self.task.sources.repositories[-1] = pinned
+        self.specs[-1] = _source_spec(pinned, "repository", index, self.base)
+        return revision or ""
+
+    def _acquire(self) -> None:
+        acquired = self.manager.acquire(
+            SourcesConfig(system="deployment", sources=self.specs)
+        )
+        self.manifest = acquired.manifest
+        self.tools = SourceTools(acquired.sources)
 
 
 def _source_tree(paths: set[str]) -> dict:
@@ -87,6 +141,11 @@ def _source_tree(paths: set[str]) -> dict:
 class SourceTools:
     def __init__(self, sources: tuple[AcquiredSource, ...]):
         self.sources = {source.id: source for source in sources}
+        versions = "\n".join(
+            f"{source.id}:{source.manifest.content_hash}"
+            for source in sorted(sources, key=lambda item: item.id)
+        )
+        self.signature = hashlib.sha256(versions.encode()).hexdigest()
         inventory = RepositoryInventoryBuilder().build(sources)
         self.entries = [entry for entry in inventory.entries if entry.selected]
         documents = []
@@ -265,7 +324,7 @@ class SourceTools:
             "references": self.reference_graph(),
         }
 
-    def working_directory(self, decision: Decision, workspace: Path) -> Path | None:
+    def source_directory(self, decision: Decision) -> Path | None:
         if not decision.working_directory:
             return None
         source_id, separator, relative = decision.working_directory.partition(":")
@@ -277,6 +336,14 @@ class SourceTools:
         path = source.resolve_path(relative)
         if not path.is_dir():
             raise ValueError("working_directory does not exist")
+        return path
+
+    def working_directory(self, decision: Decision, workspace: Path) -> Path | None:
+        path = self.source_directory(decision)
+        if path is None:
+            return None
+        source_id = decision.working_directory.partition(":")[0]
+        source = self.sources[source_id]
         copy = workspace / source_id
         if not copy.exists():
             copy.parent.mkdir(parents=True, exist_ok=True)

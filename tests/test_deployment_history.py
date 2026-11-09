@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 from pheragent.deployment.history import RunHistory
 
@@ -18,23 +19,127 @@ def test_history_restores_checkpoint_and_accumulates_usage(tmp_path: Path) -> No
     assert [event["sequence"] for event in restored.events()] == [1, 2, 3]
 
 
-def test_history_supports_recent_and_compact_source_context(tmp_path: Path) -> None:
+def test_history_returns_only_relevant_step_events(tmp_path: Path) -> None:
     history = RunHistory(tmp_path)
-    history.append("decision", value={"focus": "find command"}, usage={})
+    history.append(
+        "decision",
+        value={
+            "kind": "ACT",
+            "tool": "read_file",
+            "focus": "find command",
+            "step_id": "deploy",
+        },
+        usage={},
+    )
     history.append(
         "tool",
         tool="read_file",
         result={
             "source": "repository-1:README.md",
             "total_lines": 200,
+            "complete": True,
             "text": "start\n" + "x" * 4000 + "\nmake start",
         },
     )
+    history.append(
+        "decision",
+        value={
+            "kind": "ACT",
+            "tool": "observe",
+            "focus": "check runtime",
+            "step_id": "deploy",
+        },
+        usage={},
+    )
 
-    recent = history.context(mode="recent", window=1)
-    summary = history.context(mode="summary", window=8)
+    context = history.context(window=8, step_id="deploy")
 
-    assert recent[0]["tool"] == "read_file"
-    assert summary["source_notes"][0]["source"] == "repository-1:README.md"
-    assert "make start" in summary["source_notes"][0]["text"]
-    assert len(summary["source_notes"][0]["text"]) < 3100
+    assert [event["event"] for event in context] == ["decision", "tool", "decision"]
+    assert context[0]["focus"] == "find command"
+    assert context[1]["source"] == "repository-1:README.md"
+    assert context[2]["focus"] == "check runtime"
+    assert all("text" not in event for event in context)
+
+
+def test_history_reuses_current_step_source_evidence(tmp_path: Path) -> None:
+    history = RunHistory(tmp_path)
+    history.append(
+        "tool",
+        iteration=1,
+        tool="search_sources",
+        source_signature="current",
+        source_request={
+            "step_id": "database",
+            "focus": "find the PostgreSQL installer",
+            "query": "postgres install helm",
+        },
+        result={
+            "hits": [
+                {
+                    "source": "repository-1:postgres/install.sh",
+                    "start_line": 1,
+                    "end_line": 20,
+                    "text": "helm install postgres",
+                }
+            ]
+        },
+    )
+
+    context = history.source_context(
+        step={"id": "database"}, source_signature="current"
+    )
+    recalled = history.recall_source(
+        SimpleNamespace(
+            tool="search_sources",
+            step_id="database",
+            query="helm postgres install",
+        ),
+        source_signature="current",
+    )
+
+    assert context[0]["evidence"]["hits"][0]["text"] == "helm install postgres"
+    assert recalled["memory_hit"] is True
+    assert recalled["hits"] == context[0]["evidence"]["hits"]
+    assert history.source_context(
+        step={"id": "database"}, source_signature="changed"
+    ) == []
+
+
+def test_history_renders_an_observed_runbook(tmp_path: Path) -> None:
+    history = RunHistory(tmp_path)
+    history.append(
+        "sources_acquired",
+        sources={
+            "sources": [
+                {
+                    "id": "repository-1",
+                    "location": "https://example.invalid/repo.git",
+                    "resolved_revision": "a" * 40,
+                    "content_hash": "b" * 64,
+                }
+            ]
+        },
+    )
+    history.append(
+        "action_started",
+        iteration=2,
+        command=["./install.sh"],
+        working_directory="repository-1:deploy",
+        step_id="database",
+        stdin_input="INSTALL_CONFIRMATION",
+    )
+    history.append(
+        "action_finished",
+        iteration=2,
+        result={
+            "status": "validated",
+            "after": [{"command": ["appctl", "status"]}],
+        },
+    )
+
+    runbook = history.runbook()
+
+    assert "https://example.invalid/repo.git @ " + "a" * 40 in runbook
+    assert 'printf "%s\\n" "${INSTALL_CONFIRMATION:?set INSTALL_CONFIRMATION}"' in runbook
+    assert "./install.sh" in runbook
+    assert "# verify: appctl status" in runbook

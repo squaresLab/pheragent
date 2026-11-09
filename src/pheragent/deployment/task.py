@@ -49,7 +49,6 @@ class Budgets(StrictModel):
 
 
 class ContextSettings(StrictModel):
-    mode: Literal["recent", "summary"] = "recent"
     history_window: int = Field(default=8, gt=0, le=50)
 
 
@@ -154,7 +153,6 @@ class Decision(StrictModel):
     resolve_gaps: list[str]
     add_questions: list[str]
     resolve_questions: list[str]
-
     @model_validator(mode="after")
     def require_valid_inputs(self) -> Decision:
         names = [item.name for item in self.required_inputs]

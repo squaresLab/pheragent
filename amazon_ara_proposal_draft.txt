@@ -1,0 +1,103 @@
+PROJECT TITLE
+
+HerAgent: AI Deployment for Complex Open-Source Systems
+
+PI: [Name, title, department, institution]
+Co-PI: [Name and affiliation, if applicable]
+Amazon contact (optional): [Name and email]
+
+ABSTRACT
+
+Deploying a complex open-source system requires more than running installation scripts. Deployment instructions are often spread across repositories, documentation, configuration files, and the target infrastructure. The instructions may describe several installation routes or depend on information that only an operator can provide.
+
+General software agents such as OpenHands can inspect repositories, run shell commands, edit files, and set up software. Deployment agents such as CSR-Agents can generate and improve commands for research repositories. Recent evaluations show important limits. Agents can make unnecessary changes, fail to preserve environment changes, or stop after checking a weaker result than the task requires. These failures become more serious when a deployment spans many services, external systems, and a live cluster.
+
+We propose HerAgent, an AI system that discovers deployment requirements, creates a high-level deployment overview, and compares those requirements with the current environment. The agent selects the next unfinished component, finds a supported command, executes it within a defined policy, and verifies the result. It records every observation, decision, action, and result so that a deployment can pause and resume. The agent requests human input when it needs a secret, an external value, or approval for a high-risk action.
+
+The project has three outputs. HerAgent Deploy is the deployment agent. HerAgent Bench is an AWS benchmark for deployment success and agent trajectories. HerAgent App is an interface for operator input, approvals, and policy control. MOSIP, an open-source national identity platform, is the primary use case. In an exploratory MOSIP run on a partly prepared cluster, the prototype verified 33 component outcomes but used 7.18 million tokens. We will test whether better source selection, working memory, functional verification, and selective human review improve reliability and reduce repeated work.
+
+KEYWORDS
+
+AI agents, software deployment, DevOps, agent verification, human-AI collaboration, open-source public systems
+
+INTRODUCTION
+
+Complex open-source systems often contain many services, repositories, infrastructure components, and external integrations. Their deployment instructions are rarely complete in one location. A repository may point to another guide, while a script may assume a configured cluster. A service may also require a certificate, hostname, or secret. An operator must combine these sources before deployment can succeed.
+
+Current software agents provide part of the required capability. SWE-agent shows how an agent can use a software interface to inspect and change a repository [1]. OpenHands can read files, edit code, run commands, and interact with a runtime environment [2]. CSR-Agents coordinates several language-model agents to read repository instructions and produce deployment commands for research projects [4]. These systems show that agents can perform useful setup and deployment work.
+
+Recent evaluations also show why the problem is not solved. SetupBench found that OpenHands had low success on repository setup and local database configuration. It also found that 38 to 89 percent of actions were unnecessary when compared with an efficient human process [3]. DeployBench found that many failures occurred because an agent stopped after it validated a different or weaker result than the task required [5]. FDE-Bench found that readiness was the largest failure stage in deployment configuration tasks [7]. These results point to problems in source use, state tracking, verification, and completion decisions.
+
+HerAgent addresses a broader deployment setting. The agent may receive several repositories, several deployment routes, and a target that already contains some components. It must determine the desired system state before it can decide what to change. It must then preserve existing work, recover from command failures, request missing information, and continue with independent components when one component is blocked.
+
+HerAgent performs the deployment in a persistent loop. First, it reads the main deployment sources and creates an overview of stages, components, related files, and success conditions. Second, it observes the live environment and selects the next unfinished component. Third, it finds and runs a command supported by the repository or by the observed failure. Fourth, it verifies the component through health checks, service behavior, and dependency checks. Finally, it records the result and uses that record during the next decision.
+
+The work is important because deployment failures often appear after a command has returned successfully. A pod can run while its service is unreachable, its database is uninitialized, or its external configuration is wrong. A useful deployment agent must therefore verify system behavior and retain enough state to continue a long task. It must also reduce operator work without hiding destructive actions or exposing secrets.
+
+Our primary use case is MOSIP, a modular platform for national identity systems [8,9]. We will also evaluate at least two other complex open-source systems. We ask:
+
+1. Can an agent construct a usable deployment overview from fragmented sources and live state?
+2. Do a maintained overview and working memory reduce repeated retrieval and token use?
+3. Can functional verification and selective human review reduce false completion and operator effort without increasing unsafe actions?
+4. Do these methods generalize across systems and model sizes?
+
+METHODS
+
+Deployment discovery. HerAgent Deploy will start from deployment entry points such as root documentation, installation guides, scripts, Compose files, Helm charts, and infrastructure definitions. The agent will follow relevant local references and approved external repository links. It will create a high-level overview that lists the expected stages, components, dependencies, related source files, and success conditions. The overview can change when the agent finds better information during execution.
+
+Progressive execution. A persistent observe, decide, act, and validate loop will work through the overview. The agent will inspect the current target before it proposes a change. Each action will include a command, a reason, an expected result, and a validation command. The agent will use repository commands when available. It can make a small local repair when runtime output shows that the documented command needs one.
+
+State and recovery. HerAgent will write observations, decisions, actions, command output, validations, and human responses to an append-only event log. The log is the source of truth for the run. A small working memory will extract facts that are relevant to the active component, including commands already found, prior failures, required inputs, and verified results. A resumed run will rebuild its context from the overview and event log instead of starting discovery again.
+
+When an action fails, the next loop will receive the failure output and the relevant prior events. The agent can correct a local problem, install a missing prerequisite, or revise the deployment overview. If one component requires unavailable external information, the agent will record the reason and continue with independent work. It will stop only when the deployment is complete or no remaining component can progress.
+
+Human collaboration. HerAgent App will show deployment status and ask operators for missing external values or approval of high-risk actions. Routine observations and changes within defined limits will not require approval. The execution environment will request approval for destructive operations, host changes, cloud changes, target changes, namespace boundary changes, and possible secret exposure. Secrets will be referenced securely instead of being stored in logs.
+
+Verification. HerAgent Bench will evaluate final system behavior and the sequence of agent actions. Deterministic tests will check service functions, dependencies, and policy compliance. A running container or pod will not prove deployment success. A component will count as deployed only when its required checks pass. Language-model review will address semantic questions that cannot be checked directly, but it will not override failed deterministic tests. We will compare semantic judgments with human labels.
+
+Experimental design. Each benchmark task will specify source locations, a target AWS environment, and policy limits, but it will not provide a complete deployment plan. We will compare four conditions under matched starting states:
+
+1. A general software agent with its standard context and tools.
+2. HerAgent without working memory.
+3. HerAgent with a maintained overview and working memory.
+4. The full system with trajectory verification and selective operator input.
+
+Additional experiments will vary retrieval methods, model size, and the amount of local action freedom. Compact tasks will use at least five runs per condition. Full deployments will target at least three runs per condition when resources permit.
+
+The main measure will be end-to-end functional deployment success. Other measures will include component coverage, false completion, recovery success, operator interventions, unsafe proposals, repeated actions, token use, and execution time.
+
+Preliminary results. The prototype can inspect deployment sources, read full files, observe Kubernetes state, execute commands, record events, resume work, and request operator input. In one exploratory MOSIP run, it verified 33 component outcomes and deferred eight components or integrations that required external information or action. The run made 771 model requests and used 7,175,146 tokens before it reached its decision limit. The cluster was partly prepared, so these figures do not establish end-to-end deployment success. They show that sustained deployment progress is possible and that source reuse, memory, and completion decisions need further study.
+
+EXPECTED RESULTS
+
+Months 1 to 3: Define the benchmark schema, create repeatable MOSIP tasks on AWS, and establish results for the baseline agents.
+
+Months 4 to 6: Improve deployment discovery, working memory, component validation, persistent state, and recovery. Run initial ablations and release a research version of HerAgent Deploy.
+
+Months 7 to 9: Develop trajectory verification and HerAgent App. Measure verification accuracy and operator effort.
+
+Months 10 to 12: Evaluate MOSIP and at least two further systems. Release HerAgent Bench, evaluation code, redacted trajectories, and validated deployment workflows, subject to licensing and security restrictions.
+
+The main research result will be an evaluation of how deployment context, memory, verification, and human intervention affect reliability. The project will also deliver three open-source tools: HerAgent Deploy, HerAgent Bench, and HerAgent App.
+
+ADDITIONAL INFORMATION
+
+Relation to the call. HerAgent addresses AI-enhanced productivity through collaboration between an operator and an agent. HerAgent Bench addresses scalable trajectory verification through functional tests, policy checks, and review of agent decisions. The project also studies agent customization through retrieval, memory, tools, and policies. Deployment of open-source public systems provides the application setting.
+
+Difference from existing work. Current coding agents can execute commands and modify software, while repository deployment agents can generate setup scripts. Related benchmarks usually provide one repository, a stated task, or a deployment specification. HerAgent studies long deployments in which the agent must recover requirements from several sources and compare them with a changing target. It combines discovery, live execution, resume, structured operator input, and functional component verification in one system. The experiments will test whether this design improves outcomes.
+
+Open-source contributions. We plan to release HerAgent Deploy, HerAgent Bench, and HerAgent App. We will contribute validated deployment workflows, fixes, and documentation to the MOSIP ecosystem where maintainers accept them. We will also share benchmark cases and permitted evaluation artifacts for other systems.
+
+AWS ML tools. Amazon Bedrock will provide foundation-model inference and model comparisons. Amazon SageMaker AI will support evaluation jobs and experiment analysis. Amazon EKS and EC2 will host test environments. Amazon S3 will store artifacts. CloudWatch and OpenTelemetry will support monitoring, while Secrets Manager and IAM will control sensitive values and access.
+
+APPENDIX A: REFERENCES
+
+[1] Yang et al. SWE-agent: Agent-Computer Interfaces Enable Automated Software Engineering. NeurIPS, 2024. https://proceedings.neurips.cc/paper_files/paper/2024/hash/5a7c947568c1b1328ccc5230172e1e7c-Abstract-Conference.html
+[2] Wang et al. OpenHands: An Open Platform for AI Software Developers as Generalist Agents. 2024. https://arxiv.org/abs/2407.16741
+[3] Arora et al. SetupBench: Assessing Software Engineering Agents' Ability to Bootstrap Development Environments. 2025. https://arxiv.org/abs/2507.09063
+[4] Xiao et al. CSR-Bench: Benchmarking LLM Agents in Deployment of Computer Science Research Repositories. NAACL, 2025. https://aclanthology.org/2025.naacl-long.633/
+[5] Wang et al. DeployBench: Benchmarking LLM Agents for Research Artifact Deployment. 2026. https://arxiv.org/abs/2606.05238
+[6] Tang et al. DevOps-Gym: Benchmarking AI Agents in Software DevOps Cycle. ICLR, 2026. https://arxiv.org/abs/2601.20882
+[7] Ding et al. FDE-Bench: Evaluating LLM Agents for Deployment Environment Configuration. 2026. https://arxiv.org/abs/2609.27571
+[8] MOSIP. Deployment documentation. https://github.com/mosip/documentation
+[9] MOSIP. Infrastructure repositories. https://github.com/mosip/infra

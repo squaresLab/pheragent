@@ -4,11 +4,16 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
+from copy import deepcopy
 from datetime import UTC, datetime
 from pathlib import Path
 
 from .redaction import redact_secrets
+from .retrieval import normalize_terms
 from .telemetry import record_event
+
+_SOURCE_TOOLS = {"read_file", "search_sources"}
 
 
 def _now() -> str:
@@ -44,39 +49,95 @@ class RunHistory:
     def events(self) -> list[dict]:
         return list(self._events())
 
-    def context(self, *, mode: str, window: int) -> list[dict] | dict:
-        useful = [
-            event
-            for event in self._events()
-            if event["event"] in {"decision", "tool", "human_choice", "overview_revised"}
+    def context(self, *, window: int, step_id: str | None = None) -> list[dict]:
+        context = []
+        decision_step = None
+        for event in self._events():
+            if event["event"] == "decision":
+                decision_step = event.get("value", {}).get("step_id")
+            if event["event"] not in {
+                "decision",
+                "tool",
+                "action_started",
+                "action_finished",
+                "human_choice",
+                "human_input",
+                "overview_revised",
+            }:
+                continue
+            if step_id and decision_step != step_id:
+                continue
+            context.append(_event_summary(event))
+        return context[-window:]
+
+    def source_context(
+        self,
+        *,
+        step: dict | None,
+        source_signature: str,
+        limit: int = 2,
+    ) -> list[dict]:
+        """Return source evidence most relevant to the active overview step."""
+        if not step:
+            return []
+        records = [
+            record
+            for record in self._source_records(source_signature)
+            if record.get("step_id") == step.get("id")
         ]
-        if mode == "recent":
-            return useful[-window:]
-        sources = {}
-        for event in useful:
-            result = event.get("result", {})
-            if event.get("tool") == "read_file" and result.get("source"):
-                text = result.get("text", "")
-                sources[result["source"]] = {
-                    "source": result["source"],
-                    "total_lines": result.get("total_lines"),
-                    "text": text if len(text) <= 3000 else text[:1500] + "\n[…]\n" + text[-1500:],
-                }
-        return {
-            "decisions": sum(event["event"] == "decision" for event in useful),
-            "tools": sum(event["event"] == "tool" for event in useful),
-            "source_notes": list(sources.values())[-window:],
-            "recent": [
-                {
-                    "event": event["event"],
-                    "tool": event.get("tool"),
-                    "focus": event.get("value", {}).get("focus"),
-                    "status": event.get("result", {}).get("status"),
-                    "reason": event.get("result", {}).get("reason"),
-                }
-                for event in useful[-min(window, 4) :]
-            ],
-        }
+        return [_source_summary(record) for record in records[-limit:]]
+
+    def recall_source(self, decision, *, source_signature: str) -> dict | None:
+        """Reuse a prior source result when the source set and request still match."""
+        records = self._source_records(source_signature)
+        match = None
+        if decision.tool == "read_file":
+            match = next(
+                (
+                    record
+                    for record in reversed(records)
+                    if record["tool"] == "read_file"
+                    and record.get("source_path") == decision.source_path
+                    and record.get("start_line") == decision.start_line
+                    and record.get("end_line") == decision.end_line
+                ),
+                None,
+            )
+        elif decision.tool == "search_sources" and decision.query:
+            requested = set(normalize_terms(decision.query))
+            candidates = [
+                record
+                for record in records
+                if record["tool"] == "search_sources"
+                and record.get("step_id") == decision.step_id
+            ]
+            match = next(
+                (
+                    record
+                    for record in reversed(candidates)
+                    if set(normalize_terms(record.get("query", ""))) == requested
+                ),
+                None,
+            )
+            if match is None:
+                match = next(
+                    (
+                        record
+                        for record in reversed(candidates)
+                        if _term_overlap(
+                            requested,
+                            set(normalize_terms(record.get("query", ""))),
+                        )
+                        >= 0.75
+                    ),
+                    None,
+                )
+        if match is None:
+            return None
+        result = deepcopy(match["result"])
+        result["memory_hit"] = True
+        result["memory_event_sequence"] = match["sequence"]
+        return result
 
     def usage(self) -> dict[str, int]:
         total: dict[str, int] = {}
@@ -85,21 +146,43 @@ class RunHistory:
                 total[key] = total.get(key, 0) + value
         return total
 
-    def summary(self, report: dict) -> dict:
+    def runbook(self) -> str:
         events = self.events()
-        summary = {
-            "status": report["status"],
-            "reason": report["reason"],
-            "iterations": report["cycles"],
-            "mutating_actions": report["mutating_actions"],
-            "usage": report["usage"],
-            "verified_outcomes": [
-                item["id"] for item in report["state"].get("verified_outcomes", [])
-            ],
-            "events": len(events) + 1,
+        finished = {
+            event.get("iteration"): event.get("result", {})
+            for event in events
+            if event["event"] == "action_finished"
         }
-        self.append("stop", result=summary)
-        return summary
+        lines = [
+            "#!/bin/sh",
+            "# Observed commands. Replay assumes the same initial state and source revisions.",
+            "set -u",
+        ]
+        for event in events:
+            if event["event"] == "sources_acquired":
+                for source in event["sources"]["sources"]:
+                    revision = source.get("resolved_revision") or source["content_hash"]
+                    lines.append(f"# source {source['id']}: {source['location']} @ {revision}")
+            if event["event"] != "action_started":
+                continue
+            result = finished.get(event.get("iteration"), {})
+            lines.extend(
+                [
+                    "",
+                    f"# step: {event.get('step_id') or 'unassigned'}",
+                    f"# result: {result.get('status', 'unfinished')}",
+                ]
+            )
+            if event.get("working_directory"):
+                lines.append(f"# working directory: {event['working_directory']}")
+            command = shlex.join(event["command"])
+            if event.get("stdin_input"):
+                name = event["stdin_input"]
+                command = f'printf "%s\\n" "${{{name}:?set {name}}}" | {command}'
+            lines.append(command)
+            for check in result.get("after", []):
+                lines.append(f"# verify: {shlex.join(check['command'])}")
+        return "\n".join(lines) + "\n"
 
     def _events(self):
         if not self.path.is_file():
@@ -108,3 +191,87 @@ class RunHistory:
             for line in handle:
                 if line.strip():
                     yield json.loads(line)
+
+    def _source_records(self, source_signature: str) -> list[dict]:
+        records = []
+        for event in self._events():
+            if (
+                event["event"] != "tool"
+                or event.get("tool") not in _SOURCE_TOOLS
+                or event.get("source_signature") != source_signature
+            ):
+                continue
+            result = event.get("result", {})
+            if result.get("memory_hit") or result.get("error"):
+                continue
+            if event["tool"] == "search_sources" and not result.get("hits"):
+                continue
+            if event["tool"] == "read_file" and "text" not in result:
+                continue
+            records.append(
+                {
+                    "sequence": event["sequence"],
+                    "tool": event["tool"],
+                    "result": result,
+                    **event.get("source_request", {}),
+                }
+            )
+        return records
+
+
+def _event_summary(event: dict) -> dict:
+    if event["event"] == "decision":
+        value = event.get("value", {})
+        fields = ("kind", "tool", "focus", "reason", "step_id", "source_path", "command")
+        return {"event": "decision", **{key: value[key] for key in fields if value.get(key)}}
+    if event["event"] == "action_started":
+        fields = ("tool", "command", "working_directory", "step_id", "expected_change")
+        return {"event": "action_started", **{key: event[key] for key in fields if event.get(key)}}
+    result = event.get("result", {})
+    fields = ("status", "reason", "source", "error", "repeated_result_count")
+    return {
+        "event": event["event"],
+        **({"tool": event["tool"]} if event.get("tool") else {}),
+        **{key: result[key] for key in fields if result.get(key) is not None},
+    }
+
+
+def _term_overlap(left: set[str], right: set[str]) -> float:
+    if not left or not right:
+        return 0.0
+    return len(left & right) / min(len(left), len(right))
+
+
+def _source_summary(record: dict) -> dict:
+    result = record["result"]
+    if record["tool"] == "read_file":
+        evidence = {
+            key: result[key]
+            for key in ("source", "start_line", "end_line", "complete")
+            if key in result
+        }
+        evidence["text"] = _clip(result["text"], 3000)
+    else:
+        evidence = {
+            "hits": [
+                {
+                    key: _clip(hit[key], 1200) if key == "text" else hit[key]
+                    for key in ("source", "start_line", "end_line", "text")
+                    if key in hit
+                }
+                for hit in result["hits"][:3]
+            ]
+        }
+    return {
+        "tool": record["tool"],
+        "intent": record.get("query") or record.get("focus"),
+        "source_path": record.get("source_path"),
+        "evidence": evidence,
+    }
+
+
+def _clip(value: str, limit: int) -> str:
+    if len(value) <= limit:
+        return value
+    half = limit // 2
+    return f"{value[:half]}\n[... omitted ...]\n{value[-half:]}"
