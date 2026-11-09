@@ -113,6 +113,9 @@ def test_source_tools_search_build_file_and_read_unfamiliar_safe_text(tmp_path: 
     assert read("instructions.custom")["text"] == "Run make start."
     inventory = tools.call(SimpleNamespace(tool="inventory_sources"))
     assert "instructions.custom" in inventory["tree"]
+    assert tools.existing_refs(["fixture:Makefile (defines the start target)"]) == {
+        "fixture:Makefile"
+    }
     assert tools.grounds(
         SimpleNamespace(
             command=["make", "start"],

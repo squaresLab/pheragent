@@ -63,6 +63,7 @@ Use ACT for one tool call: source tools for evidence, observe for read-only stat
 for one state change. Execute decisions need one argv command, an exact working directory,
 inventoried evidence, the expected change, and source-defined read-only validation. A zero
 exit code does not prove success. Do not retry without new evidence, input, or repaired state.
+Use source-id:relative/directory for source working directories. Do not use an absolute host path.
 
 Use WAITING_FOR_INPUT only for atomic external values. Give each a stable name, short prompt,
 and sensitivity. Reference installer stdin by name. Render source templates from separate
@@ -258,15 +259,18 @@ class _ToolRouter:
             except (OSError, ValueError) as exc:
                 return {"error": str(exc)}
         if decision.tool == "execute":
-            return execute_action(
-                decision,
-                self.task,
-                self.sources,
-                self.workspace,
-                enabled=self.enabled,
-                approve=self.approve,
-                **execution_options,
-            )
+            try:
+                return execute_action(
+                    decision,
+                    self.task,
+                    self.sources,
+                    self.workspace,
+                    enabled=self.enabled,
+                    approve=self.approve,
+                    **execution_options,
+                )
+            except (OSError, ValueError) as exc:
+                return {"status": "needs_revision", "reason": str(exc)}
         return {"error": "ACT needs a known tool"}
 
 

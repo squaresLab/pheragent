@@ -260,7 +260,8 @@ class SourceTools:
             path
             for path in self.readable_paths
             if any(
-                ref == path or ref.startswith((path + ":", path + " —", path + " lines "))
+                ref == path
+                or ref.startswith((path + ":", path + " —", path + " lines ", path + " ("))
                 for ref in references
             )
         }

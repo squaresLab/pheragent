@@ -210,6 +210,41 @@ def test_failed_action_reaches_next_decision(tmp_path: Path) -> None:
     assert calls[1]["execution"]["exit_code"] == 1
 
 
+def test_invalid_action_directory_becomes_latest_feedback(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "install.sh").write_text("#!/bin/sh\ntouch ready\n")
+    task = tmp_path / "task.yaml"
+    output = tmp_path / "invalid-directory"
+    _task(task, source, output)
+    calls = 0
+
+    def decide(_state, _observation, latest_feedback, _sources, _cycle):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return _decision(
+                "ACT",
+                "execute",
+                command=["./install.sh"],
+                working_directory=str(source),
+                evidence=["repository-1:install.sh"],
+                expected_change="ready file exists",
+                validation=[{"command": ["test", "-f", "ready"]}],
+            ), {}
+        assert latest_feedback == {
+            "status": "needs_revision",
+            "reason": "working_directory must be source-id:relative/directory",
+            "repeated_action_count": 0,
+            "step_id": None,
+        }
+        return _decision("BLOCKED", reason="revise the working directory"), {}
+
+    report = run_deployment_agent(task, output, execute=True, approve=True, decide=decide)
+
+    assert report["status"] == "BLOCKED"
+
+
 def test_three_incomplete_actions_stop_the_agent(tmp_path: Path) -> None:
     source = tmp_path / "source"
     source.mkdir()
