@@ -141,6 +141,11 @@ def _source_tree(paths: set[str]) -> dict:
 class SourceTools:
     def __init__(self, sources: tuple[AcquiredSource, ...]):
         self.sources = {source.id: source for source in sources}
+        versions = "\n".join(
+            f"{source.id}:{source.manifest.content_hash}"
+            for source in sorted(sources, key=lambda item: item.id)
+        )
+        self.signature = hashlib.sha256(versions.encode()).hexdigest()
         inventory = RepositoryInventoryBuilder().build(sources)
         self.entries = [entry for entry in inventory.entries if entry.selected]
         documents = []

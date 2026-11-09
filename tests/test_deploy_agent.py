@@ -269,6 +269,7 @@ def test_route_choice_and_repeated_read_reach_next_decision(tmp_path: Path) -> N
         "evidence": ["repository-1:README.md"],
     }
     assert seen[2][1]["text"] == seen[1][1]["text"]
+    assert seen[2][1]["memory_hit"] is True
     assert seen[2][1]["repeated_action_count"] == 1
 
 

@@ -72,6 +72,8 @@ content. Use ASK_HUMAN only for two or three equally supported routes.
 Use overview_change only when evidence changes high-level outcomes. Set completes_step only
 when observation or validation proves the success condition, then return DONE for that step.
 Give a concise reason and do not output private chain-of-thought.
+Source memory contains previously retrieved evidence relevant to the active step. Reuse it before
+searching or reading again. Repeat a source request only when the memory lacks a required detail.
 """
 
 _TERMINAL_STATUSES = {
@@ -134,6 +136,14 @@ def request_decision(
             history.context(
                 window=task.context.history_window,
                 step_id=(state.get("active_step") or {}).get("id"),
+            )
+        ),
+        "source_memory": (
+            []
+            if "source" in last_result or "hits" in last_result
+            else history.source_context(
+                step=state.get("active_step"),
+                source_signature=sources.signature,
             )
         ),
         "last_tool_result": compact_context(last_result),
@@ -210,6 +220,7 @@ class _ToolRouter:
         self,
         task: DeploymentTask,
         sources: SourceTools,
+        history: RunHistory,
         workspace: Path,
         *,
         enabled: bool,
@@ -217,6 +228,7 @@ class _ToolRouter:
     ):
         self.task = task
         self.sources = sources
+        self.history = history
         self.workspace = workspace
         self.enabled = enabled
         self.approve = approve
@@ -229,6 +241,12 @@ class _ToolRouter:
             "list_directory",
         }:
             try:
+                cached = self.history.recall_source(
+                    decision,
+                    source_signature=self.sources.signature,
+                )
+                if cached is not None:
+                    return cached
                 return self.sources.call(decision)
             except (OSError, ValueError) as exc:
                 return {"error": str(exc)}
@@ -311,6 +329,7 @@ def run_deployment_agent(
     tools = _ToolRouter(
         task,
         sources,
+        history,
         output / "workspace",
         enabled=execute,
         approve=approve,
@@ -746,7 +765,30 @@ def run_deployment_agent(
                 if decision.tool == "execute" and "execution" in last_result
                 else "tool"
             )
-            history.append(event, iteration=cycle, tool=decision.tool, result=last_result)
+            history.append(
+                event,
+                iteration=cycle,
+                tool=decision.tool,
+                result=last_result,
+                **(
+                    {
+                        "source_signature": sources.signature,
+                        "source_request": {
+                            key: getattr(decision, key)
+                            for key in (
+                                "step_id",
+                                "focus",
+                                "query",
+                                "source_path",
+                                "start_line",
+                                "end_line",
+                            )
+                        },
+                    }
+                    if decision.tool in {"read_file", "search_sources"}
+                    else {}
+                ),
+            )
             if decision.tool == "execute" or step_completed or stalled or status == "BLOCKED":
                 if _run_finished(status, reason):
                     break

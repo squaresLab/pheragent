@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 from pheragent.deployment.history import RunHistory
 
@@ -58,6 +59,50 @@ def test_history_returns_only_relevant_step_events(tmp_path: Path) -> None:
     assert context[1]["source"] == "repository-1:README.md"
     assert context[2]["focus"] == "check runtime"
     assert all("text" not in event for event in context)
+
+
+def test_history_reuses_current_step_source_evidence(tmp_path: Path) -> None:
+    history = RunHistory(tmp_path)
+    history.append(
+        "tool",
+        iteration=1,
+        tool="search_sources",
+        source_signature="current",
+        source_request={
+            "step_id": "database",
+            "focus": "find the PostgreSQL installer",
+            "query": "postgres install helm",
+        },
+        result={
+            "hits": [
+                {
+                    "source": "repository-1:postgres/install.sh",
+                    "start_line": 1,
+                    "end_line": 20,
+                    "text": "helm install postgres",
+                }
+            ]
+        },
+    )
+
+    context = history.source_context(
+        step={"id": "database"}, source_signature="current"
+    )
+    recalled = history.recall_source(
+        SimpleNamespace(
+            tool="search_sources",
+            step_id="database",
+            query="helm postgres install",
+        ),
+        source_signature="current",
+    )
+
+    assert context[0]["evidence"]["hits"][0]["text"] == "helm install postgres"
+    assert recalled["memory_hit"] is True
+    assert recalled["hits"] == context[0]["evidence"]["hits"]
+    assert history.source_context(
+        step={"id": "database"}, source_signature="changed"
+    ) == []
 
 
 def test_history_renders_an_observed_runbook(tmp_path: Path) -> None:

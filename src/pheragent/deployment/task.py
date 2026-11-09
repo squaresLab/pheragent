@@ -49,7 +49,6 @@ class Budgets(StrictModel):
 
 
 class ContextSettings(StrictModel):
-    mode: Literal["recent", "memory"] = "memory"
     history_window: int = Field(default=8, gt=0, le=50)
 
 
