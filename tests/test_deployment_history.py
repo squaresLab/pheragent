@@ -61,7 +61,7 @@ def test_history_returns_only_relevant_step_events(tmp_path: Path) -> None:
     assert all("text" not in event for event in context)
 
 
-def test_history_reuses_current_step_source_evidence(tmp_path: Path) -> None:
+def test_history_recalls_current_step_source_search(tmp_path: Path) -> None:
     history = RunHistory(tmp_path)
     history.append(
         "tool",
@@ -85,9 +85,6 @@ def test_history_reuses_current_step_source_evidence(tmp_path: Path) -> None:
         },
     )
 
-    context = history.source_context(
-        step={"id": "database"}, source_signature="current"
-    )
     recalled = history.recall_source(
         SimpleNamespace(
             tool="search_sources",
@@ -97,12 +94,19 @@ def test_history_reuses_current_step_source_evidence(tmp_path: Path) -> None:
         source_signature="current",
     )
 
-    assert context[0]["evidence"]["hits"][0]["text"] == "helm install postgres"
     assert recalled["memory_hit"] is True
-    assert recalled["hits"] == context[0]["evidence"]["hits"]
-    assert history.source_context(
-        step={"id": "database"}, source_signature="changed"
-    ) == []
+    assert recalled["hits"][0]["text"] == "helm install postgres"
+    assert (
+        history.recall_source(
+            SimpleNamespace(
+                tool="search_sources",
+                step_id="database",
+                query="helm postgres install",
+            ),
+            source_signature="changed",
+        )
+        is None
+    )
 
 
 def test_history_renders_an_observed_runbook(tmp_path: Path) -> None:

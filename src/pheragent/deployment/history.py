@@ -70,23 +70,6 @@ class RunHistory:
             context.append(_event_summary(event))
         return context[-window:]
 
-    def source_context(
-        self,
-        *,
-        step: dict | None,
-        source_signature: str,
-        limit: int = 2,
-    ) -> list[dict]:
-        """Return source evidence most relevant to the active overview step."""
-        if not step:
-            return []
-        records = [
-            record
-            for record in self._source_records(source_signature)
-            if record.get("step_id") == step.get("id")
-        ]
-        return [_source_summary(record) for record in records[-limit:]]
-
     def recall_source(self, decision, *, source_signature: str) -> dict | None:
         """Reuse a prior source result when the source set and request still match."""
         records = self._source_records(source_signature)
@@ -108,8 +91,7 @@ class RunHistory:
             candidates = [
                 record
                 for record in records
-                if record["tool"] == "search_sources"
-                and record.get("step_id") == decision.step_id
+                if record["tool"] == "search_sources" and record.get("step_id") == decision.step_id
             ]
             match = next(
                 (
@@ -240,38 +222,3 @@ def _term_overlap(left: set[str], right: set[str]) -> float:
     if not left or not right:
         return 0.0
     return len(left & right) / min(len(left), len(right))
-
-
-def _source_summary(record: dict) -> dict:
-    result = record["result"]
-    if record["tool"] == "read_file":
-        evidence = {
-            key: result[key]
-            for key in ("source", "start_line", "end_line", "complete")
-            if key in result
-        }
-        evidence["text"] = _clip(result["text"], 3000)
-    else:
-        evidence = {
-            "hits": [
-                {
-                    key: _clip(hit[key], 1200) if key == "text" else hit[key]
-                    for key in ("source", "start_line", "end_line", "text")
-                    if key in hit
-                }
-                for hit in result["hits"][:3]
-            ]
-        }
-    return {
-        "tool": record["tool"],
-        "intent": record.get("query") or record.get("focus"),
-        "source_path": record.get("source_path"),
-        "evidence": evidence,
-    }
-
-
-def _clip(value: str, limit: int) -> str:
-    if len(value) <= limit:
-        return value
-    half = limit // 2
-    return f"{value[:half]}\n[... omitted ...]\n{value[-half:]}"

@@ -72,8 +72,7 @@ content. Use ASK_HUMAN only for two or three equally supported routes.
 Use overview_change only when evidence changes high-level outcomes. Set completes_step only
 when observation or validation proves the success condition, then return DONE for that step.
 Give a concise reason and do not output private chain-of-thought.
-Source memory contains previously retrieved evidence relevant to the active step. Reuse it before
-searching or reading again. Repeat a source request only when the memory lacks a required detail.
+Source requests use memory before source retrieval. Reuse returned evidence before another request.
 """
 
 _TERMINAL_STATUSES = {
@@ -136,14 +135,6 @@ def request_decision(
             history.context(
                 window=task.context.history_window,
                 step_id=(state.get("active_step") or {}).get("id"),
-            )
-        ),
-        "source_memory": (
-            []
-            if "source" in last_result or "hits" in last_result
-            else history.source_context(
-                step=state.get("active_step"),
-                source_signature=sources.signature,
             )
         ),
         "last_tool_result": compact_context(last_result),
