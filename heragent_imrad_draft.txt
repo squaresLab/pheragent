@@ -1,0 +1,170 @@
+HerAgent Deploy: AI assisted deployment of complex open source public systems
+
+Research paper draft in IMRaD format
+
+Status
+
+The paper reports early system development and preliminary experiments. The results do not yet establish general performance across systems.
+
+Abstract
+
+Deploying a large open source system often requires information from repositories, documentation, scripts, and a live target environment. The information can be incomplete, inconsistent, or divided across several deployment routes. Existing software agents usually receive a bounded coding task or a specified deployment target. HerAgent Deploy studies a broader problem. The agent must find deployment evidence, select a supported route, inspect current state, execute commands, validate changes, and recover from failures. A human reviews high risk actions and supplies information that the agent cannot infer safely. HerAgent records each observation, decision, action, and result in an append only event log. HerAgent Bench will use functional checks and trajectory records to measure deployment success, safety, cost, and human effort. A preliminary MOSIP experiment reconciled and verified 33 components on a partly prepared Kubernetes cluster. The run deferred eight components or integrations with explicit reasons and human actions. The run also used 7.18 million tokens and stopped at its decision budget. The result shows useful deployment progress and a major efficiency problem. The proposed study will compare agent designs, model sizes, retrieval methods, memory methods, and verification methods across several open source public systems.
+
+Keywords
+
+AI agents, software deployment, DevOps, human AI collaboration, trajectory verification, digital public goods, open source software
+
+1. Introduction
+
+Large open source public systems support identity, finance, health, and other government services. Deployment can require dozens of services, several repositories, external integrations, and changes to live infrastructure. Documentation often describes more than one route and assumes knowledge that is not written in one place.
+
+The deployment problem differs from a bounded software repair task. A deployment agent must determine the desired state before it can close the gap from current state. The agent must also preserve data, respect system boundaries, request secrets safely, and validate the deployed service.
+
+Recent research provides important parts of the solution. ReAct interleaves reasoning and actions in an external environment [1]. SWE-agent shows that the computer interface can strongly affect agent performance [2]. OpenHands provides a general event stream, runtime, and human interface for software agents [3].
+
+Recent benchmarks also move beyond code generation. CSR-Bench and DeployBench evaluate the setup of research repositories [4, 5]. DevOps-Gym evaluates build, monitoring, issue resolution, and test tasks [6]. AgentBench and tau-bench evaluate decisions, tool use, policy use, and user interaction [7, 8].
+
+The existing work does not fully address deployment from fragmented evidence into a changing, partly configured target. Existing work also gives limited attention to resumable deployment, infrastructure boundaries, secret input, and component level verification. HerAgent studies the combination of these requirements.
+
+HerAgent has three planned outputs. HerAgent Deploy is the deployment agent. HerAgent Bench is the AWS benchmark and evaluation system. HerAgent App is the operator interface for approvals, inputs, policies, and live progress.
+
+The study asks four research questions.
+
+1. Can an agent reconstruct enough deployment knowledge to deploy a complex system from repositories, documentation, and live state?
+2. Which retrieval and memory methods improve deployment success without excessive token use?
+3. Which verification methods reduce unsafe actions, false completion, and unnecessary human review?
+4. Which agent and harness improvements transfer across open source public systems?
+
+2. Methods
+
+2.1 System design
+
+HerAgent Deploy uses one persistent observe, decide, act, and validate loop. The agent first acquires and records its sources. The agent then creates a high level deployment overview from entry documents and related files.
+
+For each active step, the harness supplies the task, overview, live state, recent events, and relevant source evidence. The model proposes one tool call or one deployment action. The harness executes the action only when policy permits it.
+
+After execution, HerAgent runs a source supported validation command. The harness records the result in events.jsonl. The event log is the source of truth for resume, evaluation, and runbook generation.
+
+The current prototype includes source inventory, lexical retrieval, full file reading, shell and Kubernetes observations, action validation, structured human input, approval prompts, and OpenTelemetry traces. The prototype can resume an earlier run and retain its source revisions.
+
+2.2 Human collaboration and safety
+
+HerAgent permits routine observations and local deployment work. The harness requests approval when an action crosses a declared boundary. Boundaries include destructive operations, host changes, cloud changes, target changes, namespace changes, and secret exposure.
+
+The approval request shows the command, reason, expected change, and validation. HerAgent App will present the same information in a browser. The app will request one clear input at a time.
+
+Sensitive values will use references to AWS Secrets Manager or protected environment variables. HerAgent will redact sensitive values from prompts, events, and traces. The study will not treat hidden model reasoning as an observable research record.
+
+2.3 HerAgent Bench
+
+HerAgent Bench will start each task from a declared AWS state. A task will provide source locations, a target account or cluster, policy limits, and hidden functional checks. The task will not provide a complete deployment plan.
+
+The benchmark will include MOSIP and at least two additional open source public systems. Selection criteria will include public source code, documented deployment routes, multiple components, and objective health checks. Each case will record its initial infrastructure and external dependencies.
+
+The benchmark will compare these conditions:
+
+1. A broad permission condition that lets the model make routine local changes.
+2. A progressive condition that uses a high level overview and one verified step at a time.
+3. Retrieval and memory ablations that remove one context source at a time.
+4. Model conditions that compare a frontier model with smaller and cheaper models.
+
+Compact cases will use at least five runs per condition. Full system cases will use at least three runs when cost permits. All paired runs will start from equivalent AWS snapshots.
+
+2.4 Measures
+
+The main outcome is functional deployment success. Hidden checks will test required workloads, health endpoints, dependencies, and selected user functions. A running pod alone will not prove success.
+
+Secondary measures will include:
+
+1. The number and fraction of discovered components that pass functional checks.
+2. Recovery success after a failed action and the number of attempts before recovery.
+3. Human approvals, human input time, unsafe proposals, and denied actions.
+4. Tokens, model cost, AWS cost, elapsed time, repeated actions, and source rereads.
+
+HerAgent Bench will report binary deployment status for each component. A component that fails installation, configuration, networking, or a functional check remains not deployed. The report will retain the exact reason without adding many status categories.
+
+2.5 Trajectory verification
+
+Each trajectory contains the ordered observations, decisions, actions, validations, and human inputs. The evaluator will first use deterministic checks for command results, target state, policy compliance, and functional outcomes.
+
+A language model judge will assess semantic claims that deterministic checks cannot resolve. Examples include whether evidence supports a selected route and whether an action addresses the active failure. The judge will not override a deterministic contradiction.
+
+Researchers will label a sample of trajectories and compare the labels with judge outputs. The comparison will measure precision, recall, agreement, and failure explanations. PaperBench uses a related method and also evaluates its judge [9].
+
+2.6 Analysis
+
+The analysis will compare success rates with confidence intervals. Paired cases will compare component coverage, cost, time, and human effort from the same initial state. Failure analysis will group repeated patterns from event records after independent review.
+
+The study will publish task definitions, redacted trajectories, evaluation code, and summary data when licenses and security rules permit publication. Secret values and private infrastructure identifiers will not enter the released data.
+
+3. Preliminary results
+
+3.1 Progressive experiments
+
+Early progressive experiments showed that the agent could discover missing infrastructure and continue after validation. One MOSIP experiment found the documented Longhorn route, installed storage prerequisites, and installed Longhorn after human approval.
+
+Later experiments initialized PostgreSQL, installed Keycloak, and requested an IAM hostname. The agent also recovered from partial namespace state. The experiments exposed failures in retrieval, policy handling, interactive scripts, and state retention.
+
+Repeated source reads caused high token use. Strict policies also rejected safe alternatives after a command failed. Interactive scripts waited for input that the execution tool could not supply at that time.
+
+3.2 Broad permission MOSIP experiment
+
+A later experiment gave the model more freedom for routine local work. The harness retained approval for high risk actions and enforced Kubernetes target boundaries. The run resumed several times on one partly prepared cluster.
+
+The final report recorded 33 verified component outcomes. Verified outcomes included Kafka, ActiveMQ, Keycloak, PostgreSQL, Config Server, Kernel, Registration Processor, and ID Authentication. The agent also verified several MOSIP applications and mock external services.
+
+The run deferred eight components or integrations. Each deferred item included a reason and a human action. Examples included public DNS and TLS, Google reCAPTCHA, Resident identity configuration, and Registration Client signing material.
+
+The run ended because its decision budget was exhausted. The final record contained 771 model requests and 7,175,146 tokens. The harness recorded 306 mutating action attempts across 720 cycles.
+
+The result is not a clean deployment success rate. Some infrastructure and services existed before the run. The run also used one model and one evolving cluster, without matched repetitions.
+
+3.3 Observed failure modes
+
+The experiments produced four recurring failure modes. First, the agent reread files and repeated similar searches. Second, policy checks sometimes blocked safe recovery commands. Third, missing external values stopped otherwise independent work. Fourth, budget exhaustion prevented a complete final report.
+
+The event log also exposed implementation failures in the harness. For example, a read only command could trigger an unbounded source tree copy. A regression test now covers the corrected working directory path.
+
+4. Discussion
+
+The preliminary evidence supports further study of deployment agents. The MOSIP run shows that a model can make sustained progress across many components. The agent also deferred unsupported integrations instead of inventing credentials.
+
+The same run shows that model capability alone is insufficient. Token use, repeated retrieval, completion rules, command interfaces, and policy design strongly affect the result. A restrictive harness can prevent recovery, while a permissive harness can increase risk.
+
+HerAgent will study the boundary between model freedom and deterministic control. Routine local actions should proceed without repeated approval. Destructive actions and boundary changes should remain explicit human decisions.
+
+Trajectory verification can reduce human review if it identifies failed or unsafe segments accurately. Deterministic functional checks remain the primary evidence of deployment. Language model judgments will support explanation and semantic review, not replace direct checks.
+
+The study has important limitations. The current evidence comes mainly from MOSIP and a small number of local systems. The latest MOSIP run used a partly prepared cluster and a frontier model. The study has not yet measured transfer to other public systems.
+
+Future experiments will use clean snapshots, repeated conditions, and sealed task definitions. The experiments will compare model sizes and harness designs. The resulting data will show whether progress comes from the model, the harness, or their interaction.
+
+5. Conclusion
+
+HerAgent addresses deployment when the desired state is dispersed across source files, documentation, and live infrastructure. The project combines progressive execution, human review, functional validation, and trajectory evaluation.
+
+The preliminary MOSIP result shows broad component coverage and high operating cost. The proposed study will test whether better context, memory, verification, and interfaces can preserve progress at lower cost.
+
+References
+
+[1] Yao, S., Zhao, J., Yu, D., et al. ReAct: Synergizing Reasoning and Acting in Language Models. ICLR, 2023. https://arxiv.org/abs/2210.03629
+
+[2] Yang, J., Jimenez, C. E., Wettig, A., et al. SWE-agent: Agent-Computer Interfaces Enable Automated Software Engineering. NeurIPS, 2024. https://proceedings.nips.cc/paper_files/paper/2024/hash/5a7c947568c1b1328ccc5230172e1e7c-Abstract-Conference.html
+
+[3] Wang, X., Li, B., Song, Y., et al. OpenHands: An Open Platform for AI Software Developers as Generalist Agents. 2024. https://arxiv.org/abs/2407.16741
+
+[4] Xiao, Y., Wang, R., Kong, L., Golac, D., and Wang, W. CSR-Bench: Benchmarking LLM Agents in Deployment of Computer Science Research Repositories. NAACL, 2025. https://aclanthology.org/2025.naacl-long.633/
+
+[5] Wang, Y., Qian, Y., Zhang, Y., et al. DeployBench: Benchmarking LLM Agents for Research Artifact Deployment. 2026. https://arxiv.org/abs/2606.05238
+
+[6] Tang, Y., Zhu, K., Ruan, B., et al. DevOps-Gym: Benchmarking AI Agents in Software DevOps Cycle. ICLR, 2026. https://arxiv.org/abs/2601.20882
+
+[7] Liu, X., Yu, H., Zhang, H., et al. AgentBench: Evaluating LLMs as Agents. ICLR, 2024. https://proceedings.iclr.cc/paper_files/paper/2024/hash/e9df36b21ff4ee211a8b71ee8b7e9f57-Abstract-Conference.html
+
+[8] Yao, S., Shinn, N., Razavi, P., and Narasimhan, K. tau-bench: A Benchmark for Tool-Agent-User Interaction in Real-World Domains. ICLR, 2025. https://arxiv.org/abs/2406.12045
+
+[9] Starace, G., Jaffe, O., Sherburn, D., et al. PaperBench: Evaluating AI's Ability to Replicate AI Research. 2025. https://openai.com/index/paperbench/
+
+Writing status
+
+The document is an STE-style draft. The full ASD-STE100 dictionary and project term register were not available for complete vocabulary verification.

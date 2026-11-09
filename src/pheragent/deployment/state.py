@@ -39,3 +39,17 @@ def record_verified_outcome(state: dict, decision: Decision, result: dict) -> No
         {"id": name, "validation": checks, "evidence": decision.evidence}
     )
     result["new_outcome"] = name
+
+
+def record_step_result(
+    state: dict,
+    step,
+    *,
+    deployed: bool,
+    reason: str | None = None,
+) -> None:
+    for component in step.components or [step.id]:
+        result = {"deployed": deployed}
+        if reason:
+            result["reason"] = reason
+        state["components"][component] = result

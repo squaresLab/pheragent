@@ -1,0 +1,98 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="900" viewBox="0 0 1600 900" role="img" aria-labelledby="title desc">
+  <title id="title">Progressive deployment: successful trajectories</title>
+  <desc id="desc">Three concise trajectories showing HerAgent repairing PostgreSQL installation, initializing the database with human approval, and cleaning up a partial IAM installation.</desc>
+  <defs>
+    <style>
+      .title{font:700 39px Inter,Arial,sans-serif;fill:#111827}.subtitle{font:19px Inter,Arial,sans-serif;fill:#475569}
+      .panel-title{font:700 26px Inter,Arial,sans-serif;fill:#111827}.task{font:700 18px Inter,Arial,sans-serif;fill:#111827}
+      .label{font:700 17px Inter,Arial,sans-serif;fill:#1e3a8a}.body{font:17px Inter,Arial,sans-serif;fill:#1f2937}
+      .mono{font:16px "DejaVu Sans Mono",Consolas,monospace;fill:#111827}.output{font:16px "DejaVu Sans Mono",Consolas,monospace;fill:#7c2d12}
+      .result{font:700 19px Inter,Arial,sans-serif;fill:#166534}.footer{font:15px Inter,Arial,sans-serif;fill:#64748b}
+    </style>
+  </defs>
+  <rect width="1600" height="900" fill="#ffffff"/>
+  <text class="title" x="56" y="58">Progressive deployment: successful trajectories</text>
+
+  <!-- Panel 1 -->
+  <rect x="42" y="125" width="485" height="690" rx="18" fill="#f0fdf4" stroke="#86efac" stroke-width="2"/>
+  <text class="panel-title" x="66" y="164">① Repair a missing prerequisite</text>
+  <rect x="66" y="187" width="437" height="58" rx="10" fill="#bbf7d0"/>
+  <text class="task" x="84" y="213">Task</text><text class="body" x="134" y="213">Deploy PostgreSQL on the existing cluster.</text>
+  <text class="body" x="84" y="235">Storage was ready; the PostgreSQL release was absent.</text>
+
+  <rect x="66" y="268" width="437" height="82" rx="10" fill="#eff6ff" stroke="#3b82f6" stroke-width="2"/>
+  <text class="label" x="84" y="294">Reason → Act</text>
+  <text class="body" x="84" y="319">Use the repository’s supported installer.</text>
+  <text class="mono" x="84" y="340">$ ./install.sh</text>
+
+  <rect x="96" y="370" width="407" height="68" rx="9" fill="#fff7ed" stroke="#f97316" stroke-width="2"/>
+  <text class="output" x="114" y="399">INSTALLATION FAILED:</text>
+  <text class="output" x="114" y="423">repo bitnami not found</text>
+
+  <rect x="66" y="458" width="437" height="115" rx="10" fill="#eff6ff" stroke="#3b82f6" stroke-width="2"/>
+  <text class="label" x="84" y="484">Reason → Repair → Retry</text>
+  <text class="body" x="84" y="509">The failure identified one local missing dependency.</text>
+  <text class="mono" x="84" y="534">$ helm repo add bitnami …</text>
+  <text class="mono" x="84" y="558">$ ./install.sh</text>
+
+  <rect x="96" y="594" width="407" height="94" rx="9" fill="#ecfdf5" stroke="#22c55e" stroke-width="2"/>
+  <text class="mono" x="114" y="624" fill="#166534">postgres-postgresql-0</text>
+  <text class="mono" x="114" y="649" fill="#166534">2/2   Running</text>
+  <text class="result" x="114" y="677">✓ PostgreSQL verified</text>
+
+  <text class="body" x="66" y="736">Outcome: the agent recovered from the first error</text>
+  <text class="body" x="66" y="760">and proved the new workload was running.</text>
+
+  <!-- Panel 2 -->
+  <rect x="557" y="125" width="485" height="690" rx="18" fill="#f0fdf4" stroke="#86efac" stroke-width="2"/>
+  <text class="panel-title" x="581" y="164">② Approve a high-risk action</text>
+  <rect x="581" y="187" width="437" height="58" rx="10" fill="#bbf7d0"/>
+  <text class="task" x="599" y="213">Task</text><text class="body" x="649" y="213">Initialize the MOSIP PostgreSQL databases.</text>
+  <text class="body" x="599" y="235">PostgreSQL existed; <tspan font-family="monospace">postgres-init</tspan> did not.</text>
+
+  <rect x="581" y="268" width="437" height="104" rx="10" fill="#eff6ff" stroke="#3b82f6" stroke-width="2"/>
+  <text class="label" x="599" y="294">Reason → Ask human</text>
+  <text class="body" x="599" y="319">The documented initializer may destroy existing data.</text>
+  <text class="body" x="599" y="344">The agent requested explicit high-risk approval.</text>
+  <text class="mono" x="599" y="365">Choice: approve destructive initialization</text>
+
+  <rect x="581" y="394" width="437" height="100" rx="10" fill="#eff6ff" stroke="#3b82f6" stroke-width="2"/>
+  <text class="label" x="599" y="420">Act</text>
+  <text class="mono" x="599" y="447">$ helm install postgres-init …</text>
+  <text class="mono" x="599" y="473">  --wait --wait-for-jobs</text>
+
+  <rect x="611" y="518" width="407" height="142" rx="9" fill="#ecfdf5" stroke="#22c55e" stroke-width="2"/>
+  <text class="mono" x="629" y="548" fill="#166534">NAME: postgres-init</text>
+  <text class="mono" x="629" y="574" fill="#166534">NAMESPACE: postgres</text>
+  <text class="mono" x="629" y="600" fill="#166534">STATUS: deployed</text>
+  <text class="mono" x="629" y="626" fill="#166534">REVISION: 1</text>
+  <text class="result" x="629" y="651">✓ Database initialization verified</text>
+
+  <text class="body" x="581" y="736">Outcome: policy did not silently permit risk;</text>
+  <text class="body" x="581" y="760">the human approved it and validation closed the step.</text>
+
+  <!-- Panel 3 -->
+  <rect x="1072" y="125" width="485" height="690" rx="18" fill="#f0fdf4" stroke="#86efac" stroke-width="2"/>
+  <text class="panel-title" x="1096" y="164">③ Recover a partial installation</text>
+  <rect x="1096" y="187" width="437" height="58" rx="10" fill="#bbf7d0"/>
+  <text class="task" x="1114" y="213">Task</text><text class="body" x="1164" y="213">Prepare IAM/Keycloak for a clean retry.</text>
+  <text class="body" x="1114" y="235">The interactive installer timed out halfway through.</text>
+
+  <rect x="1096" y="268" width="437" height="104" rx="10" fill="#eff6ff" stroke="#3b82f6" stroke-width="2"/>
+  <text class="label" x="1114" y="294">Observe → Reason</text>
+  <text class="body" x="1114" y="319">Only generated ConfigMaps and the default</text>
+  <text class="body" x="1114" y="344">ServiceAccount remained in <tspan font-family="monospace">keycloak</tspan>.</text>
+  <text class="body" x="1114" y="365">A rerun would fail while that namespace existed.</text>
+
+  <rect x="1096" y="394" width="437" height="100" rx="10" fill="#eff6ff" stroke="#3b82f6" stroke-width="2"/>
+  <text class="label" x="1114" y="420">Ask human → Act</text>
+  <text class="body" x="1114" y="445">Human approved deletion of the partial state.</text>
+  <text class="mono" x="1114" y="473">$ kubectl delete namespace keycloak --wait</text>
+
+  <rect x="1126" y="518" width="407" height="110" rx="9" fill="#ecfdf5" stroke="#22c55e" stroke-width="2"/>
+  <text class="mono" x="1144" y="558" fill="#166534">namespace "keycloak" deleted</text>
+  <text class="result" x="1144" y="596">✓ Partial state removed</text>
+
+  <text class="body" x="1096" y="703">Outcome: the agent inspected the failed state,</text>
+  <text class="body" x="1096" y="727">requested approval, and validated cleanup.</text>
+</svg>

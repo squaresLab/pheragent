@@ -382,7 +382,7 @@ def inspect_target(
             accepted = input().strip().casefold() == confirmation
         if not accepted:
             return {"status": "blocked", "reason": policy}
-    cwd = sources.working_directory(decision, workspace) if decision.working_directory else None
+    cwd = sources.source_directory(decision) if decision.working_directory else None
     return _command(target_command(decision.command, task), task, cwd=cwd)
 
 

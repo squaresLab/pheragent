@@ -1,0 +1,80 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="900" viewBox="0 0 1600 900" role="img" aria-labelledby="title desc">
+  <title id="title">Full-plan execution compared with progressive deployment</title>
+  <desc id="desc">A side-by-side comparison of an older full-plan MOSIP run that cascaded into skipped steps and a progressive run that repaired the same missing repository and validated PostgreSQL.</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10z" fill="#64748b"/></marker>
+    <style>
+      .title { font: 700 36px Inter, Arial, sans-serif; fill:#0f172a; }
+      .subtitle { font: 18px Inter, Arial, sans-serif; fill:#475569; }
+      .head { font:700 25px Inter, Arial, sans-serif; fill:#0f172a; }
+      .step { font:700 18px Inter, Arial, sans-serif; fill:#0f172a; }
+      .body { font:17px Inter, Arial, sans-serif; fill:#1e293b; }
+      .mono { font:16px "DejaVu Sans Mono", Consolas, monospace; fill:#0f172a; }
+      .metric { font:700 28px Inter, Arial, sans-serif; }
+      .small { font:14px Inter, Arial, sans-serif; fill:#64748b; }
+    </style>
+  </defs>
+  <rect width="1600" height="900" fill="#f8fafc"/>
+  <text class="title" x="70" y="62">The same failure produced two very different outcomes</text>
+  <text class="subtitle" x="70" y="94">MOSIP AWS experiments · September 2026</text>
+
+  <!-- Left lane -->
+  <rect x="55" y="125" width="720" height="675" rx="18" fill="#ffffff" stroke="#dc2626" stroke-width="3"/>
+  <rect x="55" y="125" width="720" height="68" rx="18" fill="#fee2e2"/>
+  <path d="M55 170 h720 v23 h-720z" fill="#fee2e2"/>
+  <text class="head" x="85" y="168">Full plan first</text>
+  <text class="body" x="85" y="218">A fixed dependency chain was compiled before execution.</text>
+
+  <rect x="90" y="250" width="650" height="82" rx="12" fill="#f8fafc" stroke="#cbd5e1"/>
+  <text class="step" x="112" y="280">Act 1 · Run PostgreSQL installer</text>
+  <text class="mono" x="112" y="309">./install.sh</text>
+  <line x1="415" y1="332" x2="415" y2="361" stroke="#64748b" stroke-width="3" marker-end="url(#arrow)"/>
+
+  <rect x="90" y="370" width="650" height="82" rx="12" fill="#fff1f2" stroke="#dc2626" stroke-width="2"/>
+  <text class="step" x="112" y="400">Obs 1 · Missing prerequisite</text>
+  <text class="mono" x="112" y="429" fill="#b91c1c">INSTALLATION FAILED: repo bitnami not found</text>
+  <line x1="415" y1="452" x2="415" y2="481" stroke="#64748b" stroke-width="3" marker-end="url(#arrow)"/>
+
+  <rect x="90" y="490" width="650" height="107" rx="12" fill="#fefce8" stroke="#d97706" stroke-width="2"/>
+  <text class="step" x="112" y="520">Repair · Patch installer and retry</text>
+  <text class="body" x="112" y="550">The Bitnami repository and idempotent namespace creation were added.</text>
+  <text class="mono" x="112" y="578" fill="#b91c1c">INSTALLATION FAILED: context deadline exceeded</text>
+  <line x1="415" y1="597" x2="415" y2="626" stroke="#64748b" stroke-width="3" marker-end="url(#arrow)"/>
+
+  <rect x="90" y="635" width="650" height="105" rx="12" fill="#fff1f2" stroke="#dc2626" stroke-width="2"/>
+  <text class="step" x="112" y="665">Root cause · Storage was not provisioned</text>
+  <text class="body" x="112" y="693">PostgreSQL PVC stayed unbound: no PV and no StorageClass.</text>
+  <text class="metric" x="112" y="727" fill="#dc2626">10 downstream steps skipped</text>
+
+  <!-- Right lane -->
+  <rect x="825" y="125" width="720" height="675" rx="18" fill="#ffffff" stroke="#16a34a" stroke-width="3"/>
+  <rect x="825" y="125" width="720" height="68" rx="18" fill="#dcfce7"/>
+  <path d="M825 170 h720 v23 h-720z" fill="#dcfce7"/>
+  <text class="head" x="855" y="168">Progressive observe → reason → act</text>
+  <text class="body" x="855" y="218">The agent selected and validated one next state change at a time.</text>
+
+  <rect x="860" y="250" width="650" height="82" rx="12" fill="#eff6ff" stroke="#2563eb" stroke-width="2"/>
+  <text class="step" x="882" y="280">Observe · Storage already available</text>
+  <text class="mono" x="882" y="309">longhorn (default)   driver.longhorn.io</text>
+  <line x1="1185" y1="332" x2="1185" y2="361" stroke="#64748b" stroke-width="3" marker-end="url(#arrow)"/>
+
+  <rect x="860" y="370" width="650" height="82" rx="12" fill="#fff1f2" stroke="#dc2626" stroke-width="2"/>
+  <text class="step" x="882" y="400">Act + observe · Same repository failure</text>
+  <text class="mono" x="882" y="429" fill="#b91c1c">INSTALLATION FAILED: repo bitnami not found</text>
+  <line x1="1185" y1="452" x2="1185" y2="481" stroke="#64748b" stroke-width="3" marker-end="url(#arrow)"/>
+
+  <rect x="860" y="490" width="650" height="107" rx="12" fill="#fefce8" stroke="#d97706" stroke-width="2"/>
+  <text class="step" x="882" y="520">Reason + act · Close only the observed gap</text>
+  <text class="mono" x="882" y="550">helm repo add bitnami https://charts.bitnami.com/bitnami</text>
+  <text class="body" x="882" y="579">Before: absent · After: repository listed ✓</text>
+  <line x1="1185" y1="597" x2="1185" y2="626" stroke="#64748b" stroke-width="3" marker-end="url(#arrow)"/>
+
+  <rect x="860" y="635" width="650" height="105" rx="12" fill="#ecfdf5" stroke="#16a34a" stroke-width="2"/>
+  <text class="step" x="882" y="665">Retry + validate · Desired state observed</text>
+  <text class="mono" x="882" y="694" fill="#15803d">postgres-postgresql-0   2/2   Running</text>
+  <text class="metric" x="882" y="729" fill="#16a34a">1 durable outcome verified</text>
+
+  <text class="small" x="70" y="845">Left source: mosip-full-feedback-20260915T185216Z/deployment-execution.log</text>
+  <text class="small" x="830" y="845">Right source: mosip-policy-20260929T133639Z/run/{trajectory.jsonl,actions.jsonl}</text>
+  <text class="small" x="70" y="875">Interpretation: runtime reconciliation avoided a cascade by checking the prerequisite state before retrying the same source-grounded installer.</text>
+</svg>

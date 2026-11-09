@@ -8,7 +8,7 @@ from pydantic import Field
 
 from .llm import LLMClient
 from .sources import SourceTools
-from .task import OverviewChange, StrictModel
+from .task import Decision, OverviewChange, StrictModel
 
 StepStatus = Literal["pending", "active", "verified", "waiting_for_input", "blocked"]
 
@@ -144,6 +144,31 @@ def set_step_status(overview: DeploymentOverview, step_id: str, status: StepStat
         raise ValueError(f"overview step must exist exactly once: {step_id}")
     matches[0].status = status
     overview.revision += 1
+
+
+def advance_verified_step(
+    overview: DeploymentOverview | None,
+    decision: Decision,
+    result: dict,
+) -> bool:
+    current = active_step(overview) if overview else None
+    if current is None or not decision.completes_step or decision.step_id != current.id:
+        return False
+    if decision.kind == "DONE":
+        satisfied = result.get("step_id") == current.id and (
+            result.get("exit_code") == 0
+            or result.get("status") in {"validated", "already_satisfied"}
+        )
+    else:
+        satisfied = (decision.tool == "observe" and result.get("exit_code") == 0) or (
+            decision.tool == "execute"
+            and result.get("status") in {"validated", "already_satisfied"}
+        )
+    if not satisfied:
+        return False
+    set_step_status(overview, current.id, "verified")
+    result["overview_step_verified"] = current.id
+    return True
 
 
 def retry_blocked_steps(overview: DeploymentOverview) -> bool:

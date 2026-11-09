@@ -57,7 +57,7 @@ class AcquiredSource:
     def contains_file(self, relative_path: str) -> bool:
         try:
             return self.resolve_path(relative_path).is_file()
-        except OSError, ValueError:
+        except (OSError, ValueError):
             return False
 
 

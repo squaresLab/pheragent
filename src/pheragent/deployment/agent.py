@@ -6,15 +6,23 @@ import json
 import os
 import sys
 import time
-from getpass import getpass
 from pathlib import Path
 
 from .history import RunHistory
+from .interaction import (
+    choose_option,
+    confirm_source,
+    input_state,
+    input_value,
+    missing_input_names,
+    missing_inputs,
+    prompt_for_inputs,
+)
 from .llm import LLMClient
-from .models import SourcesConfig
 from .overview import (
     DeploymentOverview,
     active_step,
+    advance_verified_step,
     apply_change,
     create_overview,
     retry_blocked_steps,
@@ -30,10 +38,9 @@ from .runtime import (
     target_command,
 )
 from .serialization import load_yaml, write_json, write_yaml
-from .source_manager import SourceManager
-from .sources import SourceTools, _source_spec
-from .state import apply_result, record_verified_outcome
-from .task import Check, Decision, DeploymentTask, InputRequest, TaskInput
+from .sources import DeploymentSources, SourceTools
+from .state import apply_result, record_step_result, record_verified_outcome
+from .task import Check, Decision, DeploymentTask
 
 _INNER_LOOP_INSTRUCTIONS = """You are a senior DevOps engineer progressively deploying a system.
 Return one Decision that moves the active step toward its verified success condition.
@@ -67,6 +74,15 @@ when observation or validation proves the success condition, then return DONE fo
 Give a concise reason and do not output private chain-of-thought.
 """
 
+_TERMINAL_STATUSES = {
+    "SUCCESS",
+    "FAILED",
+    "BLOCKED",
+    "WAITING_FOR_INPUT",
+    "BUDGET_EXHAUSTED",
+    "PARTIAL",
+}
+
 
 def compact_context(value):
     if isinstance(value, str):
@@ -83,90 +99,6 @@ def compact_context(value):
             for key, item in value.items()
         }
     return value
-
-
-def _input_state(task: DeploymentTask, base: Path) -> dict[str, dict]:
-    result = {}
-    for name, item in task.inputs.items():
-        if item.value is not None:
-            available, source = True, "task"
-        elif item.from_env is not None:
-            available, source = bool(os.getenv(item.from_env)), f"env:{item.from_env}"
-        else:
-            path = item.from_file or Path()
-            path = path if path.is_absolute() else base / path
-            available, source = path.is_file(), f"file:{path}"
-        result[name] = {
-            "available": available,
-            "sensitive": item.sensitive,
-            "source": source,
-        }
-        if item.value is not None and not item.sensitive:
-            result[name]["value"] = item.value
-    return result
-
-
-def _missing_input_names(state: dict, names: list[str]) -> list[str]:
-    return sorted(name for name in names if not state["inputs"].get(name, {}).get("available"))
-
-
-def _missing_inputs(state: dict, requests: list[InputRequest]) -> list[InputRequest]:
-    missing = set(_missing_input_names(state, [request.name for request in requests]))
-    return [request for request in requests if request.name in missing]
-
-
-def _input_value(task: DeploymentTask, name: str, base: Path) -> tuple[str, bool]:
-    item = task.inputs[name]
-    if item.value is not None:
-        value = item.value
-    elif item.from_env is not None:
-        value = os.environ[item.from_env]
-    else:
-        path = item.from_file or Path()
-        path = path if path.is_absolute() else base / path
-        value = path.read_text(encoding="utf-8")
-    return value if value.endswith("\n") else value + "\n", item.sensitive
-
-
-def _prompt_for_inputs(
-    task: DeploymentTask,
-    state: dict,
-    decision: Decision,
-) -> list[str]:
-    if not sys.stdin.isatty():
-        return []
-    provided = []
-    print(decision.reason, flush=True)
-    for request in _missing_inputs(state, decision.required_inputs):
-        name = request.name
-        configured = task.inputs.get(name)
-        sensitive = request.sensitive or bool(configured and configured.sensitive)
-        try:
-            prompt = f"{request.prompt} [{name}]"
-            value = getpass(f"{prompt} (hidden): ") if sensitive else input(f"{prompt}: ").strip()
-        except (EOFError, KeyboardInterrupt):
-            value = ""
-        if not value:
-            continue
-        if sensitive:
-            variable = configured.from_env if configured and configured.from_env else name
-            os.environ[variable] = value
-            task.inputs[name] = TaskInput(from_env=variable, sensitive=True)
-            state["inputs"][name] = {
-                "available": True,
-                "sensitive": True,
-                "source": f"env:{variable}",
-            }
-        else:
-            task.inputs[name] = TaskInput(value=value)
-            state["inputs"][name] = {
-                "available": True,
-                "sensitive": False,
-                "source": "interactive",
-                "value": value,
-            }
-        provided.append(name)
-    return provided
 
 
 def request_decision(
@@ -248,42 +180,6 @@ def verify_completion(task: DeploymentTask, state: dict) -> tuple[bool, dict]:
     return all(item["status"] == "satisfied" for item in first + second), result
 
 
-def _advance_verified_step(
-    overview: DeploymentOverview | None,
-    decision: Decision,
-    result: dict,
-) -> bool:
-    current = active_step(overview) if overview else None
-    if current is None or not decision.completes_step or decision.step_id != current.id:
-        return False
-
-    if decision.kind == "DONE":
-        satisfied = result.get("step_id") == current.id and (
-            result.get("exit_code") == 0
-            or result.get("status") in {"validated", "already_satisfied"}
-        )
-    else:
-        satisfied = (decision.tool == "observe" and result.get("exit_code") == 0) or (
-            decision.tool == "execute"
-            and result.get("status") in {"validated", "already_satisfied"}
-        )
-
-    if not satisfied:
-        return False
-
-    set_step_status(overview, current.id, "verified")
-    result["overview_step_verified"] = current.id
-    return True
-
-
-def _record_step_result(state: dict, step, *, deployed: bool, reason: str | None = None) -> None:
-    for component in step.components or [step.id]:
-        result = {"deployed": deployed}
-        if reason:
-            result["reason"] = reason
-        state["components"][component] = result
-
-
 def _repeat_key(decision: Decision, result: dict) -> str:
     status = result.get("status")
     action = result.get("reason") if status == "policy_denied" else (
@@ -299,6 +195,66 @@ def _repeat_key(decision: Decision, result: dict) -> str:
         [item.get("status") for item in result.get("after", [])],
     ]
     return json.dumps([decision.step_id, action, outcome], sort_keys=True)
+
+
+def _run_finished(status: str, reason: str) -> bool:
+    return status in _TERMINAL_STATUSES and not (
+        status == "BUDGET_EXHAUSTED" and reason == "decision budget exhausted"
+    )
+
+
+class _ToolRouter:
+    """Run one source or target tool with the current deployment dependencies."""
+
+    def __init__(
+        self,
+        task: DeploymentTask,
+        sources: SourceTools,
+        workspace: Path,
+        *,
+        enabled: bool,
+        approve: bool,
+    ):
+        self.task = task
+        self.sources = sources
+        self.workspace = workspace
+        self.enabled = enabled
+        self.approve = approve
+
+    def call(self, decision: Decision, **execution_options) -> dict:
+        if decision.tool in {
+            "inventory_sources",
+            "search_sources",
+            "read_file",
+            "list_directory",
+        }:
+            try:
+                return self.sources.call(decision)
+            except (OSError, ValueError) as exc:
+                return {"error": str(exc)}
+        if decision.tool == "observe":
+            try:
+                return inspect_target(
+                    decision,
+                    self.task,
+                    self.sources,
+                    self.workspace,
+                    enabled=self.enabled,
+                    approve=self.approve,
+                )
+            except (OSError, ValueError) as exc:
+                return {"error": str(exc)}
+        if decision.tool == "execute":
+            return execute_action(
+                decision,
+                self.task,
+                self.sources,
+                self.workspace,
+                enabled=self.enabled,
+                approve=self.approve,
+                **execution_options,
+            )
+        return {"error": "ACT needs a known tool"}
 
 
 def run_deployment_agent(
@@ -340,21 +296,25 @@ def run_deployment_agent(
         )
         task.inputs = {**previous.inputs, **task.inputs}
     write_json(output / "task.json", task)
-    specs = [
-        _source_spec(item, purpose, index, task_path.parent)
-        for purpose, items in (
-            ("repository", task.sources.repositories),
-            ("documentation", task.sources.documentation),
-        )
-        for index, item in enumerate(items, start=1)
-    ]
-    acquired = SourceManager(
-        cache_dir=output.parent / ".source-cache", config_dir=task_path.parent, strict=False
-    ).acquire(SourcesConfig(system="deployment", sources=specs))
-    write_json(output / "sources.json", acquired.manifest)
+    deployment_sources = DeploymentSources.acquire(
+        task,
+        base=task_path.parent,
+        cache_dir=output.parent / ".source-cache",
+    )
+    write_json(output / "sources.json", deployment_sources.manifest)
     if not resume:
-        history.append("sources_acquired", sources=acquired.manifest.model_dump(mode="json"))
-    sources = SourceTools(acquired.sources)
+        history.append(
+            "sources_acquired",
+            sources=deployment_sources.manifest.model_dump(mode="json"),
+        )
+    sources = deployment_sources.tools
+    tools = _ToolRouter(
+        task,
+        sources,
+        output / "workspace",
+        enabled=execute,
+        approve=approve,
+    )
     client = LLMClient(model=model)
     usage = history.usage()
     if resume:
@@ -399,7 +359,7 @@ def run_deployment_agent(
             "target": task.environment.model_dump(exclude={"kubeconfig"}),
             "constraints": task.constraints.model_dump(),
             "completion_checks": [check.model_dump() for check in task.success_checks],
-            "inputs": _input_state(task, task_path.parent),
+            "inputs": input_state(task, task_path.parent),
             "source_workspaces": {
                 source_id: str((output / "workspace" / source_id).resolve())
                 for source_id in sources.sources
@@ -409,7 +369,7 @@ def run_deployment_agent(
     )
     if resume and state.get("pending_input"):
         pending = state["pending_input"]
-        if not _missing_input_names(state, list(pending["required_inputs"])):
+        if not missing_input_names(state, list(pending["required_inputs"])):
             state.pop("pending_input")
             if overview and pending.get("step_id"):
                 set_step_status(overview, pending["step_id"], "active")
@@ -466,7 +426,7 @@ def run_deployment_agent(
             }
             history.append("observe", iteration=cycle, result=observation)
             refresh_environment = False
-        for _ in range(1):
+        try:
             if time.monotonic() - started >= task.budgets.max_runtime_minutes * 60:
                 status, reason = "BUDGET_EXHAUSTED", "runtime budget exhausted"
                 break
@@ -511,14 +471,14 @@ def run_deployment_agent(
                 }
                 history.append("tool", iteration=cycle, tool=decision.tool, result=last_result)
                 continue
-            if decision.kind == "WAITING_FOR_INPUT" or _missing_inputs(
+            if decision.kind == "WAITING_FOR_INPUT" or missing_inputs(
                 state, decision.required_inputs
             ):
-                missing = _missing_inputs(state, decision.required_inputs)
+                missing = missing_inputs(state, decision.required_inputs)
                 if not missing:
                     last_result = {"status": "inputs_available"}
                     continue
-                provided = _prompt_for_inputs(task, state, decision)
+                provided = prompt_for_inputs(task, state, decision)
                 if provided:
                     write_json(output / "task.json", task)
                     history.append(
@@ -527,7 +487,7 @@ def run_deployment_agent(
                         inputs=provided,
                         sensitive=[name for name in provided if state["inputs"][name]["sensitive"]],
                     )
-                    missing = _missing_inputs(state, decision.required_inputs)
+                    missing = missing_inputs(state, decision.required_inputs)
                     last_result = {"status": "inputs_provided", "inputs": provided}
                     pass_progress = True
                     if not missing:
@@ -580,15 +540,8 @@ def run_deployment_agent(
                 elif not sys.stdin.isatty():
                     reason = "route choice needs an interactive terminal"
                 else:
-                    print(f"{decision.reason}\nChoose a route:", flush=True)
-                    for index, option in enumerate(options, 1):
-                        print(f"  {index}. {option}", flush=True)
-                    try:
-                        answer = input("Choice [number, or n to stop]: ").strip()
-                    except EOFError:
-                        answer = ""
-                    if answer in {str(index) for index in range(1, len(options) + 1)}:
-                        choice = options[int(answer) - 1]
+                    choice = choose_option(decision.reason, options)
+                    if choice:
                         state["selected_route"] = {"choice": choice, "evidence": evidence}
                         last_result = {"status": "human_selected", "choice": choice}
                         history.append("human_choice", iteration=cycle, result=last_result)
@@ -600,7 +553,7 @@ def run_deployment_agent(
             if decision.kind == "BLOCKED":
                 if overview and current:
                     set_step_status(overview, current.id, "blocked")
-                    _record_step_result(state, current, deployed=False, reason=decision.reason)
+                    record_step_result(state, current, deployed=False, reason=decision.reason)
                     last_result = {
                         "status": "blocked",
                         "reason": decision.reason,
@@ -617,7 +570,8 @@ def run_deployment_agent(
                 complete, last_result = verify_completion(task, state)
                 if complete:
                     status, reason = "SUCCESS", "completion checks passed twice"
-                break
+                    break
+                continue
             if decision.kind == "DONE":
                 pass
             elif decision.tool == "add_source":
@@ -650,53 +604,18 @@ def run_deployment_agent(
                     status, reason, last_result = "WAITING_FOR_INPUT", decision.reason, request
                     break
                 else:
-                    accepted = approve
-                    if not accepted:
-                        print(
-                            "Approve deployment source?\n"
-                            f"Source: {source.location}\n"
-                            f"Referenced by: {', '.join(evidence)}\n"
-                            f"Reason: {decision.reason}\n"
-                            "Access: read-only clone; commands still require separate approval\n"
-                            "[y/N] ",
-                            end="",
-                            flush=True,
-                        )
-                        try:
-                            accepted = input().strip().casefold() == "y"
-                        except EOFError:
-                            accepted = False
+                    accepted = approve or confirm_source(
+                        source.location, evidence, decision.reason
+                    )
                     if not accepted:
                         status, reason = "BLOCKED", "human declined deployment source"
                         last_result = {"status": "blocked", "reason": reason}
                         break
-                    task.sources.repositories.append(source)
+                    resolved_revision = deployment_sources.add_repository(source)
                     write_json(output / "task.json", task)
-                    specs.append(
-                        _source_spec(
-                            source,
-                            "repository",
-                            len(task.sources.repositories),
-                            task_path.parent,
-                        )
-                    )
-                    acquired = SourceManager(
-                        cache_dir=output.parent / ".source-cache",
-                        config_dir=task_path.parent,
-                        strict=False,
-                    ).acquire(SourcesConfig(system="deployment", sources=specs))
-                    resolved_revision = acquired.manifest.sources[-1].resolved_revision
-                    pinned_source = source.model_copy(update={"revision": resolved_revision})
-                    task.sources.repositories[-1] = pinned_source
-                    specs[-1] = _source_spec(
-                        pinned_source,
-                        "repository",
-                        len(task.sources.repositories),
-                        task_path.parent,
-                    )
-                    write_json(output / "task.json", task)
-                    write_json(output / "sources.json", acquired.manifest)
-                    sources = SourceTools(acquired.sources)
+                    write_json(output / "sources.json", deployment_sources.manifest)
+                    sources = deployment_sources.tools
+                    tools.sources = sources
                     state["source_workspaces"] = {
                         source_id: str((output / "workspace" / source_id).resolve())
                         for source_id in sources.sources
@@ -714,28 +633,8 @@ def run_deployment_agent(
                         resolved_revision=resolved_revision,
                         evidence=evidence,
                     )
-            elif decision.tool in {
-                "inventory_sources",
-                "search_sources",
-                "read_file",
-                "list_directory",
-            }:
-                try:
-                    last_result = sources.call(decision)
-                except (OSError, ValueError) as exc:
-                    last_result = {"error": str(exc)}
             elif decision.tool == "observe":
-                try:
-                    last_result = inspect_target(
-                        decision,
-                        task,
-                        sources,
-                        output / "workspace",
-                        enabled=execute,
-                        approve=approve,
-                    )
-                except (OSError, ValueError) as exc:
-                    last_result = {"error": str(exc)}
+                last_result = tools.call(decision)
                 if last_result.get("status") == "blocked":
                     status = "BLOCKED"
                     reason = last_result["reason"]
@@ -750,7 +649,7 @@ def run_deployment_agent(
                 stdin_value = None
                 stdin_sensitive = False
                 if decision.stdin_input:
-                    stdin_value, stdin_sensitive = _input_value(
+                    stdin_value, stdin_sensitive = input_value(
                         task, decision.stdin_input, task_path.parent
                     )
                     stdin_sensitive = stdin_sensitive or any(
@@ -766,13 +665,8 @@ def run_deployment_agent(
                     "expected_change": decision.expected_change,
                     "stdin_input": decision.stdin_input,
                 }
-                last_result = execute_action(
+                last_result = tools.call(
                     decision,
-                    task,
-                    sources,
-                    output / "workspace",
-                    enabled=execute,
-                    approve=approve,
                     timeout=max(1, min(1800, int(remaining))),
                     stdin_value=stdin_value,
                     stdin_sensitive=stdin_sensitive,
@@ -798,7 +692,7 @@ def run_deployment_agent(
                     else:
                         last_result = check_result
             else:
-                last_result = {"error": "ACT needs a known tool"}
+                last_result = tools.call(decision)
             repeat_key = _repeat_key(decision, last_result)
             repeats[repeat_key] = repeats.get(repeat_key, 0) + 1
             last_result["repeated_action_count"] = repeats[repeat_key] - 1
@@ -808,14 +702,14 @@ def run_deployment_agent(
                 blocked_reason = f"same action produced no progress three times: {detail}"
                 if overview and current:
                     set_step_status(overview, current.id, "blocked")
-                    _record_step_result(state, current, deployed=False, reason=blocked_reason)
+                    record_step_result(state, current, deployed=False, reason=blocked_reason)
                 else:
                     status, reason = "BLOCKED", blocked_reason
             if decision.tool in {"observe", "execute"}:
                 last_result["step_id"] = decision.step_id
-            step_completed = _advance_verified_step(overview, decision, last_result)
+            step_completed = advance_verified_step(overview, decision, last_result)
             if step_completed:
-                _record_step_result(state, current, deployed=True)
+                record_step_result(state, current, deployed=True)
                 pass_progress = True
                 repeats.clear()
                 state["overview"] = overview.model_dump()
@@ -854,16 +748,12 @@ def run_deployment_agent(
             )
             history.append(event, iteration=cycle, tool=decision.tool, result=last_result)
             if decision.tool == "execute" or step_completed or stalled or status == "BLOCKED":
-                break
-        history.checkpoint(state)
-        if status in {
-            "SUCCESS",
-            "FAILED",
-            "BLOCKED",
-            "WAITING_FOR_INPUT",
-            "BUDGET_EXHAUSTED",
-            "PARTIAL",
-        } and not (status == "BUDGET_EXHAUSTED" and reason == "decision budget exhausted"):
+                if _run_finished(status, reason):
+                    break
+                continue
+        finally:
+            history.checkpoint(state)
+        if _run_finished(status, reason):
             break
     report = {
         "status": status,

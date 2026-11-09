@@ -10,8 +10,9 @@ from typing import Literal
 
 from pydantic import Field, model_validator
 
-from .agent import _input_state, _input_value, compact_context
+from .agent import compact_context
 from .history import RunHistory
+from .interaction import input_state, input_value
 from .llm import LLMClient
 from .models import SourcesConfig
 from .runtime import execute_command, observe_target
@@ -205,7 +206,7 @@ def run_oneshot_agent(
             if event.get("event") == "decision":
                 working_memory = event.get("value", {}).get("memory", [])
                 break
-    inputs = _input_state(task, task_path.parent)
+    inputs = input_state(task, task_path.parent)
     inventory = sources.inventory()
     observation = observe_target(task)
     history.append("observe", iteration=0, result=observation)
@@ -289,7 +290,7 @@ def run_oneshot_agent(
                 }
                 history.append("tool", iteration=iteration, tool="command", result=last_result)
                 continue
-            stdin_value, stdin_sensitive = _input_value(
+            stdin_value, stdin_sensitive = input_value(
                 task, decision.stdin_input, task_path.parent
             )
 

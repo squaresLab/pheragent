@@ -11,13 +11,15 @@ import yaml
 from pheragent.cli import main as pheragent_main
 from pheragent.deployment.agent import (
     _INNER_LOOP_INSTRUCTIONS,
-    _advance_verified_step,
-    _record_step_result,
     compact_context,
     run_deployment_agent,
 )
 from pheragent.deployment.models import SourceKind, SourcesConfig
-from pheragent.deployment.overview import DeploymentOverview, active_step
+from pheragent.deployment.overview import (
+    DeploymentOverview,
+    active_step,
+    advance_verified_step,
+)
 from pheragent.deployment.runtime import (
     classify_command,
     execute_action,
@@ -26,6 +28,8 @@ from pheragent.deployment.runtime import (
     target_command,
 )
 from pheragent.deployment.source_manager import SourceManager
+from pheragent.deployment.sources import SourceTools
+from pheragent.deployment.state import record_step_result
 from pheragent.deployment.task import Check, Decision, DeploymentTask
 
 
@@ -402,7 +406,7 @@ def test_agent_hides_and_never_persists_interactive_secrets(
 
     monkeypatch.delenv("IAM_ADMIN_PASSWORD", raising=False)
     monkeypatch.setattr("pheragent.deployment.agent.sys.stdin", Terminal())
-    monkeypatch.setattr("pheragent.deployment.agent.getpass", lambda _prompt: secret)
+    monkeypatch.setattr("pheragent.deployment.interaction.getpass", lambda _prompt: secret)
     decisions = iter(
         [
             _decision(
@@ -603,15 +607,15 @@ def test_done_advances_only_matching_step_from_successful_evidence() -> None:
     deployment = overview()
     result = {"exit_code": 0, "step_id": "infrastructure"}
 
-    assert _advance_verified_step(deployment, decision, result)
+    assert advance_verified_step(deployment, decision, result)
     assert active_step(deployment).id == "application"
     assert result["overview_step_verified"] == "infrastructure"
-    assert not _advance_verified_step(
+    assert not advance_verified_step(
         overview(),
         decision.model_copy(update={"step_id": "wrong-step"}),
         result,
     )
-    assert not _advance_verified_step(
+    assert not advance_verified_step(
         overview(),
         decision,
         {"exit_code": 1, "step_id": "infrastructure"},
@@ -643,7 +647,7 @@ def test_step_result_is_binary_and_keeps_the_exact_failure_reason() -> None:
     )
     state = {"components": {}}
 
-    _record_step_result(
+    record_step_result(
         state,
         active_step(deployment),
         deployed=False,
@@ -991,6 +995,11 @@ def test_observation_uses_selected_source_directory(tmp_path: Path, monkeypatch)
         return {"exit_code": 0, "stdout": "", "stderr": ""}
 
     monkeypatch.setattr("pheragent.deployment.runtime._command", inspect)
+    monkeypatch.setattr(
+        SourceTools,
+        "working_directory",
+        lambda *_args: pytest.fail("read-only observations must not copy source trees"),
+    )
     decisions = iter(
         [
             _decision(
@@ -1008,8 +1017,10 @@ def test_observation_uses_selected_source_directory(tmp_path: Path, monkeypatch)
 
     report = run_deployment_agent(task, output, decide=decide)
     assert report["status"] == "BLOCKED"
-    assert working_directories == [output / "workspace/repository-1"]
+    assert len(working_directories) == 1
+    assert working_directories[0] != output / "workspace/repository-1"
     assert (working_directories[0] / "compose.yaml").is_file()
+    assert not (output / "workspace").exists()
 
 
 def test_generic_read_only_verb_is_allowed_without_approval(tmp_path: Path, monkeypatch) -> None:
