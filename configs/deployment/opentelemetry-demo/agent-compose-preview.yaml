@@ -19,7 +19,6 @@ constraints:
   allow_destructive_actions: false
 
 context:
-  mode: recent
   history_window: 8
 
 budgets:
