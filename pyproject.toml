@@ -3,6 +3,7 @@ name = "pheragent"
 version = "0.1.0"
 description = "Progressive deployment and checkpointed environment setup agent"
 readme = "README.md"
+license = "Apache-2.0"
 requires-python = ">=3.14"
 dependencies = [
   "openai>=2.0",
