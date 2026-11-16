@@ -15,22 +15,6 @@ class SourceKind(StrEnum):
     LOCAL_FILE = "local_file"
 
 
-class InventoryCategory(StrEnum):
-    DOCUMENTATION = "documentation"
-    BUILD = "build"
-    SHELL = "shell"
-    ANSIBLE = "ansible"
-    TERRAFORM = "terraform"
-    HELM = "helm"
-    HELMSMAN = "helmsman"
-    KUSTOMIZE = "kustomize"
-    KUBERNETES = "kubernetes"
-    COMPOSE = "compose"
-    CI_WORKFLOW = "ci_workflow"
-    CONFIGURATION = "configuration"
-    UNKNOWN = "unknown"
-
-
 class ContractModel(BaseModel):
     """Base for persisted deployment contracts that reject unknown fields."""
 
@@ -88,36 +72,6 @@ class SourceManifest(ContractModel):
     def reject_duplicate_source_ids(self) -> Self:
         _require_unique((source.id for source in self.sources), "source id")
         return self
-
-
-class InventoryEntry(ContractModel):
-    source_id: str = Field(pattern=IDENTIFIER_PATTERN)
-    path: str = Field(min_length=1)
-    category: InventoryCategory
-    size_bytes: int = Field(ge=0)
-    selected: bool = False
-    inspected: bool = False
-    skip_reason: str | None = None
-    parser: str | None = None
-    warnings: list[str] = Field(default_factory=list)
-
-    @model_validator(mode="after")
-    def validate_selection_state(self) -> Self:
-        if not self.selected and not self.skip_reason:
-            raise ValueError("unselected inventory entries require skip_reason")
-        if self.selected and self.skip_reason:
-            raise ValueError("selected inventory entries must not have skip_reason")
-        if self.inspected and not self.selected:
-            raise ValueError("inspected inventory entries must be selected")
-        if self.parser and not self.inspected:
-            raise ValueError("inventory parser requires inspected=true")
-        return self
-
-
-class RepositoryInventory(ContractModel):
-    inventory_version: str = Field(default="0.1", pattern=r"^0\.1$")
-    detected_technologies: list[str] = Field(default_factory=list)
-    entries: list[InventoryEntry] = Field(default_factory=list)
 
 
 def _require_unique(values: Iterable[str], label: str) -> None:

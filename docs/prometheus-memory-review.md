@@ -1,5 +1,8 @@
 # Prometheus memory review for HerAgent Deploy
 
+> Historical design note. The current deployment agent replaced the overview state machine,
+> source cache, and recent-history window with one model-curated working memory. See the README.
+
 ## Scope
 
 This note reviews the anonymous paper *Prometheus: Long-Horizon Codebase Navigation for Repository-Level Problem Solving*. The supplied manuscript is `prometheus_icse_2027.pdf`, dated July 14, 2026. The review focuses on the memory method and its possible use in the progressive deployment agent. No agent code was changed.

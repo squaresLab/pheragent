@@ -8,28 +8,18 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from .agent import run_deployment_agent
-from .oneshot import run_oneshot_agent
 from .telemetry import flush, set_output, span
 
 
 def add_deployment_parser(subparsers) -> None:
     deployment = subparsers.add_parser("deployment", help="Deploy from a task and live state.")
     commands = deployment.add_subparsers(dest="deployment_command", required=True)
-    run = commands.add_parser("run", help="Observe, act, and validate progressively.")
+    run = commands.add_parser("run", help="Deploy progressively from source and live state.")
     run.add_argument("task", type=Path)
     run.add_argument("--output", type=Path)
     run.add_argument("--model", default="gpt-5.6-terra")
-    run.add_argument("--execute", action="store_true", help="Permit approved changes.")
+    run.add_argument("--execute", action="store_true", help="Run model-selected commands.")
     run.add_argument("--resume", action="store_true", help="Continue an existing output run.")
-    oneshot = commands.add_parser(
-        "oneshot", help="Research: deploy as much of the source-defined system as possible."
-    )
-    oneshot.add_argument("task", type=Path)
-    oneshot.add_argument("--output", type=Path)
-    oneshot.add_argument("--model", default="gpt-6-astra")
-    oneshot.add_argument("--reasoning-effort", default="max")
-    oneshot.add_argument("--execute", action="store_true", help="Run policy-permitted commands.")
-    oneshot.add_argument("--resume", action="store_true", help="Continue an existing run.")
 
 
 def run_deployment_command(args: argparse.Namespace) -> int:
@@ -42,23 +32,13 @@ def run_deployment_command(args: argparse.Namespace) -> int:
             input={"task": str(args.task), "output": str(output)},
             task=str(args.task),
         ) as active_span:
-            if args.deployment_command == "oneshot":
-                report = run_oneshot_agent(
-                    args.task,
-                    output,
-                    model=args.model,
-                    reasoning_effort=args.reasoning_effort,
-                    execute=args.execute,
-                    resume=args.resume,
-                )
-            else:
-                report = run_deployment_agent(
-                    args.task,
-                    output,
-                    model=args.model,
-                    execute=args.execute,
-                    resume=args.resume,
-                )
+            report = run_deployment_agent(
+                args.task,
+                output,
+                model=args.model,
+                execute=args.execute,
+                resume=args.resume,
+            )
             set_output(
                 active_span,
                 {"status": report["status"], "reason": report["reason"]},
@@ -78,20 +58,9 @@ def run_deployment_command(args: argparse.Namespace) -> int:
         f"(input {usage.get('input_tokens', 0)}, output {usage.get('output_tokens', 0)})"
     )
     print(f"Actions attempted: {report['mutating_actions']}")
-    if "components" in report:
-        verified = [item["name"] for item in report["components"] if item["status"] == "verified"]
-        deferred = [item["name"] for item in report["components"] if item["status"] == "deferred"]
-        print(f"Verified components: {', '.join(verified) or 'none'}")
-        print(f"Deferred components: {', '.join(deferred) or 'none'}")
-    else:
-        components = report["state"].get("components", {})
-        deployed = [name for name, result in components.items() if result["deployed"]]
-        missing = [name for name, result in components.items() if not result["deployed"]]
-        print(f"Deployed components: {', '.join(deployed) or 'none'}")
-        print(f"Not deployed: {', '.join(missing) or 'none'}")
-        print(
-            "New verified outcomes: "
-            f"{', '.join(item['id'] for item in report['state']['verified_outcomes']) or 'none'}"
-        )
+    deployed = [item["name"] for item in report["components"] if item["deployed"]]
+    not_deployed = [item["name"] for item in report["components"] if not item["deployed"]]
+    print(f"Deployed components: {', '.join(deployed) or 'none'}")
+    print(f"Not deployed: {', '.join(not_deployed) or 'none'}")
     flush()
     return 0 if report["status"] in {"SUCCESS", "PARTIAL_SUCCESS"} else 1
