@@ -2,7 +2,7 @@
 
 HerAgent has two workflows:
 
-- `pheragent deployment run` uses a small observe, decide, act loop to deploy
+- `pheragent deploy` uses a small observe, decide, act loop to deploy
   and verify a source-defined system.
 - `pheragent plan`, `build`, and `build-projects` are the original Docker
   environment-setup workflow.
@@ -24,23 +24,24 @@ uv run ruff check .
 ## Progressive deployment
 
 A task file names the goal, source repositories, target environment, safety
-limits, and runtime and request budgets. The agent maintains a compact working
-memory containing its deployment overview and current facts. The task does not
-need to list components.
+limits, and runtime and request budgets. The agent inspects the sources and
+target, then chooses one useful deployment step at a time. It records durable
+facts and milestone summaries in run notes. The task does not need to list components.
 
 ```bash
-uv run pheragent deployment run path/to/task.yaml \
+uv run pheragent deploy path/to/task.yaml \
   --model gpt-5.6-terra \
   --output .pheragent/agent-runs/trial
 ```
 
-Without `--execute`, HerAgent previews commands. Add `--execute` to run them.
+Without `--execute`, HerAgent runs read-only checks and previews changes. Add
+`--execute` to run changes.
 Ordinary commands run directly. The harness asks for terminal approval when a
 command can cross a destructive, host, cloud, target, namespace, or secret
 boundary:
 
 ```bash
-uv run pheragent deployment run path/to/task.yaml \
+uv run pheragent deploy path/to/task.yaml \
   --model gpt-5.6-terra \
   --output .pheragent/agent-runs/live-trial \
   --execute
@@ -51,12 +52,16 @@ For a Kubernetes task, set an explicit `environment.context` and, if needed,
 cluster. A generic MOSIP task using the current deployment repository is
 [agent.yaml](configs/deployment/mosip/agent.yaml).
 
-Each run writes `task.json`, `sources.json`, `events.jsonl`, `memory.md`,
-`final-report.json`, and `runbook.sh`. Command output is streamed and saved under
-`actions/`. Repository commands run from a copied workspace; acquired source
-snapshots remain unchanged. `events.jsonl` is the source of truth for resume,
-reports, and the replay runbook. A failed command becomes feedback for the next
-turn. When human input is missing, the run writes `human-request.yaml`. Add an
+Each run writes `task.json`, `sources.json`, `events.jsonl`, `run_notes.md`,
+`final-report.json`, and `runbook.sh`. Run notes retain selected facts, repairs,
+the current step, and milestone summaries. They are rebuilt from the append-only
+event log on resume. Command output is streamed and saved under
+`actions/`. Repository commands run from isolated source directories under
+`workspace/`, using Git worktrees when available. Acquired snapshots remain
+unchanged. `events.jsonl` is the
+source of truth for resume, reports, and the replay runbook. A failed command
+becomes feedback for the next turn. When human input is missing, the run writes
+`human-request.yaml`. Add an
 environment or file reference to the task, then continue the same output directory
 with `--resume`. Secrets are referenced rather than stored in the task:
 
@@ -73,6 +78,24 @@ The model records each discovered outcome as deployed or not deployed. A deploye
 record must cite successful command events that changed and verified it. Completion
 still depends on what the agent discovered, so the final report preserves all
 not-deployed reasons for human review.
+
+`runbook.sh` replays only cited successful changes and checks. Its prerequisites
+name required inputs and pinned sources; its final section runs recorded system
+checks. Add route-independent outcomes to a task when you know them:
+
+```yaml
+task:
+  objective: Deploy the application
+  invariants:
+    user-flow: A user can complete the primary workflow
+```
+
+The agent can also record source-discovered invariants. If a component or system
+check is missing, the runbook says `INCOMPLETE` and exits before changing the
+target. Review and replay it against a clean target before treating it as a
+reusable deployment recipe. Sensitive inputs are referenced rather than embedded;
+the original run path is not used. Review the script before
+sharing it because command output and source edits can contain unrecognized secrets.
 
 ### Optional traces
 
@@ -381,7 +404,7 @@ Use `feat/mosip-deployment-mvp` for the current HerAgent-Deploy product and rese
 git fetch origin
 git switch feat/mosip-deployment-mvp
 uv sync
-uv run pheragent deployment --help
+uv run pheragent deploy --help
 uv run pheragent research --help
 ```
 
