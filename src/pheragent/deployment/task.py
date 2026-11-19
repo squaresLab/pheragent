@@ -1,7 +1,8 @@
-"""Task and decision contracts for progressive deployment."""
+"""Contracts for a deployment task and one agent decision."""
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Literal
 
@@ -43,24 +44,21 @@ class Constraints(StrictModel):
 
 class Budgets(StrictModel):
     max_cycles: int = Field(default=30, gt=0)
-    max_mutating_actions: int = Field(default=20, gt=0)
     max_runtime_minutes: int = Field(default=60, gt=0)
-    max_read_actions_per_cycle: int = Field(default=20, gt=0)
-
-
-class ContextSettings(StrictModel):
-    history_window: int = Field(default=8, gt=0, le=50)
-
-
-class Check(StrictModel):
-    command: list[str] = Field(min_length=1)
-    contains: str | None = None
-    unsatisfied_exit_codes: list[int] = Field(default_factory=list)
 
 
 class TaskGoal(StrictModel):
     objective: str = Field(min_length=1)
-    stop_after_verified_outcomes: int | None = Field(default=None, gt=0)
+    invariants: dict[str, str] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def validate_invariants(self) -> TaskGoal:
+        if any(
+            not re.fullmatch(r"[a-z0-9][a-z0-9-]*", key) or not text.strip()
+            for key, text in self.invariants.items()
+        ):
+            raise ValueError("invariants need nonempty descriptions and lowercase hyphenated ids")
+        return self
 
 
 class TaskInput(StrictModel):
@@ -91,70 +89,51 @@ class DeploymentTask(StrictModel):
     environment: Target
     constraints: Constraints = Field(default_factory=Constraints)
     budgets: Budgets = Field(default_factory=Budgets)
-    context: ContextSettings = Field(default_factory=ContextSettings)
-    success_checks: list[Check] = Field(default_factory=list)
     inputs: dict[str, TaskInput] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def require_sources(self) -> DeploymentTask:
         if not self.sources.repositories and not self.sources.documentation:
             raise ValueError("at least one repository or documentation source is required")
-        if self.task.stop_after_verified_outcomes and self.success_checks:
-            raise ValueError("choose fixed success checks or a verified-outcome target")
         return self
 
 
-class OverviewChange(StrictModel):
-    operation: Literal["insert_before", "update"]
-    step_id: str = Field(min_length=1)
-    goal: str = Field(min_length=1)
-    success_condition: str = Field(min_length=1)
-    components: list[str] = Field(default_factory=list, max_length=8)
-    source_refs: list[str] = Field(min_length=1)
-    related_sources: list[str] = Field(default_factory=list, max_length=12)
-    before_step_id: str | None = None
+class RunNote(StrictModel):
+    key: str = Field(pattern=r"^[a-z0-9][a-z0-9-]{0,63}$")
+    text: str = Field(min_length=1, max_length=1_000)
+    evidence_events: list[int] = Field(default_factory=list)
 
 
 class Decision(StrictModel):
-    kind: Literal["ACT", "DONE", "BLOCKED", "ASK_HUMAN", "WAITING_FOR_INPUT"]
-    tool: (
-        Literal[
-            "inventory_sources",
-            "search_sources",
-            "read_file",
-            "list_directory",
-            "add_source",
-            "observe",
-            "execute",
-        ]
-        | None
-    )
-    reason: str
-    focus: str
-    query: str | None
-    source_path: str | None
-    start_line: int | None
-    end_line: int | None
-    command: list[str]
-    working_directory: str | None
-    evidence: list[str]
-    source: SourceLocation | None = None
-    selected_route: str | None = None
-    step_id: str | None = None
+    action: Literal["shell", "ask", "record", "finish"]
+    reason: str = Field(min_length=1)
+    notes: list[RunNote] = Field(default_factory=list)
+    command: list[str] = Field(default_factory=list)
+    working_directory: str | None = None
+    component: str | None = None
+    deployed: bool | None = None
+    evidence_events: list[int] = Field(default_factory=list)
+    verification_events: list[int] = Field(default_factory=list)
+    human_action: str | None = None
     required_inputs: list[InputRequest] = Field(default_factory=list)
     stdin_input: str | None = Field(default=None, pattern=r"^[A-Za-z][A-Za-z0-9_]*$")
-    overview_change: OverviewChange | None = None
-    completes_step: bool = False
-    options: list[str] = Field(default_factory=list)
-    outcome_id: str | None = None
-    expected_change: str | None
-    validation: list[Check]
-    add_gaps: list[str]
-    resolve_gaps: list[str]
-    add_questions: list[str]
-    resolve_questions: list[str]
+
     @model_validator(mode="after")
-    def require_valid_inputs(self) -> Decision:
+    def validate_action(self) -> Decision:
+        if self.action == "shell" and not self.command:
+            raise ValueError("shell action requires command")
+        if self.action == "ask" and not self.required_inputs:
+            raise ValueError("ask action requires required_inputs")
+        if self.action == "record" and (not self.component or self.deployed is None):
+            raise ValueError("record action requires component and deployed")
+        if self.deployed is True and not self.evidence_events:
+            raise ValueError("deployed component requires evidence_events")
+        if self.verification_events and not set(self.verification_events) <= set(
+            self.evidence_events
+        ):
+            raise ValueError("verification_events must be included in evidence_events")
+        if self.deployed is False and not self.human_action:
+            raise ValueError("not deployed component requires human_action")
         names = [item.name for item in self.required_inputs]
         if len(names) != len(set(names)):
             raise ValueError("required input names must be distinct")

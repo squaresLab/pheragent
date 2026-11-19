@@ -45,7 +45,7 @@ def main(argv: list[str] | None = None) -> int:
         _print_batch_result(result, as_json=args.json)
         return 0 if result.ok else 1
 
-    if args.command == "deployment":
+    if args.command == "deploy":
         return run_deployment_command(args)
 
     if args.command == "evaluation":

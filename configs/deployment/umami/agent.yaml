@@ -1,0 +1,21 @@
+task:
+  objective: >-
+    Deploy self-hosted Umami on this host using a repository-supported route.
+    Inspect the sources and current runtime, choose the next useful action,
+    and verify the application and its required dependencies are working.
+
+sources:
+  repositories:
+    - location: https://github.com/umami-software/umami.git
+      revision: v3.4.1
+
+environment:
+  type: shell
+
+constraints:
+  allow_new_infrastructure: true
+  allow_destructive_actions: false
+
+budgets:
+  max_cycles: 50
+  max_runtime_minutes: 60

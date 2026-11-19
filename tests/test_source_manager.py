@@ -7,6 +7,7 @@ import pytest
 
 from pheragent.deployment.models import SourceKind, SourcesConfig, SourceSpec
 from pheragent.deployment.source_manager import SourceManager
+from pheragent.deployment.sources import SourceWorkspace
 
 
 def _git(repository: Path, *arguments: str) -> str:
@@ -62,6 +63,38 @@ def test_git_source_is_resolved_to_detached_commit(tmp_path: Path) -> None:
     assert _git(acquired.path, "rev-parse", "HEAD") == commit
     assert _git(acquired.path, "status", "--porcelain") == ""
     assert _git(upstream, "status", "--porcelain") == ""
+
+
+def test_git_source_gets_an_isolated_mutable_worktree(tmp_path: Path) -> None:
+    upstream = tmp_path / "upstream"
+    commit = _create_git_repository(upstream)
+    acquired = SourceManager(
+        cache_dir=tmp_path / "cache",
+        config_dir=tmp_path,
+        strict=True,
+    ).acquire(
+        SourcesConfig(
+            system="fixture",
+            sources=[
+                SourceSpec(
+                    id="owner/repo",
+                    kind=SourceKind.GIT,
+                    location=str(upstream),
+                    revision=commit,
+                )
+            ],
+        )
+    )
+    workspace = tmp_path / "workspace"
+
+    SourceWorkspace(acquired.sources).prepare(workspace)
+    (workspace / "owner/repo/README.md").write_text("changed\n", encoding="utf-8")
+
+    assert (
+        (acquired.sources[0].path / "README.md")
+        .read_text(encoding="utf-8")
+        .startswith("# Deployment")
+    )
 
 
 def test_git_tag_is_resolved_to_commit(tmp_path: Path) -> None:

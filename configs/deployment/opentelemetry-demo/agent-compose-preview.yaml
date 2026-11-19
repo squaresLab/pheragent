@@ -2,9 +2,7 @@ task:
   objective: >-
     Deploy the OpenTelemetry Demo on this host using the repository's default
     Docker Compose route. Observe what is already running, check prerequisites,
-    and choose the next source-grounded action. Stop after one newly verified
-    deployed outcome.
-  stop_after_verified_outcomes: 1
+    choose the next source-grounded action, and verify the deployed system.
 
 sources:
   repositories:
@@ -18,11 +16,6 @@ constraints:
   allow_new_infrastructure: true
   allow_destructive_actions: false
 
-context:
-  history_window: 8
-
 budgets:
-  max_cycles: 10
-  max_mutating_actions: 10
+  max_cycles: 50
   max_runtime_minutes: 45
-  max_read_actions_per_cycle: 40

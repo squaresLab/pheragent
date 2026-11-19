@@ -1,1852 +1,515 @@
 from __future__ import annotations
 
-import io
 import json
-import os
+import shutil
+import subprocess
+import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import yaml
 
-from pheragent.cli import main as pheragent_main
-from pheragent.deployment.agent import (
-    _INNER_LOOP_INSTRUCTIONS,
-    compact_context,
-    run_deployment_agent,
-)
-from pheragent.deployment.models import SourceKind, SourcesConfig
-from pheragent.deployment.overview import (
-    DeploymentOverview,
-    active_step,
-    advance_verified_step,
-)
-from pheragent.deployment.runtime import (
-    classify_command,
-    execute_action,
-    inspect_target,
-    run_checks,
-    target_command,
-)
-from pheragent.deployment.source_manager import SourceManager
-from pheragent.deployment.sources import SourceTools
-from pheragent.deployment.state import record_step_result
-from pheragent.deployment.task import Check, Decision, DeploymentTask
+from pheragent.deployment.agent import run_deployment_agent
+from pheragent.deployment.llm import LLMClient
+from pheragent.deployment.runtime import _stream_command, classify_command
+from pheragent.deployment.sources import SourceWorkspace, _source_names
+from pheragent.deployment.task import Decision, DeploymentTask, RunNote
 
 
-def _decision(kind: str, tool: str | None = None, **changes: object) -> Decision:
-    payload = {
-        "kind": kind,
-        "tool": tool,
-        "reason": "follow the local installer",
-        "focus": "install application",
-        "query": None,
-        "source_path": None,
-        "start_line": None,
-        "end_line": None,
-        "command": [],
-        "working_directory": None,
-        "evidence": [],
-        "source": None,
-        "required_inputs": [],
-        "expected_change": None,
-        "validation": [],
-        "add_gaps": [],
-        "resolve_gaps": [],
-        "add_questions": [],
-        "resolve_questions": [],
-    }
-    payload.update(changes)
-    return Decision.model_validate(payload)
-
-
-def _execution_events(output: Path) -> list[dict]:
-    events = [json.loads(line) for line in (output / "events.jsonl").read_text().splitlines()]
-    return [
-        event
-        for event in events
-        if event["event"] == "action_finished"
-        or event["event"] == "tool"
-        and event.get("tool") == "execute"
-    ]
-
-
-def _task(path: Path, source: Path, output: Path) -> None:
+def _task(
+    path: Path, source: Path, *, max_cycles: int = 6, invariants: dict[str, str] | None = None
+) -> None:
+    if source.is_dir() and not (source / "README.md").exists():
+        (source / "README.md").write_text("Deploy the sample application.\n")
     path.write_text(
         yaml.safe_dump(
             {
-                "task": {"objective": "Install the sample application"},
+                "task": {
+                    "objective": "Deploy the sample application",
+                    "invariants": invariants or {},
+                },
                 "sources": {"repositories": [str(source)]},
                 "environment": {"type": "shell", "sandbox": True},
-                "success_checks": [
-                    {"command": ["ls", str(output / "workspace/repository-1/ready")]}
-                ],
-                "budgets": {
-                    "max_cycles": 3,
-                    "max_mutating_actions": 2,
-                    "max_runtime_minutes": 2,
-                    "max_read_actions_per_cycle": 3,
-                },
+                "budgets": {"max_cycles": max_cycles, "max_runtime_minutes": 2},
             }
         )
     )
 
 
-def test_agent_previews_then_validates_a_source_installer(tmp_path: Path) -> None:
+def _decision(action: str, reason: str, **values) -> Decision:
+    return Decision.model_validate({"action": action, "reason": reason, **values})
+
+
+def test_llm_client_retries_a_malformed_parsed_response(monkeypatch) -> None:
+    expected = _decision("finish", "deployment complete")
+    attempts = 0
+
+    class ParsedResponse(SimpleNamespace):
+        def model_dump(self):
+            raise AssertionError("the full parsed response must not be serialized")
+
+    class Responses:
+        def parse(self, **request):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise ValueError("malformed structured response")
+            assert request["text_format"] is Decision
+            return ParsedResponse(
+                output_parsed=expected,
+                output_text=expected.model_dump_json() * 2,
+                usage={"input_tokens": 3, "output_tokens": 2, "total_tokens": 5},
+            )
+
+    monkeypatch.setenv("OPENAI_API_KEY", "test")
+    monkeypatch.setattr(
+        "pheragent.deployment.llm._openai_client",
+        lambda **_kwargs: SimpleNamespace(responses=Responses()),
+    )
+    decision, usage = LLMClient().complete(Decision, instructions="decide", payload={})
+
+    assert decision == expected
+    assert attempts == 2
+    assert usage["requests"] == 2
+    assert usage["total_tokens"] == 5
+
+
+def test_sources_use_repository_names_and_owners_only_for_clashes(tmp_path: Path) -> None:
+    assert _source_names(
+        ["https://github.com/open-telemetry/opentelemetry-demo.git"], tmp_path
+    ) == ["opentelemetry-demo"]
+    assert _source_names(
+        ["https://github.com/first/deploy.git", "https://github.com/second/deploy.git"],
+        tmp_path,
+    ) == ["first/deploy", "second/deploy"]
+    assert _source_names(["."], tmp_path) == [tmp_path.name]
+
+
+def test_source_workspace_exposes_files_without_preloading_them(tmp_path: Path) -> None:
+    source = tmp_path / "demo"
+    (source / "docs").mkdir(parents=True)
+    (source / "README.md").write_text("Start with [deployment](docs/install.md).")
+    (source / "docs/install.md").write_text("Run make start.")
+    workspace = SourceWorkspace((SimpleNamespace(id="demo"),))
+
+    assert workspace.working_directory("demo/docs", tmp_path) == source / "docs"
+
+
+def test_source_workspace_rejects_paths_outside_it(tmp_path: Path) -> None:
+    source = tmp_path / "demo"
+    source.mkdir()
+    workspace = SourceWorkspace((SimpleNamespace(id="demo"),))
+
+    with pytest.raises(ValueError, match="escapes"):
+        workspace.working_directory("../outside", tmp_path)
+
+
+def test_long_command_output_shows_omitted_part_and_keeps_full_log(tmp_path: Path) -> None:
+    task = DeploymentTask.model_validate(
+        {
+            "task": {"objective": "Inspect a file"},
+            "sources": {"repositories": ["."]},
+            "environment": {"type": "shell"},
+        }
+    )
+    result = _stream_command(
+        [sys.executable, "-c", "print('HEAD'); print('x' * 200); print('TAIL')"],
+        task,
+        cwd=tmp_path,
+        timeout=5,
+        stdin_value=None,
+        stdin_sensitive=False,
+        log_path=tmp_path / "output.log",
+        output_limit=100,
+    )
+
+    assert result["output_truncated"] is True
+    assert result["output_lines"] == 3
+    assert result["stdout"].startswith("HEAD")
+    assert f"full output: {tmp_path / 'output.log'}" in result["stdout"]
+    assert result["stdout"].endswith("TAIL\n")
+    assert "x" * 200 in (tmp_path / "output.log").read_text()
+
+
+def test_first_decision_can_read_a_large_source_file_in_preview(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "README.md").write_text("start here\n" + "x" * 20_000 + "\n")
+    task = tmp_path / "task.yaml"
+    output = tmp_path / "run"
+    _task(task, source, max_cycles=3)
+
+    def decide(payload, iteration):
+        if iteration == 1:
+            assert "overview" not in payload
+            assert payload["task"]["sources"] == ["source"]
+            return _decision(
+                "shell",
+                "read source",
+                command=["sed", "-n", "1,2p", "README.md"],
+                working_directory="source",
+            ), {}
+        feedback = payload["recent_history"][-1]["result"]
+        assert feedback["execution"]["output_truncated"] is True
+        assert feedback["state_changing"] is False
+        return _decision("finish", "source inspected"), {}
+
+    report = run_deployment_agent(task, output, decide=decide)
+    assert report["status"] == "FAILED"
+    assert (output / "actions/0001.log").read_text().startswith("start here")
+
+
+def test_preview_does_not_run_a_change(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    task = tmp_path / "task.yaml"
+    output = tmp_path / "run"
+    _task(task, source, max_cycles=2)
+
+    def decide(payload, iteration):
+        if iteration == 1:
+            return _decision(
+                "shell", "create marker", command=["touch", "marker"], working_directory="source"
+            ), {}
+        assert payload["recent_history"][-1]["result"]["status"] == "dry_run"
+        return _decision("finish", "preview complete"), {}
+
+    run_deployment_agent(task, output, decide=decide)
+    assert not (output / "workspace/source/marker").exists()
+
+
+def test_agent_deploys_verifies_and_records_a_component(tmp_path: Path) -> None:
     source = tmp_path / "source"
     source.mkdir()
     (source / "install.sh").write_text("#!/bin/sh\ntouch ready\n")
     (source / "install.sh").chmod(0o755)
     task = tmp_path / "task.yaml"
     output = tmp_path / "run"
-    _task(task, source, output)
-    decisions = iter(
-        [
-            _decision("ACT", "search_sources", query="install sample"),
-            _decision(
-                "ACT",
-                "execute",
+    _task(task, source, max_cycles=4, invariants={"ready-file": "Installed artifact exists"})
+    evidence: list[int] = []
+
+    def decide(payload, iteration):
+        if iteration == 1:
+            assert payload["task"]["objective"] == "Deploy the sample application"
+            assert payload["task"]["sources"] == ["source"]
+            assert "overview" not in payload
+            assert payload["current_step"].startswith("Inspect source guidance")
+            return _decision(
+                "shell",
+                "run the documented installer",
                 command=["./install.sh"],
-                working_directory="repository-1:.",
-                evidence=["repository-1:install.sh"],
-                expected_change="sample installer created ready file",
-                validation=[
-                    {
-                        "command": ["ls", str(output / "workspace/repository-1/ready")],
-                        "unsatisfied_exit_codes": [2],
-                    }
+                working_directory="source",
+                notes=[
+                    RunNote(key="installer", text="Run source/install.sh"),
+                    RunNote(key="credential", text="password: do-not-log"),
+                    RunNote(key="current-step", text="Verify the sample installation"),
+                    RunNote(
+                        key="progress-summary", text="Installer ran; runtime not verified yet."
+                    ),
                 ],
-            ),
-            _decision("DONE"),
-        ]
-    )
+            ), {"requests": 1}
+        if iteration == 2:
+            assert payload["current_step"] == "Verify the sample installation"
+            assert payload["progress_summary"] == "Installer ran; runtime not verified yet."
+            assert "progress-summary" not in payload["run_notes"]["index"]
+            evidence.append(payload["recent_history"][-1]["result"]["event_sequence"])
+            return _decision(
+                "shell",
+                "verify the installed artifact",
+                command=["test", "-f", "ready"],
+                working_directory="source",
+            ), {"requests": 1}
+        if iteration == 3:
+            assert "Record the current outcome" in payload["finalization"]
+            evidence.append(payload["recent_history"][-1]["result"]["event_sequence"])
+            return _decision(
+                "record",
+                "the sample application is deployed",
+                component="sample application",
+                deployed=True,
+                evidence_events=evidence,
+                verification_events=[evidence[-1]],
+                notes=[
+                    RunNote(key="progress-summary", text="Sample installation verified."),
+                    RunNote(
+                        key="invariant-ready-file",
+                        text="Installed artifact exists",
+                        evidence_events=[evidence[-1]],
+                    ),
+                ],
+            ), {"requests": 1}
+        assert "Final request" in payload["finalization"]
+        assert payload["progress_summary"] == "Sample installation verified."
+        return _decision("finish", "all discovered outcomes are deployed"), {"requests": 1}
 
-    def decide(_state, _observation, _last_result, _sources, _cycle):
-        return next(decisions), {"requests": 1}
+    report = run_deployment_agent(task, output, execute=True, decide=decide)
 
-    report = run_deployment_agent(task, output, execute=True, approve=True, decide=decide)
     assert report["status"] == "SUCCESS"
-    assert report["mutating_actions"] == 1
-    assert (output / "workspace/repository-1/ready").is_file()
-    assert json.loads((output / "final-report.json").read_text())["status"] == "SUCCESS"
-    assert (output / "events.jsonl").is_file()
-    assert not (output / "state.json").exists()
-    assert not (output / "run-summary.json").exists()
+    assert "mutating_actions" not in report
+    assert report["components"][0]["deployed"] is True
+    assert (output / "workspace/source/ready").is_file()
     assert "./install.sh" in (output / "runbook.sh").read_text()
-
+    assert "test -f ready" in (output / "runbook.sh").read_text()
+    assert "INCOMPLETE" not in (output / "runbook.sh").read_text()
     events = [json.loads(line) for line in (output / "events.jsonl").read_text().splitlines()]
-    started = next(event for event in events if event["event"] == "action_started")
-    action = next(event for event in events if event["event"] == "action_finished")
-    assert action["result"]["status"] == "validated"
-    assert action["result"]["after"][0]["status"] == "satisfied"
-    assert started["sequence"] < action["sequence"]
-    assert any(
-        event["event"] == "checkpoint" and event["sequence"] > action["sequence"]
-        for event in events
-    )
+    assert [event["event"] for event in events].count("overview_created") == 0
+    assert [event["event"] for event in events].count("note_recorded") == 6
+    assert "Run source/install.sh" in (output / "run_notes.md").read_text()
+    assert "do-not-log" not in (output / "events.jsonl").read_text()
+    assert "do-not-log" not in (output / "run_notes.md").read_text()
+    assert not (output / "overview.md").exists()
 
 
-def test_preview_does_not_run_a_source_installer(tmp_path: Path) -> None:
-    source = tmp_path / "source"
-    source.mkdir()
-    (source / "install.sh").write_text("#!/bin/sh\ntouch ready\n")
-    (source / "install.sh").chmod(0o755)
-    task = tmp_path / "task.yaml"
-    output = tmp_path / "preview"
-    _task(task, source, output)
-
-    def decide(_state, _observation, _last_result, _sources, _cycle):
-        return _decision(
-            "ACT",
-            "execute",
-            command=["./install.sh"],
-            working_directory="repository-1",
-            evidence=["repository-1:install.sh:1-2 — cited installer"],
-            expected_change="ready file exists",
-            validation=[
-                {
-                    "command": ["ls", str(output / "workspace/repository-1/ready")],
-                    "unsatisfied_exit_codes": [2],
-                }
-            ],
-        ), {}
-
-    report = run_deployment_agent(task, output, decide=decide)
-    assert report["status"] == "BLOCKED"
-    assert not (output / "workspace").exists()
-
-
-def test_failed_action_reaches_next_decision(tmp_path: Path) -> None:
+def test_runbook_replays_a_recorded_repair_from_clean_sources(tmp_path: Path) -> None:
     source = tmp_path / "source"
     source.mkdir()
     (source / "install.sh").write_text("#!/bin/sh\nexit 1\n")
     (source / "install.sh").chmod(0o755)
     task = tmp_path / "task.yaml"
-    output = tmp_path / "failed"
-    _task(task, source, output)
-    calls = []
+    output = tmp_path / "run"
+    _task(task, source, max_cycles=6, invariants={"ready": "The installed application is ready"})
+    evidence: list[int] = []
 
-    def decide(_state, _observation, last_result, _sources, _cycle):
-        calls.append(last_result)
-        if len(calls) == 1:
+    def decide(payload, iteration):
+        if iteration == 1:
             return _decision(
-                "ACT",
-                "execute",
+                "shell", "try the installer", command=["./install.sh"], working_directory="source"
+            ), {}
+        if iteration == 2:
+            assert payload["recent_history"][-1]["result"]["execution"]["exit_code"] == 1
+            return _decision(
+                "shell",
+                "repair the installer",
+                command=["sed", "-i", "s/exit 1/touch ready/", "install.sh"],
+                working_directory="source",
+            ), {}
+        if iteration == 3:
+            evidence.append(payload["recent_history"][-1]["result"]["event_sequence"])
+            return _decision(
+                "shell",
+                "install after repair",
                 command=["./install.sh"],
-                working_directory="repository-1:.",
-                evidence=["repository-1:install.sh"],
-                expected_change="ready file exists",
-                validation=[
-                    {
-                        "command": ["ls", str(output / "workspace/repository-1/ready")],
-                        "unsatisfied_exit_codes": [2],
-                    }
+                working_directory="source",
+            ), {}
+        if iteration == 4:
+            evidence.append(payload["recent_history"][-1]["result"]["event_sequence"])
+            return _decision(
+                "shell",
+                "verify installation",
+                command=["test", "-f", "ready"],
+                working_directory="source",
+            ), {}
+        if iteration == 5:
+            evidence.append(payload["recent_history"][-1]["result"]["event_sequence"])
+            return _decision(
+                "record",
+                "application is ready",
+                component="application",
+                deployed=True,
+                evidence_events=evidence,
+                verification_events=[evidence[-1]],
+                notes=[
+                    RunNote(
+                        key="invariant-ready",
+                        text="The installed application is ready",
+                        evidence_events=[evidence[-1]],
+                    )
                 ],
             ), {}
-        return _decision("BLOCKED", reason="installer failed"), {}
+        return _decision("finish", "deployment complete"), {}
 
-    report = run_deployment_agent(task, output, execute=True, approve=True, decide=decide)
-    assert report["status"] == "BLOCKED"
-    assert calls[1]["status"] == "command_failed"
-    assert calls[1]["execution"]["exit_code"] == 1
+    report = run_deployment_agent(task, output, execute=True, decide=decide)
+    assert report["status"] == "SUCCESS"
+    runbook = (output / "runbook.sh").read_text()
+    assert runbook.index("sed -i") < runbook.index("./install.sh") < runbook.index("test -f ready")
+    assert "INCOMPLETE" not in runbook
+    assert str(output) not in runbook
+
+    replay = tmp_path / "replay"
+    (replay / "workspace").mkdir(parents=True)
+    shutil.copytree(source, replay / "workspace/source")
+    shutil.copy2(output / "runbook.sh", replay / "runbook.sh")
+    result = subprocess.run(["sh", str(replay / "runbook.sh")], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    assert (replay / "workspace/source/ready").is_file()
 
 
-def test_invalid_action_directory_becomes_latest_feedback(tmp_path: Path) -> None:
+def test_agent_resumes_from_notes_and_recent_history(tmp_path: Path) -> None:
     source = tmp_path / "source"
     source.mkdir()
     (source / "install.sh").write_text("#!/bin/sh\ntouch ready\n")
+    (source / "install.sh").chmod(0o755)
     task = tmp_path / "task.yaml"
-    output = tmp_path / "invalid-directory"
-    _task(task, source, output)
-    calls = 0
+    output = tmp_path / "run"
+    _task(task, source, max_cycles=1)
 
-    def decide(_state, _observation, latest_feedback, _sources, _cycle):
-        nonlocal calls
-        calls += 1
-        if calls == 1:
+    first = run_deployment_agent(
+        task,
+        output,
+        execute=True,
+        decide=lambda _payload, _iteration: (
+            _decision(
+                "shell",
+                "install sample",
+                command=["./install.sh"],
+                working_directory="source",
+                notes=[
+                    RunNote(key="install-route", text="Use source/install.sh"),
+                    RunNote(key="current-step", text="Verify sample"),
+                    RunNote(key="progress-summary", text="Installer ran; verification remains."),
+                ],
+            ),
+            {},
+        ),
+    )
+    assert first["status"] == "BUDGET_EXHAUSTED"
+
+    _task(task, source, max_cycles=4)
+    evidence: list[int] = []
+
+    def resume(payload, iteration):
+        assert payload["current_step"] == "Verify sample"
+        assert payload["progress_summary"] == "Installer ran; verification remains."
+        assert payload["run_notes"]["index"] == {"install-route": "Use source/install.sh"}
+        if iteration == 2:
+            assert "latest_feedback" not in payload
+            evidence.append(payload["recent_history"][-1]["result"]["event_sequence"])
             return _decision(
-                "ACT",
-                "execute",
-                command=["./install.sh"],
-                working_directory=str(source),
-                evidence=["repository-1:install.sh"],
-                expected_change="ready file exists",
-                validation=[{"command": ["test", "-f", "ready"]}],
+                "shell",
+                "verify sample",
+                command=["test", "-f", "ready"],
+                working_directory="source",
             ), {}
-        assert latest_feedback == {
-            "status": "needs_revision",
-            "reason": "working_directory must be source-id:relative/directory",
-            "repeated_action_count": 0,
-            "step_id": None,
-        }
-        return _decision("BLOCKED", reason="revise the working directory"), {}
+        if iteration == 3:
+            evidence.append(payload["recent_history"][-1]["result"]["event_sequence"])
+            return _decision(
+                "record",
+                "sample is deployed",
+                component="sample",
+                deployed=True,
+                evidence_events=evidence,
+            ), {}
+        return _decision("finish", "deployment complete"), {}
+
+    report = run_deployment_agent(task, output, execute=True, resume=True, decide=resume)
 
-    report = run_deployment_agent(task, output, execute=True, approve=True, decide=decide)
-
-    assert report["status"] == "BLOCKED"
-
-
-def test_three_incomplete_actions_stop_the_agent(tmp_path: Path) -> None:
-    source = tmp_path / "source"
-    source.mkdir()
-    (source / "README.md").write_text("Run the installer.\n")
-    task = tmp_path / "task.yaml"
-    output = tmp_path / "incomplete"
-    _task(task, source, output)
-    calls = []
-
-    def decide(_state, _observation, last_result, _sources, _cycle):
-        calls.append(last_result)
-        return _decision(
-            "ACT",
-            "execute",
-            command=["touch", "ready"],
-            evidence=["repository-1:README.md"],
-            expected_change="ready file exists",
-        ), {}
-
-    report = run_deployment_agent(task, output, execute=True, approve=True, decide=decide)
-    assert report["status"] == "BLOCKED"
-    assert "same action produced no progress three times" in report["reason"]
-    assert calls[1]["status"] == "needs_revision"
-    assert calls[1]["repeated_action_count"] == 0
-    assert len(calls) == 3
-
-
-def test_route_choice_and_repeated_read_reach_next_decision(tmp_path: Path) -> None:
-    source = tmp_path / "source"
-    source.mkdir()
-    (source / "README.md").write_text("Use ./install.sh for this target.\n")
-    task = tmp_path / "task.yaml"
-    _task(task, source, tmp_path / "run")
-    seen = []
-    decisions = iter(
-        [
-            _decision("ACT", "read_file", source_path="repository-1:README.md"),
-            _decision(
-                "ACT",
-                "read_file",
-                source_path="repository-1:README.md",
-                selected_route="Use ./install.sh for this target",
-                evidence=["repository-1:README.md"],
-            ),
-            _decision("BLOCKED", reason="prerequisite is missing"),
-        ]
-    )
-
-    def decide(state, _observation, last_result, _sources, _cycle):
-        seen.append((state.copy(), last_result.copy()))
-        return next(decisions), {}
-
-    report = run_deployment_agent(task, tmp_path / "run", decide=decide)
-    assert report["status"] == "BLOCKED"
-    assert seen[2][0]["selected_route"] == {
-        "choice": "Use ./install.sh for this target",
-        "evidence": ["repository-1:README.md"],
-    }
-    assert seen[2][1]["text"] == seen[1][1]["text"]
-    assert seen[2][1]["memory_hit"] is True
-    assert seen[2][1]["repeated_action_count"] == 1
-
-
-def test_agent_waits_for_referenced_secret_and_resumes_same_run(
-    tmp_path: Path, monkeypatch
-) -> None:
-    source = tmp_path / "source"
-    source.mkdir()
-    (source / "README.md").write_text("Deploy the sample.\n")
-    task = tmp_path / "task.yaml"
-    output = tmp_path / "run"
-    _task(task, source, output)
-    document = yaml.safe_load(task.read_text())
-    document["inputs"] = {"service_token": {"from_env": "SAMPLE_SERVICE_TOKEN", "sensitive": True}}
-    task.write_text(yaml.safe_dump(document))
-    monkeypatch.delenv("SAMPLE_SERVICE_TOKEN", raising=False)
-
-    def wait(_state, _observation, _last_result, _sources, _cycle):
-        return _decision(
-            "WAITING_FOR_INPUT",
-            reason="service token is required",
-            required_inputs=[
-                {
-                    "name": "service_token",
-                    "prompt": "Service token",
-                    "sensitive": True,
-                }
-            ],
-        ), {}
-
-    first = run_deployment_agent(task, output, decide=wait)
-    assert first["status"] == "WAITING_FOR_INPUT"
-    request = yaml.safe_load((output / "human-request.yaml").read_text())
-    assert request["required_inputs"]["service_token"]["available"] is False
-    assert request["required_inputs"]["service_token"]["prompt"] == "Service token"
-    assert request["required_inputs"]["service_token"]["sensitive"] is True
-    assert "SAMPLE_SERVICE_TOKEN" not in (output / "human-request.yaml").read_text() or (
-        request["required_inputs"]["service_token"]["source"] == "env:SAMPLE_SERVICE_TOKEN"
-    )
-
-    monkeypatch.setenv("SAMPLE_SERVICE_TOKEN", "not-written-to-artifacts")
-
-    def stop(state, _observation, _last_result, _sources, _cycle):
-        assert state["inputs"]["service_token"]["available"] is True
-        assert "not-written-to-artifacts" not in json.dumps(state)
-        return _decision("BLOCKED", reason="resume verified"), {}
-
-    second = run_deployment_agent(task, output, resume=True, decide=stop)
-    assert second["reason"] == "resume verified"
-
-
-def test_resume_uses_current_task_constraints(tmp_path: Path) -> None:
-    source = tmp_path / "source"
-    source.mkdir()
-    (source / "README.md").write_text("Deploy the sample.\n")
-    task = tmp_path / "task.yaml"
-    output = tmp_path / "run"
-    _task(task, source, output)
-
-    def stop(state, _observation, _last_result, _sources, _cycle):
-        assert state["constraints"]["allow_destructive_actions"] is False
-        return _decision("BLOCKED", reason="approval required"), {}
-
-    run_deployment_agent(task, output, decide=stop)
-    document = yaml.safe_load(task.read_text())
-    document["constraints"] = {"allow_destructive_actions": True}
-    task.write_text(yaml.safe_dump(document))
-
-    def resume(state, _observation, _last_result, _sources, _cycle):
-        assert state["constraints"]["allow_destructive_actions"] is True
-        return _decision("BLOCKED", reason="updated constraints loaded"), {}
-
-    report = run_deployment_agent(task, output, resume=True, decide=resume)
-    assert report["reason"] == "updated constraints loaded"
-
-
-def test_agent_collects_and_persists_interactive_configuration(
-    tmp_path: Path, monkeypatch
-) -> None:
-    source = tmp_path / "source"
-    source.mkdir()
-    (source / "README.md").write_text("Deploy the sample.\n")
-    task = tmp_path / "task.yaml"
-    output = tmp_path / "run"
-    _task(task, source, output)
-
-    class Terminal(io.StringIO):
-        def isatty(self):
-            return True
-
-    monkeypatch.setattr("pheragent.deployment.agent.sys.stdin", Terminal("iam.example.org\n"))
-    decisions = iter(
-        [
-            _decision(
-                "WAITING_FOR_INPUT",
-                reason="IAM hostname is required",
-                required_inputs=[
-                    {
-                        "name": "iam_hostname",
-                        "prompt": "IAM hostname",
-                        "sensitive": False,
-                    }
-                ],
-            ),
-            _decision("BLOCKED", reason="input received"),
-        ]
-    )
-
-    def decide(state, _observation, _last_result, _sources, _cycle):
-        decision = next(decisions)
-        if decision.kind == "BLOCKED":
-            assert state["inputs"]["iam_hostname"]["value"] == "iam.example.org"
-        return decision, {}
-
-    report = run_deployment_agent(task, output, decide=decide)
-    effective_task = json.loads((output / "task.json").read_text())
-    assert report["reason"] == "input received"
-    assert effective_task["inputs"]["iam_hostname"]["value"] == "iam.example.org"
-
-
-def test_agent_hides_and_never_persists_interactive_secrets(
-    tmp_path: Path, monkeypatch
-) -> None:
-    source = tmp_path / "source"
-    source.mkdir()
-    (source / "README.md").write_text("Deploy the sample.\n")
-    task = tmp_path / "task.yaml"
-    output = tmp_path / "run"
-    _task(task, source, output)
-    secret = "not-written-anywhere"
-
-    class Terminal(io.StringIO):
-        def isatty(self):
-            return True
-
-    monkeypatch.delenv("IAM_ADMIN_PASSWORD", raising=False)
-    monkeypatch.setattr("pheragent.deployment.agent.sys.stdin", Terminal())
-    monkeypatch.setattr("pheragent.deployment.interaction.getpass", lambda _prompt: secret)
-    decisions = iter(
-        [
-            _decision(
-                "WAITING_FOR_INPUT",
-                reason="IAM password is required",
-                required_inputs=[
-                    {
-                        "name": "IAM_ADMIN_PASSWORD",
-                        "prompt": "IAM administrator password",
-                        "sensitive": True,
-                    }
-                ],
-            ),
-            _decision("BLOCKED", reason="secret received"),
-        ]
-    )
-
-    def decide(state, _observation, _last_result, _sources, _cycle):
-        decision = next(decisions)
-        if decision.kind == "BLOCKED":
-            assert state["inputs"]["IAM_ADMIN_PASSWORD"]["available"] is True
-            assert "value" not in state["inputs"]["IAM_ADMIN_PASSWORD"]
-        return decision, {}
-
-    report = run_deployment_agent(task, output, decide=decide)
-    artifacts = "\n".join(
-        path.read_text(errors="replace") for path in output.rglob("*") if path.is_file()
-    )
-    effective_task = json.loads((output / "task.json").read_text())
-    assert report["reason"] == "secret received"
-    assert os.environ["IAM_ADMIN_PASSWORD"] == secret
-    assert secret not in artifacts
-    assert effective_task["inputs"]["IAM_ADMIN_PASSWORD"] == {
-        "from_env": "IAM_ADMIN_PASSWORD",
-        "sensitive": True,
-    }
-
-
-def test_agent_requests_approval_for_a_linked_source(tmp_path: Path) -> None:
-    source = tmp_path / "source"
-    source.mkdir()
-    (source / "README.md").write_text(
-        "Continue with https://github.com/example/deployment-infra.\n"
-    )
-    task = tmp_path / "task.yaml"
-    output = tmp_path / "run"
-    _task(task, source, output)
-
-    def decide(_state, _observation, _last_result, _sources, _cycle):
-        return _decision(
-            "ACT",
-            "add_source",
-            source={"location": "https://github.com/example/deployment-infra"},
-            evidence=["the model did not reproduce an exact source reference"],
-            reason="the active deployment guide delegates infrastructure setup",
-        ), {}
-
-    report = run_deployment_agent(task, output, decide=decide)
-    request = yaml.safe_load((output / "human-request.yaml").read_text())
-    assert report["status"] == "WAITING_FOR_INPUT"
-    assert request["kind"] == "source_approval"
-    assert request["source"]["location"] == "https://github.com/example/deployment-infra"
-    assert request["evidence"] == ["repository-1:README.md"]
-
-
-def test_agent_acquires_an_approved_linked_source(tmp_path: Path, monkeypatch) -> None:
-    source = tmp_path / "source"
-    source.mkdir()
-    (source / "README.md").write_text(
-        "Continue with https://github.com/example/deployment-infra.\n"
-    )
-    linked = tmp_path / "linked"
-    linked.mkdir()
-    (linked / "README.md").write_text("Infrastructure instructions.\n")
-    task = tmp_path / "task.yaml"
-    output = tmp_path / "run"
-    _task(task, source, output)
-    acquire = SourceManager.acquire
-
-    def acquire_locally(manager, config):
-        if len(config.sources) == 1:
-            return acquire(manager, config)
-        replacement = config.sources[-1].model_copy(
-            update={"kind": SourceKind.LOCAL_DIRECTORY, "location": str(linked)}
-        )
-        return acquire(
-            manager,
-            SourcesConfig(system=config.system, sources=[*config.sources[:-1], replacement]),
-        )
-
-    monkeypatch.setattr(SourceManager, "acquire", acquire_locally)
-    decisions = iter(
-        [
-            _decision(
-                "ACT",
-                "add_source",
-                source={"location": "https://github.com/example/deployment-infra"},
-                evidence=["repository-1:README.md"],
-            ),
-            _decision("BLOCKED", reason="source was available for the next decision"),
-        ]
-    )
-
-    def decide(_state, _observation, _last_result, sources, _cycle):
-        decision = next(decisions)
-        if decision.kind == "BLOCKED":
-            assert "repository-2:README.md" in sources.readable_paths
-        return decision, {}
-
-    report = run_deployment_agent(task, output, approve=True, decide=decide)
-    effective_task = json.loads((output / "task.json").read_text())
-    assert report["reason"] == "source was available for the next decision"
-    assert effective_task["sources"]["repositories"][-1]["location"] == (
-        "https://github.com/example/deployment-infra"
-    )
-    assert any(
-        json.loads(line)["event"] == "source_approved"
-        for line in (output / "events.jsonl").read_text().splitlines()
-    )
-
-
-def test_sensitive_input_cannot_be_stored_inline() -> None:
-    with pytest.raises(ValueError, match="sensitive inputs cannot be stored inline"):
-        DeploymentTask.model_validate(
-            {
-                "task": {"objective": "sample"},
-                "sources": {"repositories": ["/tmp/sample"]},
-                "environment": {"type": "shell"},
-                "inputs": {"token": {"value": "secret", "sensitive": True}},
-            }
-        )
-
-
-def test_agent_prompt_requires_route_choice_and_deployment_progress() -> None:
-    assert "senior DevOps engineer" in _INNER_LOOP_INSTRUCTIONS
-    assert "active_step" in _INNER_LOOP_INSTRUCTIONS
-    assert "authoritative ordered record" in _INNER_LOOP_INSTRUCTIONS
-    assert "verified step as complete" in _INNER_LOOP_INSTRUCTIONS
-    prompt = " ".join(_INNER_LOOP_INSTRUCTIONS.split()).casefold()
-    assert "use event history before reading a file again" in prompt
-    assert "never ask for a completed generated file" in prompt
-    assert "use from_file" in prompt
-    assert "private chain-of-thought" in _INNER_LOOP_INSTRUCTIONS
-
-
-def test_agent_prompt_expands_missing_prerequisites_before_blocking() -> None:
-    assert "missing prerequisite" in _INNER_LOOP_INSTRUCTIONS
-    assert "source-supported" in _INNER_LOOP_INSTRUCTIONS
-    assert "return to the original" in " ".join(_INNER_LOOP_INSTRUCTIONS.split())
-    assert "validation" in _INNER_LOOP_INSTRUCTIONS
-
-
-def test_agent_prompt_requires_source_defined_validation_semantics() -> None:
-    assert "zero exit code does not prove success" in " ".join(
-        _INNER_LOOP_INSTRUCTIONS.split()
-    ).casefold()
-    assert "do not retry without new evidence" in " ".join(
-        _INNER_LOOP_INSTRUCTIONS.split()
-    ).casefold()
-
-
-def test_done_advances_only_matching_step_from_successful_evidence() -> None:
-    def overview() -> DeploymentOverview:
-        return DeploymentOverview.model_validate(
-            {
-                "route": "documented route",
-                "route_evidence": ["repository-1:README.md"],
-                "stages": [
-                    {
-                        "id": "deploy",
-                        "kind": "deploy",
-                        "goal": "deploy the system",
-                        "steps": [
-                            {
-                                "id": "infrastructure",
-                                "goal": "prepare infrastructure",
-                                "success_condition": "infrastructure is ready",
-                                "source_refs": ["repository-1:README.md"],
-                                "status": "active",
-                            },
-                            {
-                                "id": "application",
-                                "goal": "deploy application",
-                                "success_condition": "application is ready",
-                                "source_refs": ["repository-1:README.md"],
-                            },
-                        ],
-                    }
-                ],
-            }
-        )
-
-    decision = _decision(
-        "DONE",
-        step_id="infrastructure",
-        completes_step=True,
-    )
-    deployment = overview()
-    result = {"exit_code": 0, "step_id": "infrastructure"}
-
-    assert advance_verified_step(deployment, decision, result)
-    assert active_step(deployment).id == "application"
-    assert result["overview_step_verified"] == "infrastructure"
-    assert not advance_verified_step(
-        overview(),
-        decision.model_copy(update={"step_id": "wrong-step"}),
-        result,
-    )
-    assert not advance_verified_step(
-        overview(),
-        decision,
-        {"exit_code": 1, "step_id": "infrastructure"},
-    )
-
-
-def test_step_result_is_binary_and_keeps_the_exact_failure_reason() -> None:
-    deployment = DeploymentOverview.model_validate(
-        {
-            "route": "documented route",
-            "route_evidence": ["repository-1:README.md"],
-            "stages": [
-                {
-                    "id": "deploy",
-                    "kind": "deploy",
-                    "goal": "deploy",
-                    "steps": [
-                        {
-                            "id": "database",
-                            "goal": "deploy database",
-                            "success_condition": "database is ready",
-                            "components": ["PostgreSQL"],
-                            "source_refs": ["repository-1:README.md"],
-                        }
-                    ],
-                }
-            ],
-        }
-    )
-    state = {"components": {}}
-
-    record_step_result(
-        state,
-        active_step(deployment),
-        deployed=False,
-        reason="storage class is absent",
-    )
-
-    assert state["components"] == {
-        "PostgreSQL": {"deployed": False, "reason": "storage class is absent"}
-    }
-
-
-def test_agent_validates_prerequisite_then_resumes_original_goal(tmp_path: Path) -> None:
-    source = tmp_path / "source"
-    source.mkdir()
-    for name, output_name in (("storage.sh", "storage-ready"), ("install.sh", "ready")):
-        script = source / name
-        script.write_text(f"#!/bin/sh\ntouch {output_name}\n")
-        script.chmod(0o755)
-    task = tmp_path / "task.yaml"
-    output = tmp_path / "run"
-    _task(task, source, output)
-    decisions = iter(
-        [
-            _decision(
-                "ACT",
-                "execute",
-                command=["./storage.sh"],
-                working_directory="repository-1:.",
-                evidence=["repository-1:storage.sh"],
-                expected_change="storage ready",
-                    add_gaps=["storage missing"],
-                    validation=[
-                        {
-                            "command": [
-                                "ls",
-                                str(output / "workspace/repository-1/storage-ready"),
-                            ],
-                            "unsatisfied_exit_codes": [2],
-                        }
-                    ],
-            ),
-            _decision(
-                "ACT",
-                "execute",
-                command=["./install.sh"],
-                working_directory="repository-1:.",
-                evidence=["repository-1:install.sh"],
-                    expected_change="application ready",
-                    resolve_gaps=["storage missing"],
-                    validation=[
-                        {
-                            "command": ["ls", str(output / "workspace/repository-1/ready")],
-                            "unsatisfied_exit_codes": [2],
-                        }
-                    ],
-            ),
-            _decision("DONE"),
-        ]
-    )
-    gaps = []
-
-    def decide(state, _observation, _last_result, _sources, _cycle):
-        gaps.append(state["gaps"].copy())
-        return next(decisions), {}
-
-    report = run_deployment_agent(task, output, execute=True, approve=True, decide=decide)
     assert report["status"] == "SUCCESS"
-    assert report["mutating_actions"] == 2
-    assert gaps[1] == ["storage missing"]
-    assert report["state"]["gaps"] == []
-    assert report["state"]["goal_stack"] == []
+    assert report["cycles"] == 4
+    assert len((output / "events.jsonl").read_text().splitlines()) > 1
 
 
-def test_brief_retains_a_long_result_start_and_end() -> None:
-    result = "Default route is in this header.\n" + "x" * 7000 + "\nLast error is here."
-    brief = compact_context(result)
-    assert "Default route" in brief
-    assert "Last error" in brief
-    assert len(brief) < len(result)
+def test_repeat_detection_uses_command_result_not_reason(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    task = tmp_path / "task.yaml"
+    output = tmp_path / "run"
+    _task(task, source, max_cycles=4)
+    seen_repeat_limit = False
+
+    def decide(payload, iteration):
+        nonlocal seen_repeat_limit
+        if iteration == 4:
+            seen_repeat_limit = "repeat_limit" in payload["recent_history"][-1]["result"]
+            return _decision("finish", "no deployment outcome was found"), {}
+        return _decision(
+            "shell",
+            f"wording {iteration}",
+            command=["test", "-f", "missing"],
+            working_directory="source",
+        ), {}
+
+    run_deployment_agent(task, output, execute=True, decide=decide)
+    assert seen_repeat_limit
 
 
-def test_brief_keeps_a_complete_selected_file_intact() -> None:
-    text = "header\n" + "deployment step\n" * 600 + "make start\n"
-    brief = compact_context({"complete": True, "text": text, "total_lines": 602})
-    assert brief["text"] == text
-
-
-def test_policy_denies_direct_and_disguised_destructive_commands() -> None:
-    task = DeploymentTask.model_validate(
-        {
-            "task": {"objective": "sample"},
-            "sources": {"repositories": ["/tmp/sample"]},
-            "environment": {"type": "shell", "sandbox": True},
-        }
-    )
-    assert classify_command(["/bin/rm", "-rf", "/tmp/sample"], task, mutating=True).startswith(
-        "denied"
-    )
-    assert classify_command(
-        ["bash", "-c", "rm -rf /tmp/sample"], task, mutating=True
-    ).startswith("denied")
-
-
-def test_kubernetes_actions_use_the_declared_context() -> None:
-    task = DeploymentTask.model_validate(
-        {
-            "task": {"objective": "sample"},
-            "sources": {"repositories": ["/tmp/sample"]},
-            "environment": {"type": "kubernetes", "context": "target-cluster"},
-            "constraints": {"allowed_namespaces": ["*"]},
-        }
-    )
-    assert target_command(["kubectl", "get", "pods"], task) == [
-        "kubectl",
-        "--context",
-        "target-cluster",
-        "get",
-        "pods",
-    ]
-    with pytest.raises(ValueError, match="must match the declared target context"):
-        target_command(["kubectl", "--context", "other", "get", "pods"], task)
-
-
-def test_matching_context_storage_check_is_read_only() -> None:
-    task = DeploymentTask.model_validate(
-        {
-            "task": {"objective": "sample"},
-            "sources": {"repositories": ["/tmp/sample"]},
-            "environment": {"type": "kubernetes", "context": "test-cluster"},
-        }
-    )
-    command = ["kubectl", "--context", "test-cluster", "get", "storageclass"]
-    assert classify_command(command, task, mutating=False) == "allowed"
-    assert target_command(command, task) == command
-
-
-def test_kubernetes_global_options_do_not_hide_a_read_only_verb() -> None:
-    task = DeploymentTask.model_validate(
-        {
-            "task": {"objective": "sample"},
-            "sources": {"repositories": ["/tmp/sample"]},
-            "environment": {"type": "kubernetes", "context": "test-cluster"},
-        }
-    )
-    command = [
-        "kubectl",
-        "-n",
-        "istio-system",
-        "get",
-        "deployment/istio-ingressgateway",
-        "service/istio-ingressgateway",
-        "-o",
-        "wide",
-    ]
-    assert classify_command(command, task, mutating=False) == "allowed"
-
-
-@pytest.mark.parametrize(
-    "command",
-    [
-        ["helm", "repo", "list"],
-        ["helm", "search", "repo", "postgresql"],
-        ["helm", "history", "postgres"],
-        ["helm", "lint", "chart"],
-        ["helm", "template", "demo", "chart"],
-        ["kubectl", "auth", "can-i", "get", "pods"],
-        ["kubectl", "config", "current-context"],
-        ["kubectl", "explain", "deployments"],
-        ["kubectl", "events", "-A"],
-        ["aws", "sts", "get-caller-identity"],
-        ["aws", "ec2", "describe-instances"],
-        ["aws", "eks", "describe-cluster", "--name", "example"],
-        ["ansible", "--version"],
-        ["ansible-playbook", "--syntax-check", "site.yaml"],
-        ["bash", "-n", "install.sh"],
-        ["git", "diff", "--stat"],
-        ["grep", "-Fx", "  host: iam.example.org", "values.yaml"],
-        ["stat", "install.sh"],
-        ["docker", "ps", "--all"],
-        ["docker", "images"],
-        ["docker", "image", "ls"],
-        ["docker", "inspect", "demo"],
-        ["docker", "events", "--until", "1s"],
-        ["docker", "logs", "demo"],
-        ["docker", "compose", "version"],
-        ["docker", "compose", "ps", "--all"],
-        ["docker", "compose", "-f", "compose.yaml", "ps", "--all"],
-        ["docker", "compose", "--env-file", ".env", "-f", "compose.yaml", "ps"],
-        ["docker", "compose", "ls"],
+def test_agent_can_enter_a_directory_created_in_its_workspace(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    task = tmp_path / "task.yaml"
+    output = tmp_path / "run"
+    _task(task, source, max_cycles=5)
+    decisions = iter(
         [
-            "docker",
-            "compose",
-            "--env-file",
-            ".env",
-            "-f",
-            "compose.yaml",
-            "config",
-            "--quiet",
-        ],
-        ["lsblk"],
-        ["lscpu"],
-        ["whoami"],
-    ],
-)
-def test_supported_read_only_probes(command: list[str]) -> None:
+            _decision(
+                "shell",
+                "create generated workspace",
+                command=["mkdir", "generated"],
+                working_directory="source",
+            ),
+            _decision(
+                "shell",
+                "inspect generated workspace",
+                command=["pwd"],
+                working_directory="source/generated",
+            ),
+            _decision("finish", "workspace behavior verified"),
+        ]
+    )
+
+    report = run_deployment_agent(
+        task,
+        output,
+        execute=True,
+        decide=lambda _payload, _iteration: (next(decisions), {}),
+    )
+
+    assert report["latest_feedback"]["status"] == "succeeded"
+    assert report["latest_feedback"]["execution"]["stdout"].rstrip().endswith("generated")
+
+
+def test_command_without_working_directory_runs_at_workspace_root(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    task = tmp_path / "task.yaml"
+    output = tmp_path / "run"
+    _task(task, source, max_cycles=4)
+    decisions = iter(
+        [
+            _decision("shell", "inspect the workspace", command=["pwd"]),
+            _decision("finish", "workspace inspected"),
+        ]
+    )
+
+    report = run_deployment_agent(
+        task,
+        output,
+        execute=True,
+        decide=lambda _payload, _iteration: (next(decisions), {}),
+    )
+
+    assert report["latest_feedback"]["execution"]["stdout"].strip() == str(
+        (output / "workspace").resolve()
+    )
+
+
+def test_only_boundary_crossing_commands_need_approval() -> None:
     task = DeploymentTask.model_validate(
         {
-            "task": {"objective": "sample"},
-            "sources": {"repositories": ["/tmp/sample"]},
-            "environment": {"type": "kubernetes", "context": "target-cluster"},
-        }
-    )
-    assert classify_command(command, task, mutating=False) == "allowed"
-
-
-@pytest.mark.parametrize(
-    "command",
-    [
-        ["helm", "repo", "update"],
-        ["kubectl", "config", "use-context", "other-cluster"],
-        ["aws", "ec2", "start-instances", "--instance-ids", "i-example"],
-        ["aws", "ec2", "describe-instances", "--profile", "other-account"],
-        ["aws", "ec2", "describe-instances", "--endpoint-url", "https://example.invalid"],
-        ["ansible-playbook", "--syntax-check", "--flush-cache", "site.yaml"],
-        ["ansible-playbook", "site.yaml"],
-        ["bash", "-n", "-i", "install.sh"],
-        ["bash", "install.sh"],
-        ["docker", "compose", "config"],
-        ["docker", "compose", "up", "-d"],
-        ["docker", "compose", "-f", "compose.yaml", "up", "-d"],
-        ["docker", "events"],
-    ],
-)
-def test_commands_not_known_to_be_read_only_require_review(command: list[str]) -> None:
-    task = DeploymentTask.model_validate(
-        {
-            "task": {"objective": "sample"},
-            "sources": {"repositories": ["/tmp/sample"]},
-            "environment": {"type": "kubernetes", "context": "target-cluster"},
-        }
-    )
-    assert classify_command(command, task, mutating=False).startswith(
-        ("approval_required", "high_risk_approval", "denied")
-    )
-    if command[0] == "aws":
-        assert classify_command(command, task, mutating=True).startswith("denied")
-
-
-def test_policy_allows_direct_mutations_but_reviews_opaque_commands() -> None:
-    task = DeploymentTask.model_validate(
-        {
-            "task": {"objective": "sample"},
-            "sources": {"repositories": ["/tmp/sample"]},
+            "task": {"objective": "Deploy a system"},
+            "sources": {"repositories": ["."]},
             "environment": {"type": "shell"},
         }
     )
-    assert classify_command(["projectctl", "deploy"], task, mutating=True) == "allowed"
-    assert classify_command(["make", "start"], task, mutating=True).startswith(
-        "approval_required"
+
+    assert classify_command(["make", "start"], task) == "allowed"
+    assert classify_command(["python3", "-c", "print('ok')"], task) == "allowed"
+    assert classify_command(["sed", "-n", "1,120p", "README.md"], task) == "allowed"
+    assert classify_command(["aws", "sts", "get-caller-identity"], task) == "allowed"
+    assert classify_command(["rm", "-rf", "data"], task).startswith("high_risk_approval")
+    assert classify_command(["kubectl", "create", "ingress", "web"], task).startswith(
+        "high_risk_approval"
+    )
+    assert classify_command(["sudo", "apt-get", "install", "curl"], task).startswith(
+        "high_risk_approval"
     )
 
-
-@pytest.mark.parametrize(
-    "command",
-    [
-        ["sudo", "apt-get", "install", "open-iscsi"],
-        ["kubectl", "delete", "pod", "db", "-n", "postgres"],
-        ["helm", "uninstall", "postgres", "-n", "postgres"],
-        ["terraform", "apply"],
-        ["aws", "ec2", "start-instances", "--instance-ids", "i-example"],
-    ],
-)
-def test_high_risk_changes_have_a_distinct_review_tier(command: list[str]) -> None:
-    task = DeploymentTask.model_validate(
+    kubernetes = DeploymentTask.model_validate(
         {
-            "task": {"objective": "sample"},
-            "sources": {"repositories": ["/tmp/sample"]},
-            "environment": {"type": "kubernetes", "context": "target-cluster"},
-            "constraints": {
-                "allow_new_infrastructure": True,
-                "allow_destructive_actions": True,
-                "allowed_namespaces": ["*"],
-            },
+            "task": {"objective": "Deploy a system"},
+            "sources": {"repositories": ["."]},
+            "environment": {"type": "kubernetes", "context": "test"},
+            "constraints": {"allowed_namespaces": ["application"]},
         }
     )
-    assert classify_command(command, task, mutating=True).startswith("high_risk_approval")
-
-
-def test_read_only_execute_is_observed_without_approval(tmp_path: Path, monkeypatch) -> None:
-    source = tmp_path / "source"
-    source.mkdir()
-    (source / "README.md").write_text("Sample deployment source\n")
-    task_path = tmp_path / "task.yaml"
-    task_path.write_text(
-        yaml.safe_dump(
-            {
-                "task": {"objective": "Inspect storage"},
-                "sources": {"repositories": [str(source)]},
-                "environment": {"type": "kubernetes", "context": "target-cluster"},
-            }
-        )
-    )
-    monkeypatch.setattr("pheragent.deployment.agent.observe_target", lambda _task: {})
-    observed = []
-
-    def inspect(command, _task, **_kwargs):
-        observed.append(command)
-        return {"exit_code": 0, "stdout": "No resources found", "stderr": ""}
-
-    monkeypatch.setattr("pheragent.deployment.runtime._command", inspect)
-    decisions = iter(
-        [
-            _decision(
-                "ACT",
-                "execute",
-                command=["kubectl", "--context", "target-cluster", "get", "storageclass"],
-            ),
-            _decision("BLOCKED", reason="inspection complete"),
-        ]
-    )
-
-    def decide(_state, _observation, _last_result, _sources, _cycle):
-        return next(decisions), {}
-
-    output = tmp_path / "preview"
-    report = run_deployment_agent(task_path, output, decide=decide)
-    assert report["status"] == "BLOCKED"
-    assert observed == [["kubectl", "--context", "target-cluster", "get", "storageclass"]]
-    assert report["mutating_actions"] == 0
-    assert not _execution_events(output)
-
-
-def test_observation_uses_selected_source_directory(tmp_path: Path, monkeypatch) -> None:
-    source = tmp_path / "source"
-    source.mkdir()
-    (source / "compose.yaml").write_text("services: {}\n")
-    task = tmp_path / "task.yaml"
-    output = tmp_path / "run"
-    _task(task, source, output)
-    monkeypatch.setattr("pheragent.deployment.agent.observe_target", lambda _task: {})
-    working_directories = []
-
-    def inspect(_command, _task, **kwargs):
-        working_directories.append(kwargs.get("cwd"))
-        return {"exit_code": 0, "stdout": "", "stderr": ""}
-
-    monkeypatch.setattr("pheragent.deployment.runtime._command", inspect)
-    monkeypatch.setattr(
-        SourceTools,
-        "working_directory",
-        lambda *_args: pytest.fail("read-only observations must not copy source trees"),
-    )
-    decisions = iter(
-        [
-            _decision(
-                "ACT",
-                "observe",
-                command=["docker", "compose", "-f", "compose.yaml", "ps"],
-                working_directory="repository-1:.",
-            ),
-            _decision("BLOCKED", reason="inspection complete"),
-        ]
-    )
-
-    def decide(_state, _observation, _last_result, _sources, _cycle):
-        return next(decisions), {}
-
-    report = run_deployment_agent(task, output, decide=decide)
-    assert report["status"] == "BLOCKED"
-    assert len(working_directories) == 1
-    assert working_directories[0] != output / "workspace/repository-1"
-    assert (working_directories[0] / "compose.yaml").is_file()
-    assert not (output / "workspace").exists()
-
-
-def test_generic_read_only_verb_is_allowed_without_approval(tmp_path: Path, monkeypatch) -> None:
-    task = DeploymentTask.model_validate(
-        {
-            "task": {"objective": "sample"},
-            "sources": {"repositories": ["/tmp/sample"]},
-            "environment": {"type": "shell", "sandbox": True},
-        }
-    )
-    decision = _decision(
-        "ACT",
-        "observe",
-        command=["projectctl", "inspect"],
-        reason="inspect the project without changing it",
-    )
-
-    commands = []
-    monkeypatch.setattr(
-        "pheragent.deployment.runtime._command",
-        lambda command, _task, **_kwargs: commands.append(command)
-        or {"exit_code": 0, "stdout": "ready", "stderr": ""},
-    )
-    result = inspect_target(
-        decision,
-        task,
-        object(),
-        tmp_path,
-        enabled=True,
-        approve=False,
-    )
-    assert result["exit_code"] == 0
-    assert commands == [["projectctl", "inspect"]]
-
-
-def test_reworded_denied_observations_stop_early(tmp_path: Path, monkeypatch) -> None:
-    source = tmp_path / "source"
-    source.mkdir()
-    (source / "README.md").write_text("Sample deployment source\n")
-    task = tmp_path / "task.yaml"
-    output = tmp_path / "run"
-    _task(task, source, output)
-    monkeypatch.setattr("pheragent.deployment.agent.observe_target", lambda _task: {})
-    commands = iter(
-        [
-            ["kubectl", "config", "use-context", "first"],
-            ["kubectl", "config", "use-context", "second"],
-            ["kubectl", "config", "use-context", "third"],
-        ]
-    )
-    calls = 0
-
-    def decide(_state, _observation, _last_result, _sources, _cycle):
-        nonlocal calls
-        calls += 1
-        return _decision("ACT", "observe", command=next(commands)), {}
-
-    report = run_deployment_agent(task, output, decide=decide)
-    assert report["status"] == "BLOCKED"
-    assert calls == 3
-    assert "same action produced no progress three times" in report["reason"]
-
-
-def test_policy_denial_is_returned_to_the_agent_for_revision(tmp_path: Path) -> None:
-    source = tmp_path / "source"
-    source.mkdir()
-    (source / "README.md").write_text("Run the installer.\n")
-    task = tmp_path / "task.yaml"
-    output = tmp_path / "run"
-    _task(task, source, output)
-    decisions = iter(
-        [
-            _decision(
-                "ACT",
-                "execute",
-                command=["kubectl", "config", "use-context", "other"],
-                evidence=["repository-1:README.md"],
-                expected_change="application ready",
-                validation=[{"command": ["ls", str(source / "ready")]}],
-            ),
-            _decision("BLOCKED", reason="request a supported alternative"),
-        ]
-    )
-    calls = 0
-
-    def decide(_state, _observation, last_result, _sources, _cycle):
-        nonlocal calls
-        if calls:
-            assert last_result["status"] == "policy_denied"
-            assert "context changes" in last_result["reason"]
-        calls += 1
-        return next(decisions), {}
-
-    report = run_deployment_agent(task, output, execute=True, decide=decide)
-    assert report["status"] == "BLOCKED"
-    assert report["reason"] == "request a supported alternative"
-    assert calls == 2
-
-
-def test_unavailable_stdin_reference_is_returned_for_revision(tmp_path: Path) -> None:
-    source = tmp_path / "source"
-    source.mkdir()
-    (source / "README.md").write_text("Run the installer.\n")
-    task = tmp_path / "task.yaml"
-    output = tmp_path / "run"
-    _task(task, source, output)
-    decisions = iter(
-        [
-            _decision(
-                "ACT",
-                "execute",
-                command=["./install.sh"],
-                stdin_input="INSTALL_CONFIRMATION",
-                evidence=["repository-1:README.md"],
-                expected_change="application ready",
-                validation=[{"command": ["ls", str(source / "ready")]}],
-            ),
-            _decision("BLOCKED", reason="ask for the missing input"),
-        ]
-    )
-    calls = 0
-
-    def decide(_state, _observation, last_result, _sources, _cycle):
-        nonlocal calls
-        if calls:
-            assert last_result["status"] == "needs_revision"
-            assert "structured required_inputs" in last_result["reason"]
-        calls += 1
-        return next(decisions), {}
-
-    report = run_deployment_agent(task, output, execute=True, decide=decide)
-    assert report["reason"] == "ask for the missing input"
-    assert calls == 2
-
-
-def test_unfamiliar_mutation_requires_review_and_wrong_context_is_denied() -> None:
-    task = DeploymentTask.model_validate(
-        {
-            "task": {"objective": "sample"},
-            "sources": {"repositories": ["/tmp/sample"]},
-            "environment": {"type": "kubernetes", "context": "target-cluster"},
-            "constraints": {"allowed_namespaces": ["postgres"]},
-        }
-    )
-    assert (
-        classify_command(
-            ["kubectl", "label", "pod", "db", "tested=yes", "-n", "postgres"], task, mutating=True
-        )
-        == "allowed"
-    )
-    assert classify_command(
-        ["kubectl", "--context", "other-cluster", "get", "pods"], task, mutating=False
-    ).startswith("denied")
-
-
-@pytest.mark.parametrize(
-    ("command", "answer", "prompt_text", "should_run"),
-    [
-        (
-            ["kubectl", "delete", "pod", "db", "-n", "postgres"],
-            "y\n",
-            "Approve HIGH-RISK deployment action",
-            False,
-        ),
-        (
-            ["kubectl", "delete", "pod", "db", "-n", "postgres"],
-            "approve\n",
-            "Approve HIGH-RISK deployment action",
-            True,
-        ),
-    ],
-)
-def test_destructive_kubernetes_change_waits_for_terminal_approval(
-    tmp_path: Path,
-    monkeypatch,
-    capsys,
-    command: list[str],
-    answer: str,
-    prompt_text: str,
-    should_run: bool,
-) -> None:
-    task = DeploymentTask.model_validate(
-        {
-            "task": {"objective": "sample"},
-            "sources": {"repositories": ["/tmp/sample"]},
-            "environment": {"type": "kubernetes", "context": "target-cluster"},
-            "constraints": {
-                "allow_destructive_actions": True,
-                "allowed_namespaces": ["postgres"],
-            },
-        }
-    )
-    decision = _decision(
-        "ACT",
-        "execute",
-        command=command,
-        evidence=["repository-1:README.md"],
-        expected_change="Pod has the label",
-        validation=[
-            {
-                "command": ["kubectl", "get", "pod", "db", "-n", "postgres"],
-                "unsatisfied_exit_codes": [1],
-            }
-        ],
-    )
-
-    class Evidence:
-        def existing_refs(self, _references):
-            return {"repository-1:README.md"}
-
-        def working_directory(self, _decision, _workspace):
-            return None
-
-        def grounds(self, _decision):
-            return True
-
-    class Terminal(io.StringIO):
-        def isatty(self):
-            return True
-
-    commands = []
-
-    def run_command(command, _task, **_kwargs):
-        commands.append(command)
-
-        if command[1:3] == ["config", "current-context"]:
-            return {"exit_code": 0, "stdout": "target-cluster\n", "stderr": ""}
-        if "get" in command and not any(
-            len(earlier) > 3 and earlier[3] in {"delete", "label"} for earlier in commands
-        ):
-            return {
-                "exit_code": 1,
-                "stdout": "",
-                "stderr": 'Error from server (NotFound): pods "db" not found',
-            }
-        return {"exit_code": 0, "stdout": "", "stderr": ""}
-
-    monkeypatch.setattr("pheragent.deployment.runtime.sys.stdin", Terminal(answer))
-    monkeypatch.setattr("pheragent.deployment.runtime._command", run_command)
-    monkeypatch.setattr("pheragent.deployment.runtime._stream_command", run_command)
-    result = execute_action(
-        decision, task, Evidence(), tmp_path, enabled=True, approve=False, timeout=10
-    )
-    assert (result["status"] == "validated") is should_run
-    prompt = capsys.readouterr().out
-    assert prompt_text in prompt
-    assert "Change: Pod has the label" in prompt
-    assert "Source: repository-1:README.md" in prompt
-    assert "Check: kubectl get pod db -n postgres" in prompt
-    assert any(item[3] == command[1] for item in commands if len(item) > 3) is should_run
-
-
-def test_policy_blocks_secret_output_and_reviews_host_changes() -> None:
-    task = DeploymentTask.model_validate(
-        {
-            "task": {"objective": "sample"},
-            "sources": {"repositories": ["/tmp/sample"]},
-            "environment": {"type": "kubernetes", "context": "target-cluster"},
-            "constraints": {"allowed_namespaces": ["*"]},
-        }
-    )
-
-    assert classify_command(
-        ["kubectl", "get", "secret", "database", "-o", "yaml"], task, mutating=False
-    ).startswith("denied")
-    assert classify_command(
-        ["sed", "-i", "s/a/b/", "/etc/app.conf"], task, mutating=True
-    ).startswith("high_risk_approval")
-
-
-def test_cli_reports_usage_and_verified_changes(tmp_path: Path, monkeypatch, capsys) -> None:
-    monkeypatch.setattr("pheragent.cli.load_dotenv", lambda _path: None)
-    monkeypatch.setattr(
-        "pheragent.deployment.cli.run_deployment_agent",
-        lambda *_args, **_kwargs: {
-            "status": "SUCCESS",
-            "reason": "verified",
-            "usage": {
-                "requests": 3,
-                "input_tokens": 100,
-                "output_tokens": 20,
-                "total_tokens": 120,
-            },
-            "mutating_actions": 2,
-            "state": {
-                "components": {"storage": {"deployed": True}},
-                "verified_outcomes": [{"id": "storage"}],
-            },
-        },
-    )
-    assert (
-        pheragent_main(["deployment", "run", "task.yaml", "--output", str(tmp_path / "run")]) == 0
-    )
-    summary = capsys.readouterr().out
-    assert "3 requests; 120 tokens (input 100, output 20)" in summary
-    assert "Actions attempted: 2" in summary
-    assert "Deployed components: storage" in summary
-    assert "New verified outcomes: storage" in summary
-
-
-def test_deployment_exposes_only_progressive_run() -> None:
-    from pheragent.cli import _build_parser
-
-    parser = _build_parser()
-    assert parser.parse_args(["deployment", "run", "task.yaml"]).task == Path("task.yaml")
-    assert parser.parse_args(["deployment", "run", "task.yaml", "--resume"]).resume is True
-    with pytest.raises(SystemExit):
-        parser.parse_args(["deployment", "analyze"])
-
-
-def test_missing_key_stops_before_source_acquisition(tmp_path: Path, monkeypatch) -> None:
-    source = tmp_path / "source"
-    source.mkdir()
-    task = tmp_path / "task.yaml"
-    output = tmp_path / "run"
-    _task(task, source, output)
-    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-    with pytest.raises(ValueError, match="OPENAI_API_KEY"):
-        run_deployment_agent(task, output)
-    assert not output.exists()
-
-
-def test_dynamic_goal_counts_only_new_outcomes(tmp_path: Path) -> None:
-    source = tmp_path / "source"
-    source.mkdir()
-    for name in ("prepare", "storage", "service"):
-        script = source / f"{name}.sh"
-        script.write_text(f"#!/bin/sh\ntouch {name}-ready\n")
-        script.chmod(0o755)
-    task = tmp_path / "task.yaml"
-    output = tmp_path / "run"
-    _task(task, source, output)
-    document = yaml.safe_load(task.read_text())
-    document["task"]["stop_after_verified_outcomes"] = 2
-    document.pop("success_checks")
-    document["budgets"].update(max_cycles=5, max_mutating_actions=4)
-    task.write_text(yaml.safe_dump(document))
-
-    def action(name: str, outcome_id: str | None = None) -> Decision:
-        return _decision(
-            "ACT",
-            "execute",
-            command=[f"./{name}.sh"],
-            working_directory="repository-1:.",
-            evidence=[f"repository-1:{name}.sh"],
-            expected_change=f"{name} ready",
-            outcome_id=outcome_id,
-            validation=[
-                {
-                    "command": ["ls", str(output / "workspace/repository-1")],
-                    "contains": f"{name}-ready",
-                }
-            ],
-        )
-
-    decisions = iter(
-        [
-            action("prepare"),
-            action("storage", "storage"),
-            action("storage", "storage"),
-            action("service", "service"),
-        ]
-    )
-
-    def decide(_state, _observation, _last_result, _sources, _cycle):
-        return next(decisions), {}
-
-    report = run_deployment_agent(task, output, execute=True, approve=True, decide=decide)
-    assert report["status"] == "SUCCESS"
-    assert report["mutating_actions"] == 3
-    assert [item["id"] for item in report["state"]["verified_outcomes"]] == ["storage", "service"]
-    actions = _execution_events(output)
-    assert [item["result"]["status"] for item in actions] == [
-        "validated",
-        "validated",
-        "already_satisfied",
-        "validated",
-    ]
-
-
-@pytest.mark.parametrize("script_body", ["touch already-ready", "exit 1"])
-def test_preexisting_state_does_not_count_as_new_outcome(tmp_path: Path, script_body: str) -> None:
-    source = tmp_path / "source"
-    source.mkdir()
-    script = source / "install.sh"
-    script.write_text(f"#!/bin/sh\n{script_body}\n")
-    script.chmod(0o755)
-    (source / "already-ready").touch()
-    task = tmp_path / "task.yaml"
-    output = tmp_path / "run"
-    _task(task, source, output)
-    document = yaml.safe_load(task.read_text())
-    document["task"]["stop_after_verified_outcomes"] = 1
-    document.pop("success_checks")
-    task.write_text(yaml.safe_dump(document))
-    decisions = iter(
-        [
-            _decision(
-                "ACT",
-                "execute",
-                command=["./install.sh"],
-                working_directory="repository-1:.",
-                evidence=["repository-1:install.sh"],
-                expected_change="already ready",
-                outcome_id="existing",
-                validation=[
-                    {
-                        "command": ["ls", str(output / "workspace/repository-1")],
-                        "contains": "already-ready",
-                    }
-                ],
-            ),
-            _decision("BLOCKED", reason="nothing else can be deployed"),
-        ]
-    )
-
-    def decide(_state, _observation, _last_result, _sources, _cycle):
-        return next(decisions), {}
-
-    report = run_deployment_agent(task, output, execute=True, decide=decide)
-    assert report["status"] == "BLOCKED"
-    assert report["mutating_actions"] == 0
-    assert report["state"]["verified_outcomes"] == []
-
-
-def test_agent_asks_human_to_choose_between_supported_routes(tmp_path: Path, monkeypatch) -> None:
-    source = tmp_path / "source"
-    source.mkdir()
-    (source / "README.md").write_text("Two supported installation routes.\n")
-    task = tmp_path / "task.yaml"
-    output = tmp_path / "run"
-    _task(task, source, output)
-
-    class Terminal(io.StringIO):
-        def isatty(self):
-            return True
-
-    monkeypatch.setattr("pheragent.deployment.agent.sys.stdin", Terminal("2\n"))
-    decisions = iter(
-        [
-            _decision(
-                "ASK_HUMAN",
-                reason="Both routes fit",
-                focus="storage route",
-                options=["Use provider A", "Use provider B"],
-                evidence=["repository-1:README.md"],
-            ),
-            _decision("BLOCKED", reason="choice recorded"),
-        ]
-    )
-
-    def decide(_state, _observation, _last_result, _sources, _cycle):
-        return next(decisions), {}
-
-    report = run_deployment_agent(task, output, decide=decide)
-    assert report["state"]["selected_route"]["choice"] == "Use provider B"
-    assert report["mutating_actions"] == 0
-
-
-def test_unknown_preflight_does_not_execute(tmp_path: Path, monkeypatch) -> None:
-    task = DeploymentTask.model_validate(
-        {
-            "task": {"objective": "sample"},
-            "sources": {"repositories": ["/tmp/sample"]},
-            "environment": {"type": "shell", "sandbox": True},
-        }
-    )
-    decision = _decision(
-        "ACT",
-        "execute",
-        command=["touch", str(tmp_path / "ready")],
-        evidence=["repository-1:README.md"],
-        expected_change="ready",
-        validation=[{"command": ["ls", str(tmp_path / "ready")]}],
-    )
-
-    class Evidence:
-        def existing_refs(self, _references):
-            return {"repository-1:README.md"}
-
-        def working_directory(self, _decision, _workspace):
-            return None
-
-        def grounds(self, _decision):
-            return True
-
-    calls = []
-
-    def cannot_read(command, _task, **_kwargs):
-        calls.append(command)
-        return {"exit_code": 1, "stdout": "", "stderr": "Permission denied"}
-
-    monkeypatch.setattr("pheragent.deployment.runtime._command", cannot_read)
-    result = execute_action(
-        decision, task, Evidence(), tmp_path, enabled=True, approve=False, timeout=10
-    )
-    assert result["status"] == "needs_better_check"
-    assert calls == [["ls", str(tmp_path / "ready")]]
-
-
-def test_execute_streams_output_and_supplies_referenced_stdin(tmp_path: Path, capsys) -> None:
-    source = tmp_path / "source"
-    source.mkdir()
-    script = source / "install.sh"
-    script.write_text(
-        "#!/bin/sh\nread answer\nprintf 'received:%s\\n' \"$answer\"\ntouch ready\n"
-    )
-    script.chmod(0o755)
-    task = DeploymentTask.model_validate(
-        {
-            "task": {"objective": "sample"},
-            "sources": {"repositories": [str(source)]},
-            "environment": {"type": "shell", "sandbox": True},
-        }
-    )
-    decision = _decision(
-        "ACT",
-        "execute",
-        command=["./install.sh"],
-        working_directory="repository-1:.",
-        evidence=["repository-1:install.sh"],
-        expected_change="installer completes",
-        required_inputs=[
-            {
-                "name": "INSTALL_CONFIRMATION",
-                "prompt": "Confirm installation",
-                "sensitive": True,
-            }
-        ],
-        stdin_input="INSTALL_CONFIRMATION",
-        validation=[{"command": ["ls", "ready"], "unsatisfied_exit_codes": [2]}],
-    )
-
-    class Evidence:
-        def existing_refs(self, _references):
-            return {"repository-1:install.sh"}
-
-        def working_directory(self, _decision, _workspace):
-            return source
-
-        def grounds(self, _decision):
-            return True
-
-    log = tmp_path / "actions" / "0001.log"
-    secret = "super-secret-value\n"
-    result = execute_action(
-        decision,
-        task,
-        Evidence(),
-        tmp_path,
-        enabled=True,
-        approve=True,
-        timeout=10,
-        stdin_value=secret,
-        stdin_sensitive=True,
-        log_path=log,
-    )
-    assert result["status"] == "validated"
-    assert "[REDACTED INPUT]" in result["execution"]["stdout"]
-    assert "super-secret-value" not in result["execution"]["stdout"]
-    assert "[REDACTED INPUT]" in log.read_text()
-    assert "[REDACTED INPUT]" in capsys.readouterr().out
-
-
-def test_execute_retains_partial_output_when_it_times_out(tmp_path: Path) -> None:
-    source = tmp_path / "source"
-    source.mkdir()
-    script = source / "install.sh"
-    script.write_text("#!/bin/sh\nprintf 'started\\n'\nsleep 10\n")
-    script.chmod(0o755)
-    task = DeploymentTask.model_validate(
-        {
-            "task": {"objective": "sample"},
-            "sources": {"repositories": [str(source)]},
-            "environment": {"type": "shell", "sandbox": True},
-        }
-    )
-    decision = _decision(
-        "ACT",
-        "execute",
-        command=["./install.sh"],
-        working_directory="repository-1:.",
-        evidence=["repository-1:install.sh"],
-        expected_change="installer completes",
-        validation=[{"command": ["ls", "ready"], "unsatisfied_exit_codes": [2]}],
-    )
-
-    class Evidence:
-        def existing_refs(self, _references):
-            return {"repository-1:install.sh"}
-
-        def working_directory(self, _decision, _workspace):
-            return source
-
-        def grounds(self, _decision):
-            return True
-
-    log = tmp_path / "actions" / "0001.log"
-    result = execute_action(
-        decision,
-        task,
-        Evidence(),
-        tmp_path,
-        enabled=True,
-        approve=True,
-        timeout=1,
-        log_path=log,
-    )
-    assert result["status"] == "command_failed"
-    assert result["execution"]["timed_out"] is True
-    assert "started" in result["execution"]["stdout"]
-    assert "timed out" in result["execution"]["stderr"]
-    assert "started" in log.read_text()
-
-
-def test_checks_use_declared_generic_outcomes(tmp_path: Path, monkeypatch) -> None:
-    task = DeploymentTask.model_validate(
-        {
-            "task": {"objective": "sample"},
-            "sources": {"repositories": ["/tmp/sample"]},
-            "environment": {"type": "shell", "sandbox": True},
-        }
-    )
-    results = iter(
-        [
-            {"exit_code": 0, "stdout": "demo\n", "stderr": ""},
-            {"exit_code": 0, "stdout": "", "stderr": ""},
-            {"exit_code": 1, "stdout": "", "stderr": "not found"},
-            {"exit_code": 2, "stdout": "", "stderr": "unavailable"},
-        ]
-    )
-    monkeypatch.setattr(
-        "pheragent.deployment.runtime._command", lambda *_args, **_kwargs: next(results)
-    )
-    checks = [
-        Check(command=["docker", "inspect", "demo"], contains="demo"),
-        Check(command=["docker", "inspect", "demo"], contains="demo"),
-        Check(command=["docker", "inspect", "demo"], unsatisfied_exit_codes=[1]),
-        Check(command=["docker", "inspect", "demo"], unsatisfied_exit_codes=[1]),
-    ]
-    assert [item["status"] for item in run_checks(task, checks, tmp_path)] == [
-        "satisfied",
-        "unsatisfied",
-        "unsatisfied",
-        "unknown",
-    ]
-
-
-def test_declared_unsatisfied_preflight_allows_execution(tmp_path: Path, monkeypatch) -> None:
-    task = DeploymentTask.model_validate(
-        {
-            "task": {"objective": "sample"},
-            "sources": {"repositories": ["/tmp/sample"]},
-            "environment": {"type": "shell", "sandbox": True},
-        }
-    )
-    decision = _decision(
-        "ACT",
-        "execute",
-        command=["touch", str(tmp_path / "ready")],
-        evidence=["repository-1:README.md"],
-        expected_change="demo becomes available",
-        validation=[
-            {
-                "command": ["docker", "inspect", "demo"],
-                "unsatisfied_exit_codes": [1],
-            }
-        ],
-    )
-
-    class Evidence:
-        def existing_refs(self, _references):
-            return {"repository-1:README.md"}
-
-        def working_directory(self, _decision, _workspace):
-            return None
-
-        def grounds(self, _decision):
-            return True
-
-    responses = iter(
-        [
-            {"exit_code": 1, "stdout": "", "stderr": "not found"},
-            {"exit_code": 0, "stdout": "", "stderr": ""},
-            {"exit_code": 0, "stdout": "demo", "stderr": ""},
-        ]
-    )
-    monkeypatch.setattr(
-        "pheragent.deployment.runtime._command", lambda *_args, **_kwargs: next(responses)
-    )
-    result = execute_action(
-        decision, task, Evidence(), tmp_path, enabled=True, approve=True, timeout=10
-    )
-    assert result["status"] == "validated"
-    assert result["before_unsatisfied"] is True
-
-
-def test_successful_command_without_verified_change_is_failure(tmp_path: Path, monkeypatch) -> None:
-    task = DeploymentTask.model_validate(
-        {
-            "task": {"objective": "sample"},
-            "sources": {"repositories": ["/tmp/sample"]},
-            "environment": {"type": "shell", "sandbox": True},
-        }
-    )
-    decision = _decision(
-        "ACT",
-        "execute",
-        command=["touch", str(tmp_path / "wrong-file")],
-        evidence=["repository-1:README.md"],
-        expected_change="ready",
-        validation=[
-            {
-                "command": ["ls", str(tmp_path / "ready")],
-                "unsatisfied_exit_codes": [1],
-            }
-        ],
-    )
-
-    class Evidence:
-        def existing_refs(self, _references):
-            return {"repository-1:README.md"}
-
-        def working_directory(self, _decision, _workspace):
-            return None
-
-        def grounds(self, _decision):
-            return True
-
-    def run_command(command, _task, **_kwargs):
-        if command[0] == "ls":
-            return {"exit_code": 1, "stdout": "", "stderr": "No such file or directory"}
-        return {"exit_code": 0, "stdout": "", "stderr": ""}
-
-    monkeypatch.setattr("pheragent.deployment.runtime._command", run_command)
-    result = execute_action(
-        decision, task, Evidence(), tmp_path, enabled=True, approve=True, timeout=0
-    )
-    assert result["status"] == "verification_failed"
-    assert result["execution"]["exit_code"] == 0
-
-
-def test_delayed_readiness_is_verified_before_next_action(tmp_path: Path, monkeypatch) -> None:
-    source = tmp_path / "source"
-    source.mkdir()
-    script = source / "install.sh"
-    script.write_text("#!/bin/sh\ntouch ready\n")
-    script.chmod(0o755)
-    task = tmp_path / "task.yaml"
-    output = tmp_path / "run"
-    _task(task, source, output)
-    document = yaml.safe_load(task.read_text())
-    document["task"]["stop_after_verified_outcomes"] = 1
-    document.pop("success_checks")
-    task.write_text(yaml.safe_dump(document))
-    reads = 0
-
-    def delayed_checks(task, checks, cwd=None):
-        nonlocal reads
-        reads += 1
-        result = run_checks(task, checks, cwd)
-        if reads == 2:
-            result[0]["status"] = "unsatisfied"
-        return result
-
-    monkeypatch.setattr("pheragent.deployment.runtime.time.sleep", lambda _seconds: None)
-    monkeypatch.setattr("pheragent.deployment.runtime.run_checks", delayed_checks)
-    decision = _decision(
-        "ACT",
-        "execute",
-        command=["./install.sh"],
-        working_directory="repository-1:.",
-        evidence=["repository-1:install.sh"],
-        expected_change="service ready",
-        outcome_id="service",
-        validation=[
-            {
-                "command": ["ls", str(output / "workspace/repository-1/ready")],
-                "unsatisfied_exit_codes": [2],
-            }
-        ],
-    )
-
-    def decide(_state, _observation, _last_result, _sources, _cycle):
-        return decision, {}
-
-    report = run_deployment_agent(task, output, execute=True, approve=True, decide=decide)
-    actions = _execution_events(output)
-    assert report["status"] == "SUCCESS"
-    assert report["mutating_actions"] == 1
-    assert [item["result"]["status"] for item in actions] == ["validated"]
-    assert reads >= 3
-    assert [item["id"] for item in report["state"]["verified_outcomes"]] == ["service"]
+    assert classify_command(["./install.sh"], kubernetes).startswith("high_risk_approval")
