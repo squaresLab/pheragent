@@ -8,10 +8,9 @@ from typing import Any
 from pydantic import BaseModel
 
 from pheragent.llm_planner import (
-    IncompleteLLMResponseError,
+    _extract_token_usage,
     _format_llm_error,
     _openai_client,
-    _read_streamed_response_with_usage,
     _resolve_openai_base_url,
 )
 
@@ -63,7 +62,10 @@ class LLMClient:
         instructions: str,
         payload: dict[str, Any],
         max_output_tokens: int | None = None,
+        max_attempts: int = 2,
     ) -> tuple[T, dict[str, int]]:
+        if max_attempts < 1:
+            raise ValueError("max_attempts must be positive")
         api_key = os.getenv(self.api_key_env)
         if not api_key:
             raise LLMError(
@@ -75,6 +77,7 @@ class LLMClient:
         name = _schema_name(response_model)
         content = ""
         usage: dict[str, int] = {}
+        attempts = 0
         with span(
             f"llm.{name}",
             span_type="LLM",
@@ -105,26 +108,26 @@ class LLMClient:
                             ],
                         }
                     ],
-                    "text": {"format": _response_format(response_model, name)},
-                    "stream": True,
                 }
                 if output_limit is not None:
                     request["max_output_tokens"] = output_limit
                 if self.reasoning_effort:
                     request["reasoning"] = {"effort": self.reasoning_effort}
-                content, usage = _read_streamed_response_with_usage(
-                    client.responses.create(**request),
-                    error_context=name.replace("_", " "),
-                )
-                value = response_model.model_validate(_parse_object(content))
+                for attempts in range(1, max_attempts + 1):
+                    try:
+                        response = client.responses.parse(**request, text_format=response_model)
+                        content = response.output_text
+                        usage = _extract_token_usage(response.usage) or {}
+                        value = response.output_parsed
+                        if value is None:
+                            raise ValueError("structured response did not contain a parsed object")
+                        break
+                    except ValueError:
+                        if attempts == max_attempts:
+                            raise
             except Exception as exc:
                 status = "invalid_response" if isinstance(exc, ValueError) else "failed"
-                if isinstance(exc, IncompleteLLMResponseError):
-                    content = exc.content
-                    usage = exc.usage
-                    reason = re.sub(r"\W+", "_", exc.reason.casefold()).strip("_")
-                    status = f"incomplete_{reason or 'response'}"
-                usage["requests"] = max(1, int(usage.get("requests", 0)))
+                usage["requests"] = max(attempts, 1, int(usage.get("requests", 0)))
                 message = _format_llm_error(name.replace("_", " "), exc)
                 set_output(active_span, {"status": status, "error": message}, usage)
                 raise LLMError(
@@ -134,7 +137,7 @@ class LLMClient:
                     usage=usage,
                 ) from exc
 
-            usage["requests"] = max(1, int(usage.get("requests", 0)))
+            usage["requests"] = max(attempts, 1, int(usage.get("requests", 0)))
             set_output(active_span, {"status": "succeeded", "response": content}, usage)
             return value, usage
 
@@ -144,39 +147,3 @@ def _minimum(*values: int | None) -> int | None:
 
 def _schema_name(response_model: type[BaseModel]) -> str:
     return re.sub(r"(?<!^)(?=[A-Z])", "_", response_model.__name__).lower()
-
-def _response_format(response_model: type[BaseModel], name: str) -> dict[str, Any]:
-    schema = response_model.model_json_schema()
-    _make_schema_strict(schema)
-    return {"type": "json_schema", "name": name, "strict": True, "schema": schema}
-
-def _make_schema_strict(node: Any) -> None:
-    if isinstance(node, list):
-        for item in node:
-            _make_schema_strict(item)
-        return
-    if not isinstance(node, dict):
-        return
-
-    properties = node.get("properties")
-    node.pop("default", None)
-    node.pop("title", None)
-    if isinstance(properties, dict):
-        node["additionalProperties"] = False
-        node["required"] = list(properties)
-        for value in properties.values():
-            _make_schema_strict(value)
-    for key, value in node.items():
-        if key != "properties":
-            _make_schema_strict(value)
-
-def _parse_object(content: str) -> dict[str, Any]:
-    try:
-        value = json.loads(content)
-    except json.JSONDecodeError as exc:
-        raise ValueError(
-            f"structured response was not complete JSON: {exc.msg} at character {exc.pos}"
-        ) from None
-    if not isinstance(value, dict):
-        raise ValueError("structured response JSON must be an object")
-    return value

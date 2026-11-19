@@ -12,14 +12,14 @@ from .telemetry import flush, set_output, span
 
 
 def add_deployment_parser(subparsers) -> None:
-    deployment = subparsers.add_parser("deployment", help="Deploy from a task and live state.")
-    commands = deployment.add_subparsers(dest="deployment_command", required=True)
-    run = commands.add_parser("run", help="Deploy progressively from source and live state.")
-    run.add_argument("task", type=Path)
-    run.add_argument("--output", type=Path)
-    run.add_argument("--model", default="gpt-5.6-terra")
-    run.add_argument("--execute", action="store_true", help="Run model-selected commands.")
-    run.add_argument("--resume", action="store_true", help="Continue an existing output run.")
+    deploy = subparsers.add_parser(
+        "deploy", help="Deploy progressively from source and live state."
+    )
+    deploy.add_argument("task", type=Path)
+    deploy.add_argument("--output", type=Path)
+    deploy.add_argument("--model", default="gpt-5.6-terra")
+    deploy.add_argument("--execute", action="store_true", help="Run model-selected commands.")
+    deploy.add_argument("--resume", action="store_true", help="Continue an existing output run.")
 
 
 def run_deployment_command(args: argparse.Namespace) -> int:
@@ -28,7 +28,7 @@ def run_deployment_command(args: argparse.Namespace) -> int:
     )
     try:
         with span(
-            f"pheragent.deployment.{args.deployment_command}",
+            "pheragent.deploy",
             input={"task": str(args.task), "output": str(output)},
             task=str(args.task),
         ) as active_span:
@@ -57,7 +57,6 @@ def run_deployment_command(args: argparse.Namespace) -> int:
         f"{usage.get('total_tokens', 0)} tokens "
         f"(input {usage.get('input_tokens', 0)}, output {usage.get('output_tokens', 0)})"
     )
-    print(f"Actions attempted: {report['mutating_actions']}")
     deployed = [item["name"] for item in report["components"] if item["deployed"]]
     not_deployed = [item["name"] for item in report["components"] if not item["deployed"]]
     print(f"Deployed components: {', '.join(deployed) or 'none'}")

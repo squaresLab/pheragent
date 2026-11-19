@@ -31,6 +31,7 @@ _READ_COMMANDS = {
     "ls",
     "lsblk",
     "lscpu",
+    "nl",
     "printenv",
     "ps",
     "pwd",
@@ -123,7 +124,7 @@ def _stream_command(
     stdin_value: str | None,
     stdin_sensitive: bool,
     log_path: Path,
-    output_limit: int = 20_000,
+    output_limit: int = 8_000,
 ) -> dict:
     env = os.environ.copy()
     if task.environment.kubeconfig:
@@ -170,8 +171,8 @@ def _stream_command(
 
     threading.Thread(target=read_output, daemon=True).start()
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    tail = ""
-    output_characters = 0
+    head = tail = ""
+    output_characters = output_lines = 0
     finished = timed_out = False
     with log_path.open("a", encoding="utf-8") as log:
         while not finished:
@@ -185,6 +186,8 @@ def _stream_command(
                 log.write(chunk)
                 log.flush()
                 output_characters += len(chunk)
+                output_lines += 1
+                head = (head + chunk)[: output_limit // 2]
                 tail = (tail + chunk)[-output_limit:]
             except queue.Empty:
                 pass
@@ -199,6 +202,14 @@ def _stream_command(
                         os.killpg(process.pid, signal.SIGKILL)
                 process.wait()
     process.wait()
+    truncated = output_characters > output_limit
+    if truncated:
+        end = output_characters - output_limit // 2
+        tail = (
+            head
+            + f"\n[output characters {len(head) + 1}-{end} omitted; full output: {log_path}]\n"
+            + tail[-output_limit // 2 :]
+        )
     return {
         "exit_code": None if timed_out else process.returncode,
         "stdout": tail,
@@ -206,8 +217,9 @@ def _stream_command(
         "duration_seconds": round(time.monotonic() - started, 2),
         "timed_out": timed_out,
         "output_log": str(log_path),
-        "output_truncated": output_characters > output_limit,
+        "output_truncated": truncated,
         "output_characters": output_characters,
+        "output_lines": output_lines,
     }
 
 
@@ -245,8 +257,14 @@ def target_command(command: list[str], task: DeploymentTask) -> list[str]:
 
 def _read_only(command: list[str]) -> bool:
     executable = Path(command[0]).name
+    if executable == "sed":
+        return (
+            len(command) == 4
+            and command[1] == "-n"
+            and re.fullmatch(r"\d+(?:,\d+)?p", command[2]) is not None
+        )
     if executable in _READ_COMMANDS:
-        return executable != "sed" or not any(part.startswith("-i") for part in command[1:])
+        return True
     words = [part.casefold().replace("_", "-") for part in command[1:] if not part.startswith("-")]
     if executable == "git":
         return bool(words and words[0] in {"diff", "log", "rev-parse", "show", "status"})
@@ -360,7 +378,7 @@ def execute_command(
     policy = classify_command(decision.command, task)
     if policy.startswith("denied"):
         return {"status": "policy_denied", "reason": policy}
-    if not enabled:
+    if not enabled and not _read_only(decision.command):
         return {"status": "dry_run", "reason": "pass --execute", "policy": policy}
     if policy.startswith("high_risk_approval"):
         if not sys.stdin.isatty():

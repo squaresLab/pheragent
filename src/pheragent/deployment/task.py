@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Literal
 
@@ -48,6 +49,16 @@ class Budgets(StrictModel):
 
 class TaskGoal(StrictModel):
     objective: str = Field(min_length=1)
+    invariants: dict[str, str] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def validate_invariants(self) -> TaskGoal:
+        if any(
+            not re.fullmatch(r"[a-z0-9][a-z0-9-]*", key) or not text.strip()
+            for key, text in self.invariants.items()
+        ):
+            raise ValueError("invariants need nonempty descriptions and lowercase hyphenated ids")
+        return self
 
 
 class TaskInput(StrictModel):
@@ -87,15 +98,22 @@ class DeploymentTask(StrictModel):
         return self
 
 
+class RunNote(StrictModel):
+    key: str = Field(pattern=r"^[a-z0-9][a-z0-9-]{0,63}$")
+    text: str = Field(min_length=1, max_length=1_000)
+    evidence_events: list[int] = Field(default_factory=list)
+
+
 class Decision(StrictModel):
     action: Literal["shell", "ask", "record", "finish"]
     reason: str = Field(min_length=1)
-    memory: str = Field(min_length=1, max_length=20_000)
+    notes: list[RunNote] = Field(default_factory=list)
     command: list[str] = Field(default_factory=list)
     working_directory: str | None = None
     component: str | None = None
     deployed: bool | None = None
     evidence_events: list[int] = Field(default_factory=list)
+    verification_events: list[int] = Field(default_factory=list)
     human_action: str | None = None
     required_inputs: list[InputRequest] = Field(default_factory=list)
     stdin_input: str | None = Field(default=None, pattern=r"^[A-Za-z][A-Za-z0-9_]*$")
@@ -110,6 +128,10 @@ class Decision(StrictModel):
             raise ValueError("record action requires component and deployed")
         if self.deployed is True and not self.evidence_events:
             raise ValueError("deployed component requires evidence_events")
+        if self.verification_events and not set(self.verification_events) <= set(
+            self.evidence_events
+        ):
+            raise ValueError("verification_events must be included in evidence_events")
         if self.deployed is False and not self.human_action:
             raise ValueError("not deployed component requires human_action")
         names = [item.name for item in self.required_inputs]

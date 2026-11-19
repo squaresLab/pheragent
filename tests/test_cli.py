@@ -7,6 +7,14 @@ import pytest
 from pheragent.cli import _batch_base_request_from_args, _build_parser, _request_from_args
 
 
+def test_deploy_is_a_direct_command(tmp_path: Path) -> None:
+    args = _build_parser().parse_args(["deploy", str(tmp_path / "task.yaml"), "--execute"])
+
+    assert args.command == "deploy"
+    assert args.task == tmp_path / "task.yaml"
+    assert args.execute is True
+
+
 def test_build_resume_from_does_not_require_base_dockerfile(tmp_path: Path) -> None:
     parser = _build_parser()
     args = parser.parse_args(

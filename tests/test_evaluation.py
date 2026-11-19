@@ -273,7 +273,7 @@ def test_llm_judge_resolves_semantic_metrics_with_redacted_evidence(
     instructions: list[str] = []
 
     class Responses:
-        def create(self, **payload):
+        def parse(self, **payload):
             request = json.loads(payload["input"][0]["content"][0]["text"])
             requests.append(request)
             instructions.append(payload["instructions"])
@@ -305,7 +305,7 @@ def test_llm_judge_resolves_semantic_metrics_with_redacted_evidence(
                         }
                     ]
                 }
-            return _response_stream(response)
+            return _parsed_response(response, payload["text_format"])
 
     monkeypatch.setenv("TEST_OPENAI_KEY", "test-key")
     monkeypatch.setattr(
@@ -351,8 +351,8 @@ def test_llm_judge_failure_preserves_deterministic_results(
     monkeypatch,
 ) -> None:
     class Responses:
-        def create(self, **_payload):
-            return _response_stream({"decisions": []})
+        def parse(self, **payload):
+            return _parsed_response({"decisions": []}, payload["text_format"])
 
     monkeypatch.setenv("TEST_OPENAI_KEY", "test-key")
     monkeypatch.setattr(
@@ -387,7 +387,7 @@ def test_llm_component_judge_uses_complete_bounded_batches(
     requests: list[dict] = []
 
     class Responses:
-        def create(self, **payload):
+        def parse(self, **payload):
             request = json.loads(payload["input"][0]["content"][0]["text"])
             requests.append(request)
             if request["task"] == "judge_phase1_components":
@@ -399,7 +399,7 @@ def test_llm_component_judge_uses_complete_bounded_batches(
                         for entity in request["entities"]
                     ]
                 }
-            return _response_stream(response)
+            return _parsed_response(response, payload["text_format"])
 
     _mock_openai(monkeypatch, Responses)
     report = evaluate_phase_one(
@@ -431,7 +431,7 @@ def test_incomplete_component_batch_does_not_publish_partial_judgments(
     component_batch = 0
 
     class Responses:
-        def create(self, **payload):
+        def parse(self, **payload):
             nonlocal component_batch
             request = json.loads(payload["input"][0]["content"][0]["text"])
             if request["task"] == "judge_phase1_components":
@@ -455,7 +455,7 @@ def test_incomplete_component_batch_does_not_publish_partial_judgments(
                         for entity in request["entities"]
                     ]
                 }
-            return _response_stream(response)
+            return _parsed_response(response, payload["text_format"])
 
     _mock_openai(monkeypatch, Responses)
     report = evaluate_phase_one(
@@ -480,7 +480,7 @@ def test_completeness_can_account_for_entity_with_workflow_action(
     requests: list[dict] = []
 
     class Responses:
-        def create(self, **payload):
+        def parse(self, **payload):
             request = json.loads(payload["input"][0]["content"][0]["text"])
             requests.append(request)
             if request["task"] == "judge_phase1_components":
@@ -503,7 +503,7 @@ def test_completeness_can_account_for_entity_with_workflow_action(
                         for entity in request["entities"]
                     ]
                 }
-            return _response_stream(response)
+            return _parsed_response(response, payload["text_format"])
 
     _mock_openai(monkeypatch, Responses)
     report = evaluate_phase_one(
@@ -778,20 +778,12 @@ def _judge_config(tmp_path: Path, *, max_requests: int = 2) -> PhaseOneJudgeConf
     )
 
 
-def _response_stream(response: dict) -> list[dict]:
-    return [
-        {"type": "response.output_text.delta", "delta": json.dumps(response)},
-        {
-            "type": "response.completed",
-            "response": {
-                "usage": {
-                    "input_tokens": 40,
-                    "output_tokens": 20,
-                    "total_tokens": 60,
-                }
-            },
-        },
-    ]
+def _parsed_response(response: dict, response_model) -> SimpleNamespace:
+    return SimpleNamespace(
+        output_parsed=response_model.model_validate(response),
+        output_text=json.dumps(response),
+        usage={"input_tokens": 40, "output_tokens": 20, "total_tokens": 60},
+    )
 
 
 _COVERAGE_FIELDS = (
